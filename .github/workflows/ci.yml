@@ -72,13 +72,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Test with coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
+        run: cargo llvm-cov --workspace --summary-only
 
   cpp-test:
     runs-on: ubuntu-latest
