@@ -17,12 +17,14 @@
   ~ under the License.
 -->
 
-# Apache Paimon Mosaic &emsp; [![Build Status]][actions] [![Latest Version]][crates.io]
+# Apache Paimon Mosaic &emsp; [![Build Status]][actions] [![Latest Version]][crates.io] [![codecov]][codecov-page]
 
 [Build Status]: https://img.shields.io/github/actions/workflow/status/apache/paimon-mosaic/ci.yml
 [actions]: https://github.com/apache/paimon-mosaic/actions?query=branch%3Amain
 [Latest Version]: https://img.shields.io/crates/v/paimon.svg
 [crates.io]: https://crates.io/crates/mosaic
+[codecov]: https://codecov.io/gh/jianguotian/paimon-mosaic/graph/badge.svg
+[codecov-page]: https://codecov.io/gh/jianguotian/paimon-mosaic
 
 A columnar-bucket hybrid format optimized for wide tables of Apache Paimon. 
 
