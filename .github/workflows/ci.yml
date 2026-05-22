@@ -68,8 +68,17 @@ jobs:
       - name: Build
         run: cargo build --all-targets
 
-      - name: Test
-        run: cargo test
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Test with coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
 
   cpp-test:
     runs-on: ubuntu-latest
