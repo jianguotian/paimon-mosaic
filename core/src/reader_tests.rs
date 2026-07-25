@@ -2381,6 +2381,24 @@ fn test_all_null_rows() {
 }
 
 #[test]
+fn test_all_null_arrays_are_reused_within_row_group() {
+    let columns: Vec<_> = (0..20)
+        .map(|i| (format!("null_{i}"), DataType::Int16, true))
+        .collect();
+    let rows = vec![vec![Value::Null; columns.len()]; 30];
+    let (reader, _) = write_and_read(columns, &rows);
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+
+    assert_eq!(batch.num_columns(), 20);
+    for column in batch.columns() {
+        assert_eq!(column.len(), 30);
+        assert_eq!(column.null_count(), 30);
+        assert!(Arc::ptr_eq(batch.column(0), column));
+    }
+}
+
+#[test]
 fn test_mixed_encodings_multi_column() {
     let columns = vec![
         ("all_null".to_string(), DataType::Int32, true),

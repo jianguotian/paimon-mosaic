@@ -182,6 +182,27 @@ fn build_all_null_array(dt: &DataType, num_rows: usize) -> ArrayRef {
     arrow_array::new_null_array(dt, num_rows)
 }
 
+#[derive(Default)]
+pub(crate) struct AllNullArrayCache {
+    arrays: Vec<(DataType, usize, ArrayRef)>,
+}
+
+impl AllNullArrayCache {
+    pub(crate) fn get_or_insert(&mut self, dt: &DataType, num_rows: usize) -> ArrayRef {
+        if let Some((_, _, array)) = self
+            .arrays
+            .iter()
+            .find(|(cached_type, cached_rows, _)| cached_type == dt && *cached_rows == num_rows)
+        {
+            return array.clone();
+        }
+
+        let array = build_all_null_array(dt, num_rows);
+        self.arrays.push((dt.clone(), num_rows, array.clone()));
+        array
+    }
+}
+
 fn build_array(
     data: RawColumnData,
     dt: &DataType,
@@ -755,6 +776,13 @@ impl BucketReader {
     }
 
     pub fn read_all_columns(&self) -> io::Result<Vec<ArrayRef>> {
+        self.read_all_columns_with_cache(&mut AllNullArrayCache::default())
+    }
+
+    pub(crate) fn read_all_columns_with_cache(
+        &self,
+        all_null_cache: &mut AllNullArrayCache,
+    ) -> io::Result<Vec<ArrayRef>> {
         // Read all N+C physical columns
         let mut all_arrays: Vec<ArrayRef> = Vec::with_capacity(self.total_columns);
 
@@ -763,7 +791,7 @@ impl BucketReader {
             let variant = data_variant_for_type(&self.col_types[i]);
 
             if self.encodings[i] == ENCODING_ALL_NULL {
-                all_arrays.push(build_all_null_array(&self.col_types[i], col_rows));
+                all_arrays.push(all_null_cache.get_or_insert(&self.col_types[i], col_rows));
                 continue;
             }
 
@@ -1037,11 +1065,18 @@ impl ColumnPageReader {
     }
 
     pub fn read_all(&self) -> io::Result<ArrayRef> {
+        self.read_all_with_cache(&mut AllNullArrayCache::default())
+    }
+
+    pub(crate) fn read_all_with_cache(
+        &self,
+        all_null_cache: &mut AllNullArrayCache,
+    ) -> io::Result<ArrayRef> {
         let num_rows = self.num_rows;
         let variant = data_variant_for_type(&self.col_type);
 
         if self.encoding == ENCODING_ALL_NULL {
-            return Ok(build_all_null_array(&self.col_type, num_rows));
+            return Ok(all_null_cache.get_or_insert(&self.col_type, num_rows));
         }
 
         let has_nulls = self.has_nulls;
