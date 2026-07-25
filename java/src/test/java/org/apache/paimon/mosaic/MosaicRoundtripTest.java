@@ -41,6 +41,7 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.complex.impl.UnionListWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
@@ -332,6 +333,22 @@ public class MosaicRoundtripTest {
                     assertEquals(i * 0.5, cOut.get(i), 1e-10);
                 }
             }
+            try (StructVector batch = reader.readRowGroupStruct(0, allocator)) {
+                assertEquals(3, batch.size());
+                assertEquals("c", batch.getChildByOrdinal(0).getName());
+                assertEquals("a", batch.getChildByOrdinal(1).getName());
+                assertEquals("b", batch.getChildByOrdinal(2).getName());
+                assertEquals(10, batch.getValueCount());
+
+                Float8Vector cOut = (Float8Vector) batch.getChildByOrdinal(0);
+                IntVector aOut = (IntVector) batch.getChildByOrdinal(1);
+                VarCharVector bOut = (VarCharVector) batch.getChildByOrdinal(2);
+                for (int i = 0; i < 10; i++) {
+                    assertEquals(i, aOut.get(i));
+                    assertEquals("s" + i, new String(bOut.get(i)));
+                    assertEquals(i * 0.5, cOut.get(i), 1e-10);
+                }
+            }
         }
     }
 
@@ -363,6 +380,10 @@ public class MosaicRoundtripTest {
             try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
                 assertEquals(0, batch.getFieldVectors().size());
                 assertEquals(5, batch.getRowCount());
+            }
+            try (StructVector batch = reader.readRowGroupStruct(0, allocator)) {
+                assertEquals(0, batch.size());
+                assertEquals(5, batch.getValueCount());
             }
         }
     }

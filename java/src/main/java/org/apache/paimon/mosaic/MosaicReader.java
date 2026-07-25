@@ -19,21 +19,29 @@
 
 package org.apache.paimon.mosaic;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 public class MosaicReader implements AutoCloseable {
 
     private long handle;
     private final Schema schema;
+    private Schema readSchema;
 
     private MosaicReader(long handle, BufferAllocator allocator) {
         this.handle = handle;
@@ -68,7 +76,23 @@ public class MosaicReader implements AutoCloseable {
     }
 
     public void project(String[] columns) {
+        Map<String, Field> fieldsByName = new HashMap<>();
+        for (Field field : schema.getFields()) {
+            fieldsByName.put(field.getName(), field);
+        }
+        Set<String> selected = new HashSet<>();
+        List<Field> projected = new ArrayList<>(columns.length);
+        for (String name : columns) {
+            Field field = fieldsByName.get(name);
+            if (field == null) {
+                throw new IllegalArgumentException("column '" + name + "' not found in schema");
+            }
+            if (selected.add(name)) {
+                projected.add(field);
+            }
+        }
         NativeLib.nativeReaderSetProjection(handle, columns);
+        readSchema = new Schema(projected);
     }
 
     public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) {
@@ -85,13 +109,56 @@ public class MosaicReader implements AutoCloseable {
 
     private VectorSchemaRoot readRowGroupHandle(long rgHandle, BufferAllocator allocator) {
         try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
-             ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
-            int rc = NativeLib.nativeRowGroupReaderReadColumns(
-                    rgHandle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
+                ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+            int rc =
+                    NativeLib.nativeRowGroupReaderReadColumns(
+                            rgHandle,
+                            arrowArray.memoryAddress(),
+                            arrowSchema.memoryAddress());
             if (rc != 0) {
                 throw new RuntimeException("readColumns failed");
             }
             return Data.importVectorSchemaRoot(allocator, arrowArray, arrowSchema, null);
+        }
+    }
+
+    /**
+     * Reads one row group directly as its Arrow struct root.
+     *
+     * <p>This avoids importing the same schema again and transferring the struct's children into a
+     * second vector tree. The returned vector owns the imported C Data array and must be closed.
+     */
+    public StructVector readRowGroupStruct(int rgIndex, BufferAllocator allocator) {
+        long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
+        if (rgHandle == 0) {
+            throw new RuntimeException("failed to open row group " + rgIndex);
+        }
+        try {
+            return readRowGroupStructHandle(rgHandle, allocator);
+        } finally {
+            NativeLib.nativeRowGroupReaderFree(rgHandle);
+        }
+    }
+
+    private StructVector readRowGroupStructHandle(long rgHandle, BufferAllocator allocator) {
+        try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
+            int rc =
+                    NativeLib.nativeRowGroupReaderReadColumns(
+                            rgHandle, arrowArray.memoryAddress(), 0);
+            if (rc != 0) {
+                throw new RuntimeException("readColumns failed");
+            }
+
+            StructVector vector = StructVector.emptyWithDuplicates("", allocator);
+            try {
+                Schema projectedSchema = readSchema == null ? schema : readSchema;
+                vector.initializeChildrenFromFields(projectedSchema.getFields());
+                Data.importIntoVector(allocator, arrowArray, vector, null);
+                return vector;
+            } catch (RuntimeException | Error failure) {
+                vector.close();
+                throw failure;
+            }
         }
     }
 
