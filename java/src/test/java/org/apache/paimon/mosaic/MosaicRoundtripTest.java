@@ -29,6 +29,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
@@ -81,11 +82,39 @@ public class MosaicRoundtripTest {
         return baos.toByteArray();
     }
 
+    private byte[] writeSchemaCacheFixture(Schema schema) {
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            for (FieldVector vector : root.getFieldVectors()) {
+                if (vector instanceof IntVector) {
+                    IntVector ints = (IntVector) vector;
+                    ints.allocateNew(1);
+                    ints.set(0, 7);
+                } else if (vector instanceof BigIntVector) {
+                    BigIntVector longs = (BigIntVector) vector;
+                    longs.allocateNew(1);
+                    longs.set(0, 9L);
+                } else if (vector instanceof VarCharVector) {
+                    VarCharVector strings = (VarCharVector) vector;
+                    strings.allocateNew();
+                    strings.setSafe(0, "value".getBytes());
+                } else {
+                    throw new AssertionError("unsupported schema-cache fixture vector: " + vector);
+                }
+            }
+            root.setRowCount(1);
+            return writeToBytes(schema, writer -> writer.write(root));
+        }
+    }
+
     private MosaicReader readerFromBytes(byte[] data) {
+        return readerFromBytes(data, null);
+    }
+
+    private MosaicReader readerFromBytes(byte[] data, MosaicReader.SchemaCache schemaCache) {
         InputFile inputFile = (position, buffer, offset, length) -> {
             System.arraycopy(data, (int) position, buffer, offset, length);
         };
-        return MosaicReader.open(inputFile, data.length, allocator);
+        return MosaicReader.open(inputFile, data.length, allocator, schemaCache);
     }
 
     private static void awaitGarbageCollection(WeakReference<?> reference) throws InterruptedException {
@@ -178,6 +207,66 @@ public class MosaicRoundtripTest {
                 }
             }
             assertEquals(50, totalRows);
+        }
+    }
+
+    @Test
+    public void testSchemaCacheReusesOnlyExactLogicalSchema() {
+        Schema baseSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("id", new ArrowType.Int(32, true)),
+                                Field.nullable("name", ArrowType.Utf8.INSTANCE)));
+        Schema[] changedSchemas = {
+            new Schema(
+                    Arrays.asList(
+                            Field.notNullable("id", new ArrowType.Int(64, true)),
+                            Field.nullable("name", ArrowType.Utf8.INSTANCE))),
+            new Schema(
+                    Arrays.asList(
+                            Field.notNullable("identifier", new ArrowType.Int(32, true)),
+                            Field.nullable("name", ArrowType.Utf8.INSTANCE))),
+            new Schema(
+                    Arrays.asList(
+                            Field.nullable("name", ArrowType.Utf8.INSTANCE),
+                            Field.notNullable("id", new ArrowType.Int(32, true)))),
+            new Schema(
+                    Arrays.asList(
+                            Field.nullable("id", new ArrowType.Int(32, true)),
+                            Field.nullable("name", ArrowType.Utf8.INSTANCE)))
+        };
+
+        byte[] baseData = writeSchemaCacheFixture(baseSchema);
+        byte[][] changedData = new byte[changedSchemas.length][];
+        for (int i = 0; i < changedSchemas.length; i++) {
+            changedData[i] = writeSchemaCacheFixture(changedSchemas[i]);
+        }
+
+        Schema cachedJavaSchema;
+        try (MosaicReader firstReader = readerFromBytes(baseData);
+                MosaicReader.SchemaCache cache = firstReader.createSchemaCache()) {
+            assertFalse(firstReader.reusedSchemaCache());
+            cachedJavaSchema = firstReader.getSchema();
+
+            try (MosaicReader repeatedReader = readerFromBytes(baseData, cache);
+                    VectorSchemaRoot batch = repeatedReader.readRowGroup(0, allocator)) {
+                assertTrue(repeatedReader.reusedSchemaCache());
+                assertSame(cachedJavaSchema, repeatedReader.getSchema());
+                assertEquals(1, batch.getRowCount());
+                assertEquals(7, ((IntVector) batch.getVector(0)).get(0));
+            }
+
+            for (int i = 0; i < changedSchemas.length; i++) {
+                try (MosaicReader changedReader = readerFromBytes(changedData[i], cache)) {
+                    assertFalse(changedReader.reusedSchemaCache());
+                    assertNotSame(cachedJavaSchema, changedReader.getSchema());
+                    assertEquals(changedSchemas[i], changedReader.getSchema());
+                }
+            }
+
+            cache.close();
+            assertThrows(
+                    IllegalStateException.class, () -> readerFromBytes(baseData, cache));
         }
     }
 
