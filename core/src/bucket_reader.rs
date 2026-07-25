@@ -62,6 +62,10 @@ fn data_variant_for_type(dt: &DataType) -> DataVariant {
     }
 }
 
+fn const_values_are_dense(variant: DataVariant) -> bool {
+    !matches!(variant, DataVariant::Binary)
+}
+
 #[derive(Debug, Clone)]
 enum RawColumnData {
     Boolean(Vec<u8>),
@@ -187,8 +191,15 @@ fn build_array(
     dt: &DataType,
     null_bitmap: Option<Vec<u8>>,
     num_rows: usize,
+    values_are_dense: bool,
 ) -> io::Result<ArrayRef> {
     let null_buf = make_null_buffer(null_bitmap.clone(), num_rows);
+    let no_scatter = None;
+    let scatter_bitmap = if values_are_dense {
+        &no_scatter
+    } else {
+        &null_bitmap
+    };
 
     Ok(match data {
         RawColumnData::Boolean(values) => {
@@ -196,15 +207,15 @@ fn build_array(
             Arc::new(BooleanArray::new(bool_buf, null_buf))
         }
         RawColumnData::Int8(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             Arc::new(Int8Array::new(ScalarBuffer::from(scattered), null_buf))
         }
         RawColumnData::Int16(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             Arc::new(Int16Array::new(ScalarBuffer::from(scattered), null_buf))
         }
         RawColumnData::Int32(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             match dt {
                 DataType::Date32 => {
                     Arc::new(Date32Array::new(ScalarBuffer::from(scattered), null_buf))
@@ -217,7 +228,7 @@ fn build_array(
             }
         }
         RawColumnData::Int64(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             match dt {
                 DataType::Decimal128(p, s) => {
                     let i128_values: Vec<i128> = scattered.iter().map(|&v| v as i128).collect();
@@ -249,16 +260,16 @@ fn build_array(
             }
         }
         RawColumnData::Float32(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             Arc::new(Float32Array::new(ScalarBuffer::from(scattered), null_buf))
         }
         RawColumnData::Float64(values) => {
-            let scattered = scatter_fixed(values, &null_bitmap, num_rows);
+            let scattered = scatter_fixed(values, scatter_bitmap, num_rows);
             Arc::new(Float64Array::new(ScalarBuffer::from(scattered), null_buf))
         }
         RawColumnData::Binary { offsets, data } => {
             let (i32_offsets, out_data) =
-                scatter_binary_offsets(offsets, data, &null_bitmap, num_rows);
+                scatter_binary_offsets(offsets, data, scatter_bitmap, num_rows);
             let offset_buf = OffsetBuffer::new(ScalarBuffer::from(i32_offsets));
             match dt {
                 DataType::Utf8 => Arc::new(StringArray::new(
@@ -301,8 +312,8 @@ fn build_array(
             millis,
             nanos_of_milli,
         } => {
-            let millis_scattered = scatter_fixed(millis, &null_bitmap, num_rows);
-            let nanos_scattered = scatter_fixed(nanos_of_milli, &null_bitmap, num_rows);
+            let millis_scattered = scatter_fixed(millis, scatter_bitmap, num_rows);
+            let nanos_scattered = scatter_fixed(nanos_of_milli, scatter_bitmap, num_rows);
 
             match dt {
                 DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
@@ -802,6 +813,7 @@ impl BucketReader {
                 &self.col_types[i],
                 null_bitmap,
                 col_rows,
+                self.encodings[i] == ENCODING_CONST && const_values_are_dense(variant),
             )?);
         }
 
@@ -1073,7 +1085,13 @@ impl ColumnPageReader {
             _ => empty_raw_data_for_type(&self.col_type),
         };
 
-        build_array(data, &self.col_type, null_bitmap, num_rows)
+        build_array(
+            data,
+            &self.col_type,
+            null_bitmap,
+            num_rows,
+            self.encoding == ENCODING_CONST && const_values_are_dense(variant),
+        )
     }
 }
 
@@ -1173,7 +1191,10 @@ fn read_all_const(
     null_bitmap: &[u8],
     variant: DataVariant,
 ) -> io::Result<RawColumnData> {
-    let non_null_count = if has_nulls {
+    // Fixed-width values can be materialized densely and use the Arrow null bitmap to hide null
+    // slots. Keep variable-width values compact: repeating their payload into null slots can
+    // significantly amplify memory for large constants and sparse columns.
+    let stored_values = if matches!(variant, DataVariant::Binary) && has_nulls {
         count_non_null(null_bitmap, num_rows)
     } else {
         num_rows
@@ -1188,9 +1209,7 @@ fn read_all_const(
             let mut buf = vec![0u8; num_rows.div_ceil(8)];
             if b {
                 for row in 0..num_rows {
-                    if !has_nulls || !is_null(null_bitmap, row) {
-                        buf[row / 8] |= 1 << (row % 8);
-                    }
+                    buf[row / 8] |= 1 << (row % 8);
                 }
             }
             Ok(RawColumnData::Boolean(buf))
@@ -1200,7 +1219,7 @@ fn read_all_const(
                 Value::TinyInt(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i8; non_null_count];
+            let mut out = vec![0i8; num_rows];
             out.fill(v);
             Ok(RawColumnData::Int8(out))
         }
@@ -1209,7 +1228,7 @@ fn read_all_const(
                 Value::SmallInt(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i16; non_null_count];
+            let mut out = vec![0i16; num_rows];
             out.fill(v);
             Ok(RawColumnData::Int16(out))
         }
@@ -1218,7 +1237,7 @@ fn read_all_const(
                 Value::Integer(x) | Value::Date(x) | Value::Time(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i32; non_null_count];
+            let mut out = vec![0i32; num_rows];
             out.fill(v);
             Ok(RawColumnData::Int32(out))
         }
@@ -1230,7 +1249,7 @@ fn read_all_const(
                 | Value::TimestampMicros(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i64; non_null_count];
+            let mut out = vec![0i64; num_rows];
             out.fill(v);
             Ok(RawColumnData::Int64(out))
         }
@@ -1239,7 +1258,7 @@ fn read_all_const(
                 Value::Float(x) => *x,
                 _ => 0.0,
             };
-            let mut out = vec![0.0f32; non_null_count];
+            let mut out = vec![0.0f32; num_rows];
             out.fill(v);
             Ok(RawColumnData::Float32(out))
         }
@@ -1248,7 +1267,7 @@ fn read_all_const(
                 Value::Double(x) => *x,
                 _ => 0.0,
             };
-            let mut out = vec![0.0f64; non_null_count];
+            let mut out = vec![0.0f64; num_rows];
             out.fill(v);
             Ok(RawColumnData::Float64(out))
         }
@@ -1257,10 +1276,10 @@ fn read_all_const(
                 Value::String(b) | Value::Bytes(b) | Value::DecimalLarge(b) => b.as_slice(),
                 _ => &[],
             };
-            let mut offsets = Vec::with_capacity(non_null_count + 1);
-            let mut data = Vec::with_capacity(non_null_count * bytes.len());
+            let mut offsets = Vec::with_capacity(stored_values + 1);
+            let mut data = Vec::with_capacity(stored_values * bytes.len());
             offsets.push(0u32);
-            for _ in 0..non_null_count {
+            for _ in 0..stored_values {
                 data.extend_from_slice(bytes);
                 offsets.push(data.len() as u32);
             }
@@ -1274,8 +1293,8 @@ fn read_all_const(
                 } => (*millis, *nanos_of_milli),
                 _ => (0, 0),
             };
-            let mut millis_out = vec![0i64; non_null_count];
-            let mut nanos_out = vec![0i32; non_null_count];
+            let mut millis_out = vec![0i64; num_rows];
+            let mut nanos_out = vec![0i32; num_rows];
             millis_out.fill(m);
             nanos_out.fill(n);
             Ok(RawColumnData::TimestampNanos {
