@@ -120,6 +120,9 @@ final class NativeLib {
     static native long nativeReaderOpen(Object inputFile, long fileLength);
     static native void nativeReaderFree(long handle);
     static native int nativeReaderExportSchema(long handle, long schemaAddr);
+    static native long nativeReaderCopySchema(long handle);
+    static native boolean nativeReaderSchemaEquals(long handle, long schemaHandle);
+    static native void nativeReaderSchemaFree(long schemaHandle);
     static native int nativeReaderNumRowGroups(long handle);
     static native long nativeReaderOpenRowGroup(long handle, int rgIndex);
     static native void nativeReaderSetProjection(long handle, String[] columns);

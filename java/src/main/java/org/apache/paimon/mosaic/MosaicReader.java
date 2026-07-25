@@ -41,26 +41,45 @@ public class MosaicReader implements AutoCloseable {
 
     private long handle;
     private final Schema schema;
+    private final boolean reusedSchemaCache;
     private Schema readSchema;
 
-    private MosaicReader(long handle, BufferAllocator allocator) {
+    private MosaicReader(long handle, BufferAllocator allocator, SchemaCache schemaCache) {
         this.handle = handle;
-        try (ArrowSchema cSchema = ArrowSchema.allocateNew(allocator)) {
-            int rc = NativeLib.nativeReaderExportSchema(handle, cSchema.memoryAddress());
-            if (rc != 0) {
-                throw new RuntimeException("failed to export schema");
+        if (schemaCache != null && schemaCache.matches(handle)) {
+            this.schema = schemaCache.schema;
+            this.reusedSchemaCache = true;
+        } else {
+            try (ArrowSchema cSchema = ArrowSchema.allocateNew(allocator)) {
+                int rc = NativeLib.nativeReaderExportSchema(handle, cSchema.memoryAddress());
+                if (rc != 0) {
+                    throw new RuntimeException("failed to export schema");
+                }
+                this.schema = Data.importSchema(allocator, cSchema, null);
             }
-            this.schema = Data.importSchema(allocator, cSchema, null);
+            this.reusedSchemaCache = false;
         }
+        this.readSchema = schema;
     }
 
     public static MosaicReader open(InputFile inputFile, long fileLength, BufferAllocator allocator) {
+        return open(inputFile, fileLength, allocator, null);
+    }
+
+    /**
+     * Opens a reader and reuses a previously cached Java schema after an exact native comparison.
+     */
+    public static MosaicReader open(
+            InputFile inputFile,
+            long fileLength,
+            BufferAllocator allocator,
+            SchemaCache schemaCache) {
         long handle = NativeLib.nativeReaderOpen(inputFile, fileLength);
         if (handle == 0) {
             throw new RuntimeException("failed to open reader");
         }
         try {
-            return new MosaicReader(handle, allocator);
+            return new MosaicReader(handle, allocator, schemaCache);
         } catch (RuntimeException | Error e) {
             NativeLib.nativeReaderFree(handle);
             throw e;
@@ -69,6 +88,23 @@ public class MosaicReader implements AutoCloseable {
 
     public Schema getSchema() {
         return schema;
+    }
+
+    /** Returns whether this reader reused the supplied schema cache. */
+    public boolean reusedSchemaCache() {
+        return reusedSchemaCache;
+    }
+
+    /** Captures this reader's logical schema for exact comparison by subsequent readers. */
+    public SchemaCache createSchemaCache() {
+        if (handle == 0) {
+            throw new IllegalStateException("reader is closed");
+        }
+        long schemaHandle = NativeLib.nativeReaderCopySchema(handle);
+        if (schemaHandle == 0) {
+            throw new RuntimeException("failed to copy native schema");
+        }
+        return new SchemaCache(schemaHandle, schema);
     }
 
     public int numRowGroups() {
@@ -151,8 +187,7 @@ public class MosaicReader implements AutoCloseable {
 
             StructVector vector = StructVector.emptyWithDuplicates("", allocator);
             try {
-                Schema projectedSchema = readSchema == null ? schema : readSchema;
-                vector.initializeChildrenFromFields(projectedSchema.getFields());
+                vector.initializeChildrenFromFields(readSchema.getFields());
                 Data.importIntoVector(allocator, arrowArray, vector, null);
                 return vector;
             } catch (RuntimeException | Error failure) {
@@ -193,6 +228,36 @@ public class MosaicReader implements AutoCloseable {
         if (handle != 0) {
             NativeLib.nativeReaderFree(handle);
             handle = 0;
+        }
+    }
+
+    /**
+     * Exact native schema token paired with its immutable Java Arrow schema.
+     *
+     * <p>The token must be closed when no longer needed.
+     */
+    public static final class SchemaCache implements AutoCloseable {
+        private long handle;
+        private final Schema schema;
+
+        private SchemaCache(long handle, Schema schema) {
+            this.handle = handle;
+            this.schema = schema;
+        }
+
+        private boolean matches(long readerHandle) {
+            if (handle == 0) {
+                throw new IllegalStateException("schema cache is closed");
+            }
+            return NativeLib.nativeReaderSchemaEquals(readerHandle, handle);
+        }
+
+        @Override
+        public void close() {
+            if (handle != 0) {
+                NativeLib.nativeReaderSchemaFree(handle);
+                handle = 0;
+            }
         }
     }
 }
