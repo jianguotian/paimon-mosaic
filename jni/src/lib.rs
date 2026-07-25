@@ -23,13 +23,13 @@ use std::sync::Arc;
 use jni::objects::{
     GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JValue,
 };
-use jni::sys::{jint, jlong, jlongArray};
+use jni::sys::{jboolean, jint, jlong, jlongArray};
 use jni::JNIEnv;
 use jni::JavaVM;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{RecordBatch, StructArray};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 
 use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess, RowGroupReader};
 use mosaic_core::spec::*;
@@ -178,6 +178,41 @@ impl InputFile for JniInputFile {
 struct ReaderHandle {
     reader: Box<dyn ReaderAccess>,
     _input_file_ref: Option<GlobalRef>,
+}
+
+struct ReaderSchemaHandle {
+    fields: Vec<(String, DataType, bool)>,
+}
+
+fn logical_schema_fields(reader: &dyn ReaderAccess) -> Vec<(String, DataType, bool)> {
+    let schema = reader.schema();
+    schema
+        .original_order
+        .iter()
+        .map(|&index| {
+            let column = &schema.columns[index];
+            (
+                column.name.clone(),
+                column.data_type.clone(),
+                column.nullable,
+            )
+        })
+        .collect()
+}
+
+fn logical_schema_equals(reader: &dyn ReaderAccess, cached: &[(String, DataType, bool)]) -> bool {
+    let schema = reader.schema();
+    if schema.original_order.len() != cached.len() {
+        return false;
+    }
+    schema
+        .original_order
+        .iter()
+        .zip(cached)
+        .all(|(&index, (name, data_type, nullable))| {
+            let column = &schema.columns[index];
+            column.name == *name && column.data_type == *data_type && column.nullable == *nullable
+        })
 }
 
 fn bytemuck_cast(data: &[u8]) -> &[i8] {
@@ -684,6 +719,58 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExpor
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderCopySchema(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle == 0 {
+        return 0;
+    }
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let reader = unsafe { &*(handle as *const ReaderHandle) };
+        let schema = ReaderSchemaHandle {
+            fields: logical_schema_fields(&*reader.reader),
+        };
+        Box::into_raw(Box::new(schema)) as jlong
+    }));
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSchemaEquals(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    schema_handle: jlong,
+) -> jboolean {
+    if handle == 0 || schema_handle == 0 {
+        return 0;
+    }
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let reader = unsafe { &*(handle as *const ReaderHandle) };
+        let cached = unsafe { &*(schema_handle as *const ReaderSchemaHandle) };
+        logical_schema_equals(&*reader.reader, &cached.fields)
+    }));
+    if result.unwrap_or(false) {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSchemaFree(
+    _env: JNIEnv,
+    _class: JClass,
+    schema_handle: jlong,
+) {
+    if schema_handle != 0 {
+        unsafe { drop(Box::from_raw(schema_handle as *mut ReaderSchemaHandle)) };
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderNumRowGroups(
     _env: JNIEnv,
     _class: JClass,
@@ -968,8 +1055,8 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
             throw(&mut env, "null handle");
             return -1;
         }
-        if array_addr == 0 || schema_addr == 0 {
-            throw(&mut env, "null ArrowArray or ArrowSchema address");
+        if array_addr == 0 {
+            throw(&mut env, "null ArrowArray address");
             return -1;
         }
         let rg = unsafe { &mut *(handle as *mut RowGroupReaderHandle) };
@@ -982,6 +1069,13 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
         };
 
         let struct_array = StructArray::from(batch);
+        if schema_addr == 0 {
+            let ffi_array = FFI_ArrowArray::new(&struct_array.into());
+            unsafe {
+                ptr::write(array_addr as *mut FFI_ArrowArray, ffi_array);
+            }
+            return 0;
+        }
         match arrow_array::ffi::to_ffi(&struct_array.into()) {
             Ok((ffi_array, ffi_schema)) => {
                 unsafe {

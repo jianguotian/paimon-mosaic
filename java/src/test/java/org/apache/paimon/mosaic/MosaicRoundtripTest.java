@@ -23,12 +23,15 @@ import java.io.ByteArrayOutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
@@ -41,6 +44,7 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.complex.impl.UnionListWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.TimeUnit;
@@ -81,11 +85,39 @@ public class MosaicRoundtripTest {
         return baos.toByteArray();
     }
 
+    private byte[] writeSchemaCacheFixture(Schema schema) {
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            for (FieldVector vector : root.getFieldVectors()) {
+                if (vector instanceof IntVector) {
+                    IntVector ints = (IntVector) vector;
+                    ints.allocateNew(1);
+                    ints.set(0, 7);
+                } else if (vector instanceof BigIntVector) {
+                    BigIntVector longs = (BigIntVector) vector;
+                    longs.allocateNew(1);
+                    longs.set(0, 9L);
+                } else if (vector instanceof VarCharVector) {
+                    VarCharVector strings = (VarCharVector) vector;
+                    strings.allocateNew();
+                    strings.setSafe(0, "value".getBytes());
+                } else {
+                    throw new AssertionError("unsupported schema-cache fixture vector: " + vector);
+                }
+            }
+            root.setRowCount(1);
+            return writeToBytes(schema, writer -> writer.write(root));
+        }
+    }
+
     private MosaicReader readerFromBytes(byte[] data) {
+        return readerFromBytes(data, null);
+    }
+
+    private MosaicReader readerFromBytes(byte[] data, MosaicReader.SchemaCache schemaCache) {
         InputFile inputFile = (position, buffer, offset, length) -> {
             System.arraycopy(data, (int) position, buffer, offset, length);
         };
-        return MosaicReader.open(inputFile, data.length, allocator);
+        return MosaicReader.open(inputFile, data.length, allocator, schemaCache);
     }
 
     private static void awaitGarbageCollection(WeakReference<?> reference) throws InterruptedException {
@@ -182,6 +214,67 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testSchemaCacheReusesOnlyExactLogicalSchema() {
+        Schema baseSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("id", new ArrowType.Int(32, true)),
+                                Field.nullable("name", ArrowType.Utf8.INSTANCE)));
+        Schema[] changedSchemas = {
+            new Schema(
+                    Arrays.asList(
+                            Field.notNullable("id", new ArrowType.Int(64, true)),
+                            Field.nullable("name", ArrowType.Utf8.INSTANCE))),
+            new Schema(
+                    Arrays.asList(
+                            Field.notNullable("identifier", new ArrowType.Int(32, true)),
+                            Field.nullable("name", ArrowType.Utf8.INSTANCE))),
+            new Schema(
+                    Arrays.asList(
+                            Field.nullable("name", ArrowType.Utf8.INSTANCE),
+                            Field.notNullable("id", new ArrowType.Int(32, true)))),
+            new Schema(
+                    Arrays.asList(
+                            Field.nullable("id", new ArrowType.Int(32, true)),
+                            Field.nullable("name", ArrowType.Utf8.INSTANCE)))
+        };
+
+        byte[] baseData = writeSchemaCacheFixture(baseSchema);
+        byte[][] changedData = new byte[changedSchemas.length][];
+        for (int i = 0; i < changedSchemas.length; i++) {
+            changedData[i] = writeSchemaCacheFixture(changedSchemas[i]);
+        }
+
+        Schema cachedJavaSchema;
+        try (MosaicReader firstReader = readerFromBytes(baseData);
+                MosaicReader.SchemaCache cache = firstReader.createSchemaCache()) {
+            assertFalse(firstReader.reusedSchemaCache());
+            cachedJavaSchema = firstReader.getSchema();
+
+            try (MosaicReader repeatedReader = readerFromBytes(baseData, cache)) {
+                assertTrue(repeatedReader.reusedSchemaCache());
+                assertSame(cachedJavaSchema, repeatedReader.getSchema());
+                try (StructVector batch = repeatedReader.readRowGroupStruct(0, allocator)) {
+                    assertEquals(1, batch.getValueCount());
+                    assertEquals(7, ((IntVector) batch.getChildByOrdinal(0)).get(0));
+                }
+            }
+
+            for (int i = 0; i < changedSchemas.length; i++) {
+                try (MosaicReader changedReader = readerFromBytes(changedData[i], cache)) {
+                    assertFalse(changedReader.reusedSchemaCache());
+                    assertNotSame(cachedJavaSchema, changedReader.getSchema());
+                    assertEquals(changedSchemas[i], changedReader.getSchema());
+                }
+            }
+
+            cache.close();
+            assertThrows(
+                    IllegalStateException.class, () -> readerFromBytes(baseData, cache));
+        }
+    }
+
+    @Test
     public void testNullValues() {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
@@ -236,6 +329,47 @@ public class MosaicRoundtripTest {
 
                     assertFalse(readValues.isNull(0));
                     assertTrue(readValues.isNull(2));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testSharedAllNullArraysCanBeExportedThroughJni() {
+        int columnCount = 12;
+        int rowCount = 30;
+        List<Field> fields = new ArrayList<>();
+        for (int column = 0; column < columnCount; column++) {
+            fields.add(
+                    Field.nullable(
+                            "null_" + column, new ArrowType.Int(32, true)));
+        }
+        Schema arrowSchema = new Schema(fields);
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            for (FieldVector fieldVector : root.getFieldVectors()) {
+                IntVector vector = (IntVector) fieldVector;
+                vector.allocateNew(rowCount);
+                for (int row = 0; row < rowCount; row++) {
+                    vector.setNull(row);
+                }
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                StructVector batch = reader.readRowGroupStruct(0, allocator)) {
+            assertEquals(columnCount, batch.size());
+            assertEquals(rowCount, batch.getValueCount());
+            for (int column = 0; column < columnCount; column++) {
+                IntVector vector = (IntVector) batch.getChildByOrdinal(column);
+                assertEquals("null_" + column, vector.getName());
+                assertEquals(rowCount, vector.getValueCount());
+                assertEquals(rowCount, vector.getNullCount());
+                for (int row = 0; row < rowCount; row++) {
+                    assertTrue(vector.isNull(row));
                 }
             }
         }
@@ -332,6 +466,22 @@ public class MosaicRoundtripTest {
                     assertEquals(i * 0.5, cOut.get(i), 1e-10);
                 }
             }
+            try (StructVector batch = reader.readRowGroupStruct(0, allocator)) {
+                assertEquals(3, batch.size());
+                assertEquals("c", batch.getChildByOrdinal(0).getName());
+                assertEquals("a", batch.getChildByOrdinal(1).getName());
+                assertEquals("b", batch.getChildByOrdinal(2).getName());
+                assertEquals(10, batch.getValueCount());
+
+                Float8Vector cOut = (Float8Vector) batch.getChildByOrdinal(0);
+                IntVector aOut = (IntVector) batch.getChildByOrdinal(1);
+                VarCharVector bOut = (VarCharVector) batch.getChildByOrdinal(2);
+                for (int i = 0; i < 10; i++) {
+                    assertEquals(i, aOut.get(i));
+                    assertEquals("s" + i, new String(bOut.get(i)));
+                    assertEquals(i * 0.5, cOut.get(i), 1e-10);
+                }
+            }
         }
     }
 
@@ -363,6 +513,10 @@ public class MosaicRoundtripTest {
             try (VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
                 assertEquals(0, batch.getFieldVectors().size());
                 assertEquals(5, batch.getRowCount());
+            }
+            try (StructVector batch = reader.readRowGroupStruct(0, allocator)) {
+                assertEquals(0, batch.size());
+                assertEquals(5, batch.getValueCount());
             }
         }
     }

@@ -21,7 +21,9 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
+use crate::bucket_reader::{
+    read_typed_value, read_variable_value, AllNullArrayCache, BucketReader, ColumnPageReader,
+};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
 use crate::stats::{self, ColumnStats};
@@ -1506,6 +1508,7 @@ impl RowGroupReader {
     pub fn read_columns(&mut self) -> io::Result<RecordBatch> {
         let num_cols = self.num_columns;
         let mut arrays: Vec<Option<ArrayRef>> = vec![None; num_cols];
+        let mut all_null_cache = AllNullArrayCache::default();
 
         for &bucket_id in &self.active_buckets {
             let global_indices = &self.bucket_to_global[bucket_id];
@@ -1524,7 +1527,7 @@ impl RowGroupReader {
                     let mut phys_arrays: Vec<ArrayRef> = Vec::new();
                     for (idx, cr_opt) in column_readers.iter().enumerate() {
                         if let Some(ref cr) = cr_opt {
-                            phys_arrays.push(cr.read_all()?);
+                            phys_arrays.push(cr.read_all_with_cache(&mut all_null_cache)?);
                         } else {
                             let dt = phys_types.get(idx).unwrap_or(&DataType::Int32);
                             let rows = if idx < global_indices.len() {
@@ -1532,7 +1535,7 @@ impl RowGroupReader {
                             } else {
                                 0
                             };
-                            phys_arrays.push(arrow_array::new_null_array(dt, rows));
+                            phys_arrays.push(all_null_cache.get_or_insert(dt, rows));
                         }
                     }
 
@@ -1565,7 +1568,7 @@ impl RowGroupReader {
                     }
                 }
                 BucketState::Monolithic { reader } => {
-                    let columns = reader.read_all_columns()?;
+                    let columns = reader.read_all_columns_with_cache(&mut all_null_cache)?;
                     for (local_idx, &global_idx) in global_indices.iter().enumerate() {
                         if !self.projected_columns[global_idx] {
                             continue;
