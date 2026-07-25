@@ -23,12 +23,15 @@ import java.io.ByteArrayOutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
@@ -236,6 +239,47 @@ public class MosaicRoundtripTest {
 
                     assertFalse(readValues.isNull(0));
                     assertTrue(readValues.isNull(2));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testSharedAllNullArraysCanBeExportedThroughJni() {
+        int columnCount = 12;
+        int rowCount = 30;
+        List<Field> fields = new ArrayList<>();
+        for (int column = 0; column < columnCount; column++) {
+            fields.add(
+                    Field.nullable(
+                            "null_" + column, new ArrowType.Int(32, true)));
+        }
+        Schema arrowSchema = new Schema(fields);
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            for (FieldVector fieldVector : root.getFieldVectors()) {
+                IntVector vector = (IntVector) fieldVector;
+                vector.allocateNew(rowCount);
+                for (int row = 0; row < rowCount; row++) {
+                    vector.setNull(row);
+                }
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(columnCount, batch.getFieldVectors().size());
+            assertEquals(rowCount, batch.getRowCount());
+            for (int column = 0; column < columnCount; column++) {
+                IntVector vector = (IntVector) batch.getVector(column);
+                assertEquals("null_" + column, vector.getName());
+                assertEquals(rowCount, vector.getValueCount());
+                assertEquals(rowCount, vector.getNullCount());
+                for (int row = 0; row < rowCount; row++) {
+                    assertTrue(vector.isNull(row));
                 }
             }
         }
