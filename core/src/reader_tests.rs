@@ -1687,6 +1687,72 @@ fn test_const_encoding_with_nulls() {
 }
 
 #[test]
+fn test_const_encoding_with_nulls_all_primitive_types() {
+    let columns = vec![
+        ("bool".to_string(), DataType::Boolean, true),
+        ("tiny".to_string(), DataType::Int8, true),
+        ("small".to_string(), DataType::Int16, true),
+        ("int".to_string(), DataType::Int32, true),
+        ("big".to_string(), DataType::Int64, true),
+        ("float".to_string(), DataType::Float32, true),
+        ("double".to_string(), DataType::Float64, true),
+        ("string".to_string(), DataType::Utf8, true),
+    ];
+    let rows: Vec<Vec<Value>> = (0..24)
+        .map(|i| {
+            if i % 4 == 0 {
+                vec![Value::Null; columns.len()]
+            } else {
+                vec![
+                    Value::Boolean(true),
+                    Value::TinyInt(-7),
+                    Value::SmallInt(1234),
+                    Value::Integer(-56789),
+                    Value::BigInt(9_876_543_210),
+                    Value::Float(1.25),
+                    Value::Double(-12.5),
+                    Value::String(b"constant".to_vec()),
+                ]
+            }
+        })
+        .collect();
+
+    let (reader, _) = write_and_read(columns, &rows);
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+
+    let bools = batch_col_bool(&batch, "bool");
+    let tiny = batch_col_i8(&batch, "tiny");
+    let small = batch_col_i16(&batch, "small");
+    let ints = batch_col_i32(&batch, "int");
+    let big = batch_col_i64(&batch, "big");
+    let floats = batch_col_f32(&batch, "float");
+    let doubles = batch_col_f64(&batch, "double");
+    let strings = batch_col_string(&batch, "string");
+    for i in 0..rows.len() {
+        if i % 4 == 0 {
+            assert!(bools.is_null(i));
+            assert!(tiny.is_null(i));
+            assert!(small.is_null(i));
+            assert!(ints.is_null(i));
+            assert!(big.is_null(i));
+            assert!(floats.is_null(i));
+            assert!(doubles.is_null(i));
+            assert!(strings.is_null(i));
+        } else {
+            assert!(bools.value(i));
+            assert_eq!(tiny.value(i), -7);
+            assert_eq!(small.value(i), 1234);
+            assert_eq!(ints.value(i), -56789);
+            assert_eq!(big.value(i), 9_876_543_210);
+            assert_eq!(floats.value(i), 1.25);
+            assert_eq!(doubles.value(i), -12.5);
+            assert_eq!(strings.value(i), "constant");
+        }
+    }
+}
+
+#[test]
 fn test_dict_encoding_with_nulls() {
     let columns = vec![("v".to_string(), DataType::Int32, true)];
     let mut rows = Vec::new();
