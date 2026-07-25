@@ -968,8 +968,8 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
             throw(&mut env, "null handle");
             return -1;
         }
-        if array_addr == 0 || schema_addr == 0 {
-            throw(&mut env, "null ArrowArray or ArrowSchema address");
+        if array_addr == 0 {
+            throw(&mut env, "null ArrowArray address");
             return -1;
         }
         let rg = unsafe { &mut *(handle as *mut RowGroupReaderHandle) };
@@ -982,6 +982,13 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
         };
 
         let struct_array = StructArray::from(batch);
+        if schema_addr == 0 {
+            let ffi_array = FFI_ArrowArray::new(&struct_array.into());
+            unsafe {
+                ptr::write(array_addr as *mut FFI_ArrowArray, ffi_array);
+            }
+            return 0;
+        }
         match arrow_array::ffi::to_ffi(&struct_array.into()) {
             Ok((ffi_array, ffi_schema)) => {
                 unsafe {
