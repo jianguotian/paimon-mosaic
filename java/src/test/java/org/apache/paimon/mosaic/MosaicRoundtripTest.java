@@ -282,6 +282,36 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testNativeColumnarJsonWritesNullableConstantInt16Blocks() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable("i16", new ArrowType.Int(16, true))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            SmallIntVector values = (SmallIntVector) root.getVector("i16");
+            values.allocateNew(17);
+            int[] nonNullRows = {1, 3, 4, 7, 8, 10, 12, 13, 15, 16};
+            for (int row : nonNullRows) {
+                values.set(row, 0);
+            }
+            root.setRowCount(17);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertTrue(reader.writeRowGroupColumnarJson(0, output));
+            assertEquals(
+                    "{\"i16\":\",0,,0,0,,,0,0,,0,,0,0,,0,0\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
     public void testNativeColumnarJsonMatchesJavaDoubleFormattingBoundaries() {
         Schema arrowSchema =
                 new Schema(
