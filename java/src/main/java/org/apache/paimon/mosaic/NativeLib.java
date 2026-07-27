@@ -128,6 +128,8 @@ final class NativeLib {
     static native void nativeReaderSetProjection(long handle, String[] columns);
     static native boolean nativeReaderWriteRowGroupColumnarJson(
             long handle, int rgIndex, OutputStream output);
+    static native boolean nativeReaderWriteRowGroupColumnarJsonZstd(
+            long handle, int rgIndex, OutputStream output, int zstdLevel);
 
     // RowGroupReader
     static native int nativeRowGroupReaderNumRows(long handle);
