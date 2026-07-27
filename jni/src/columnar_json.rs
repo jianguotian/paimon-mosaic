@@ -34,19 +34,15 @@ const COMMA_BLOCK: [u8; 64] = [b','; 64];
 const ZERO_INT16_FIRST_BLOCK: &[u8] = b"0,0,0,0,0,0,0,0";
 #[cfg(test)]
 const ZERO_INT16_BLOCK: &[u8] = b",0,0,0,0,0,0,0,0";
-#[cfg(test)]
 const ZERO_INT16_FIRST_BLOCKS: ZeroInt16Blocks = zero_int16_blocks(true);
-#[cfg(test)]
 const ZERO_INT16_BLOCKS: ZeroInt16Blocks = zero_int16_blocks(false);
 const REPEATED_VALUE_BUFFER_BYTES: usize = 64 * 1024;
 
-#[cfg(test)]
 struct ZeroInt16Blocks {
     bytes: [[u8; 16]; 256],
     lengths: [u8; 256],
 }
 
-#[cfg(test)]
 const fn zero_int16_blocks(first_block: bool) -> ZeroInt16Blocks {
     let mut blocks = ZeroInt16Blocks {
         bytes: [[0; 16]; 256],
@@ -252,6 +248,16 @@ impl<W: Write> EncodedJsonWriter<'_, W> {
         let value = column
             .constant()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing CONST value"))?;
+        if column.has_nulls()
+            && matches!(data_type, DataType::Int16)
+            && matches!(value, EncodedValueRef::Int16(0))
+        {
+            return write_nullable_zero_int16_constant(
+                self.output,
+                column,
+                &mut self.repeated_buffer,
+            );
+        }
         self.value_buffer.clear();
         write_encoded_value(&mut self.value_buffer, data_type, value, false)?;
         if column.has_nulls() {
@@ -349,6 +355,55 @@ fn write_repeated_value<W: Write>(
     Ok(())
 }
 
+fn write_nullable_zero_int16_constant<W: Write>(
+    output: &mut W,
+    column: EncodedColumn<'_>,
+    repeated_buffer: &mut Vec<u8>,
+) -> io::Result<()> {
+    let null_bitmap = column.null_bitmap().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "nullable CONST column is missing its null bitmap",
+        )
+    })?;
+    repeated_buffer.clear();
+
+    let mut row = 0usize;
+    while row + 8 <= column.num_rows() {
+        let validity = !null_bitmap[row / 8];
+        let block = zero_int16_block(validity, row == 0);
+        if !repeated_buffer.is_empty()
+            && repeated_buffer.len().saturating_add(block.len()) > REPEATED_VALUE_BUFFER_BYTES
+        {
+            output.write_all(repeated_buffer)?;
+            repeated_buffer.clear();
+        }
+        repeated_buffer.extend_from_slice(block);
+        row += 8;
+    }
+
+    while row < column.num_rows() {
+        if !repeated_buffer.is_empty()
+            && repeated_buffer.len().saturating_add(2) > REPEATED_VALUE_BUFFER_BYTES
+        {
+            output.write_all(repeated_buffer)?;
+            repeated_buffer.clear();
+        }
+        if row > 0 {
+            repeated_buffer.push(b',');
+        }
+        if null_bitmap[row / 8] & (1 << (row % 8)) == 0 {
+            repeated_buffer.push(b'0');
+        }
+        row += 1;
+    }
+
+    if !repeated_buffer.is_empty() {
+        output.write_all(repeated_buffer)?;
+    }
+    Ok(())
+}
+
 fn write_nullable_repeated_value<W: Write>(
     output: &mut W,
     value: &[u8],
@@ -378,7 +433,6 @@ fn write_nullable_repeated_value<W: Write>(
     Ok(())
 }
 
-#[cfg(test)]
 fn zero_int16_block(validity: u8, first_block: bool) -> &'static [u8] {
     let blocks = if first_block {
         &ZERO_INT16_FIRST_BLOCKS
