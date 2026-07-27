@@ -36,6 +36,7 @@ use mosaic_core::spec::*;
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
 mod columnar_json;
+mod java_compatible_zstd;
 
 fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<String>() {
@@ -1190,6 +1191,116 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWrite
                 &mut env,
                 &output_exception,
                 &format!("columnar JSON output flush failed: {}", e.into_error()),
+            );
+            return 0;
+        }
+        1
+    }));
+    match result {
+        Ok(value) => value,
+        Err(e) => {
+            let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
+            throw(&mut env, &panic_message(&e));
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWriteRowGroupColumnarJsonZstd(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+    output: JObject,
+    zstd_level: jint,
+) -> jboolean {
+    const JSON_BUFFER_BYTES: usize = 256 * 1024;
+
+    let raw_env = env.get_raw();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle == 0 {
+            throw(&mut env, "null reader handle");
+            return 0;
+        }
+
+        let rh = unsafe { &*(handle as *const ReaderHandle) };
+        let row_group = match rh.reader.row_group_reader(rg_index as usize) {
+            Ok(row_group) => row_group,
+            Err(e) => {
+                throw_callback_or_runtime(
+                    &mut env,
+                    &rh.callback_exception,
+                    &format!("open row group failed: {}", e),
+                );
+                return 0;
+            }
+        };
+
+        match columnar_json::is_encoded_supported(&row_group) {
+            Ok(false) => return 0,
+            Ok(true) => {}
+            Err(e) => {
+                throw(
+                    &mut env,
+                    &format!("columnar JSON compatibility check failed: {}", e),
+                );
+                return 0;
+            }
+        }
+
+        let output_exception = Arc::new(JavaExceptionSlot::default());
+        let output = match new_jni_output_file(&mut env, &output, output_exception.clone()) {
+            Ok(output) => output,
+            Err(e) => {
+                throw(&mut env, &e);
+                return 0;
+            }
+        };
+        let encoder = match java_compatible_zstd::JavaCompatibleZstdEncoder::new(output, zstd_level)
+        {
+            Ok(encoder) => encoder,
+            Err(e) => {
+                throw(&mut env, &format!("create Zstd encoder failed: {}", e));
+                return 0;
+            }
+        };
+        let mut buffered = BufWriter::with_capacity(JSON_BUFFER_BYTES, encoder);
+        if let Err(e) = columnar_json::write_encoded_supported(&row_group, &mut buffered) {
+            throw_callback_or_runtime(
+                &mut env,
+                &output_exception,
+                &format!("columnar JSON write failed: {}", e),
+            );
+            return 0;
+        }
+        let encoder = match buffered.into_inner() {
+            Ok(encoder) => encoder,
+            Err(e) => {
+                throw_callback_or_runtime(
+                    &mut env,
+                    &output_exception,
+                    &format!("columnar JSON buffer flush failed: {}", e.into_error()),
+                );
+                return 0;
+            }
+        };
+        let mut output = match encoder.finish() {
+            Ok(output) => output,
+            Err(e) => {
+                throw_callback_or_runtime(
+                    &mut env,
+                    &output_exception,
+                    &format!("finish Zstd output failed: {}", e),
+                );
+                return 0;
+            }
+        };
+        if let Err(e) = OutputFile::flush(&mut output) {
+            throw_callback_or_runtime(
+                &mut env,
+                &output_exception,
+                &format!("flush Zstd output failed: {}", e),
             );
             return 0;
         }
