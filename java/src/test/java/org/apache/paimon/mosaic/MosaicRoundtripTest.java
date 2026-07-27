@@ -20,10 +20,12 @@
 package org.apache.paimon.mosaic;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
+import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -94,7 +96,14 @@ public class MosaicRoundtripTest {
             System.runFinalization();
             Thread.sleep(50L);
         }
-        assertNull("expected input file to be released after failed open", reference.get());
+        assertNull("expected native callback object to be released", reference.get());
+    }
+
+    private static void awaitGarbageCollection(List<WeakReference<?>> references)
+            throws InterruptedException {
+        for (WeakReference<?> reference : references) {
+            awaitGarbageCollection(reference);
+        }
     }
 
     private WeakReference<InputFile> openReaderWithClosedAllocator(byte[] data) {
@@ -111,6 +120,28 @@ public class MosaicRoundtripTest {
 
         assertThrows(RuntimeException.class, () -> MosaicReader.open(inputFile, data.length, failingAllocator));
         return reference;
+    }
+
+    private List<WeakReference<?>> openReaderWithFailingInput() {
+        IOException expected = new IOException("intentional native input failure");
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        throw expected;
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        IOException error =
+                assertThrows(
+                        IOException.class,
+                        () -> MosaicReader.open(inputFile, 64L, allocator));
+        assertSame(expected, error);
+        return Arrays.asList(inputReference, exceptionReference);
     }
 
     @Test
@@ -681,6 +712,12 @@ public class MosaicRoundtripTest {
 
         WeakReference<InputFile> reference = openReaderWithClosedAllocator(data);
         awaitGarbageCollection(reference);
+    }
+
+    @Test
+    public void testReaderOpenReleasesInputGlobalRefWhenReadFails() throws Exception {
+        List<WeakReference<?>> references = openReaderWithFailingInput();
+        awaitGarbageCollection(references);
     }
 
     @Test
