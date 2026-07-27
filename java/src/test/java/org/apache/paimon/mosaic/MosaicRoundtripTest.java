@@ -28,6 +28,8 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.arrow.c.jni.JniWrapper;
 import org.apache.arrow.memory.ArrowBuf;
@@ -209,6 +211,111 @@ public class MosaicRoundtripTest {
 
         assertThrows(RuntimeException.class, () -> MosaicReader.open(inputFile, data.length, failingAllocator));
         return reference;
+    }
+
+    private List<WeakReference<?>> openReaderWithFailingInput() {
+        IOException expected = new IOException("intentional native input failure");
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        throw expected;
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        IOException error =
+                assertThrows(
+                        IOException.class,
+                        () -> MosaicReader.open(inputFile, 64L, allocator));
+        assertSame(expected, error);
+        return Arrays.asList(inputReference, exceptionReference);
+    }
+
+    private List<WeakReference<?>> readRowGroupWithFailingInput(byte[] data) {
+        IOException expected = new IOException("intentional native background input failure");
+        long callingThreadId = Thread.currentThread().getId();
+        AtomicInteger reads = new AtomicInteger();
+        AtomicLong failingThreadId = new AtomicLong(-1L);
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        if (reads.incrementAndGet() == 1) {
+                            System.arraycopy(data, (int) position, buffer, offset, length);
+                            return;
+                        }
+                        failingThreadId.compareAndSet(-1L, Thread.currentThread().getId());
+                        throw expected;
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        long handle = NativeLib.nativeReaderOpen(inputFile, data.length);
+        assertNotEquals(0L, handle);
+        try {
+            IOException actual =
+                    assertThrows(
+                            IOException.class,
+                            () ->
+                                    NativeLib.nativeReaderWriteRowGroupColumnarJsonZstd(
+                                            handle, 0, new ByteArrayOutputStream(), 3));
+            assertSame(expected, actual);
+            assertTrue("expected a row-group read", reads.get() >= 2);
+            assertNotEquals(callingThreadId, failingThreadId.get());
+            assertEquals(1, NativeLib.nativeReaderNumRowGroups(handle));
+        } finally {
+            NativeLib.nativeReaderFree(handle);
+        }
+        return Arrays.asList(inputReference, exceptionReference);
+    }
+
+    private List<WeakReference<?>> writeWithFailingNativeOutput(
+            MosaicReader reader, boolean failOnFlush) {
+        String message =
+                failOnFlush
+                        ? "intentional native flush failure"
+                        : "intentional native output failure";
+        IOException expected = new IOException(message);
+        OutputStream output =
+                new OutputStream() {
+                    @Override
+                    public void write(int value) throws IOException {
+                        if (!failOnFlush) {
+                            throw expected;
+                        }
+                    }
+
+                    @Override
+                    public void write(byte[] value, int offset, int length)
+                            throws IOException {
+                        if (!failOnFlush) {
+                            throw expected;
+                        }
+                    }
+
+                    @Override
+                    public void flush() throws IOException {
+                        if (failOnFlush) {
+                            throw expected;
+                        }
+                    }
+                };
+        WeakReference<OutputStream> outputReference = new WeakReference<>(output);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        IOException error =
+                assertThrows(
+                        IOException.class,
+                        () -> reader.writeRowGroupColumnarJsonZstd(0, output, 3));
+        assertSame(expected, error);
+        return Arrays.asList(outputReference, exceptionReference);
     }
 
     @Test
@@ -972,6 +1079,15 @@ public class MosaicRoundtripTest {
                     new String(
                             output.toByteArray(),
                             java.nio.charset.StandardCharsets.UTF_8));
+
+            List<WeakReference<?>> writeFailure =
+                    writeWithFailingNativeOutput(reader, false);
+            awaitGarbageCollection(writeFailure);
+
+            List<WeakReference<?>> flushFailure =
+                    writeWithFailingNativeOutput(reader, true);
+            awaitGarbageCollection(flushFailure);
+            assertEquals(1, reader.numRowGroups());
         }
     }
 
@@ -1063,6 +1179,11 @@ public class MosaicRoundtripTest {
             output.write(7);
             assertFalse(reader.writeRowGroupColumnarJson(0, output));
             assertArrayEquals(new byte[] {7}, output.toByteArray());
+
+            ByteArrayOutputStream compressed = new ByteArrayOutputStream();
+            compressed.write(9);
+            assertFalse(reader.writeRowGroupColumnarJsonZstd(0, compressed, 3));
+            assertArrayEquals(new byte[] {9}, compressed.toByteArray());
         }
     }
 
@@ -1566,6 +1687,31 @@ public class MosaicRoundtripTest {
 
         WeakReference<InputFile> reference = openReaderWithClosedAllocator(data);
         awaitGarbageCollection(reference);
+    }
+
+    @Test
+    public void testReaderOpenReleasesInputGlobalRefWhenReadFails() throws Exception {
+        List<WeakReference<?>> references = openReaderWithFailingInput();
+        awaitGarbageCollection(references);
+    }
+
+    @Test
+    public void testReaderRestoresBackgroundInputExceptionAndReleasesGlobalRef() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable("value", new ArrowType.Int(32, true))));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        List<WeakReference<?>> references = readRowGroupWithFailingInput(data);
+        awaitGarbageCollection(references);
     }
 
     @Test
