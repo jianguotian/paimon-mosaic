@@ -18,10 +18,10 @@
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use jni::objects::{
-    GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JValue,
+    GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JThrowable, JValue,
 };
 use jni::sys::{jint, jlong, jlongArray};
 use jni::JNIEnv;
@@ -45,9 +45,62 @@ fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+#[derive(Default)]
+struct JavaExceptionSlot {
+    throwable: Mutex<Option<GlobalRef>>,
+}
+
+impl JavaExceptionSlot {
+    fn capture(&self, env: &mut JNIEnv<'_>) -> io::Result<()> {
+        let throwable = env
+            .exception_occurred()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        env.exception_clear()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let global = env
+            .new_global_ref(&throwable)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut pending = self
+            .throwable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_none() {
+            *pending = Some(global);
+        }
+        Ok(())
+    }
+
+    fn take(&self) -> Option<GlobalRef> {
+        self.throwable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+fn callback_result<T>(
+    env: &mut JNIEnv<'_>,
+    exception: &JavaExceptionSlot,
+    result: jni::errors::Result<T>,
+    callback: &str,
+) -> io::Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(jni::errors::Error::JavaException) => {
+            exception.capture(env)?;
+            Err(io::Error::other(format!(
+                "{} threw a Java exception",
+                callback
+            )))
+        }
+        Err(e) => Err(io::Error::other(e.to_string())),
+    }
+}
+
 struct JniOutputFile {
     jvm: Arc<JavaVM>,
     stream_ref: GlobalRef,
+    callback_exception: Arc<JavaExceptionSlot>,
     write_mid: JMethodID,
     flush_mid: JMethodID,
     pos: u64,
@@ -88,7 +141,7 @@ impl OutputFile for JniOutputFile {
         env.set_byte_array_region(&byte_array, 0, bytemuck_cast(data))
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        unsafe {
+        let result = unsafe {
             env.call_method_unchecked(
                 &self.stream_ref,
                 self.write_mid,
@@ -99,8 +152,13 @@ impl OutputFile for JniOutputFile {
                     jni::sys::jvalue { i: len },
                 ],
             )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        }
+        };
+        callback_result(
+            &mut env,
+            &self.callback_exception,
+            result,
+            "OutputStream.write",
+        )?;
         #[allow(clippy::forget_non_drop)]
         std::mem::forget(byte_array);
         self.pos += data.len() as u64;
@@ -112,15 +170,20 @@ impl OutputFile for JniOutputFile {
             .jvm
             .attach_current_thread()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        unsafe {
+        let result = unsafe {
             env.call_method_unchecked(
                 &self.stream_ref,
                 self.flush_mid,
                 jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
                 &[],
             )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        }
+        };
+        callback_result(
+            &mut env,
+            &self.callback_exception,
+            result,
+            "OutputStream.flush",
+        )?;
         Ok(())
     }
 
@@ -134,6 +197,7 @@ impl OutputFile for JniOutputFile {
 struct JniInputFile {
     jvm: Arc<JavaVM>,
     input_file_ref: GlobalRef,
+    callback_exception: Arc<JavaExceptionSlot>,
 }
 
 unsafe impl Send for JniInputFile {}
@@ -153,7 +217,7 @@ impl InputFile for JniInputFile {
             .new_byte_array(buf.len() as i32)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        env.call_method(
+        let result = env.call_method(
             &self.input_file_ref,
             "readFully",
             "(J[BII)V",
@@ -163,8 +227,13 @@ impl InputFile for JniInputFile {
                 JValue::Int(0),
                 JValue::Int(buf.len() as jint),
             ],
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        );
+        callback_result(
+            &mut env,
+            &self.callback_exception,
+            result,
+            "InputFile.readFully",
+        )?;
 
         let i8_buf: &mut [i8] =
             unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut i8, buf.len()) };
@@ -178,6 +247,7 @@ impl InputFile for JniInputFile {
 struct ReaderHandle {
     reader: Box<dyn ReaderAccess>,
     _input_file_ref: Option<GlobalRef>,
+    callback_exception: Arc<JavaExceptionSlot>,
 }
 
 fn bytemuck_cast(data: &[u8]) -> &[i8] {
@@ -185,12 +255,40 @@ fn bytemuck_cast(data: &[u8]) -> &[i8] {
 }
 
 fn throw(env: &mut JNIEnv, msg: &str) {
-    let _ = env.throw_new("java/lang/RuntimeException", msg);
+    // Java callbacks such as InputFile.readFully and OutputStream.write/flush may throw checked
+    // exceptions. Preserve the original exception instead of making further JNI calls with an
+    // exception pending and attempting to replace it with a RuntimeException.
+    if matches!(env.exception_check(), Ok(false)) {
+        let _ = env.throw_new("java/lang/RuntimeException", msg);
+    }
+}
+
+fn throw_callback_or_runtime(env: &mut JNIEnv<'_>, exception: &JavaExceptionSlot, message: &str) {
+    let Some(throwable) = exception.take() else {
+        throw(env, message);
+        return;
+    };
+
+    let local = match env.new_local_ref(throwable.as_obj()) {
+        Ok(local) => local,
+        Err(e) => {
+            drop(throwable);
+            throw(
+                env,
+                &format!("failed to restore Java callback exception: {}", e),
+            );
+            return;
+        }
+    };
+    drop(throwable);
+    let throwable = JThrowable::from(local);
+    let _ = env.throw(throwable);
 }
 
 struct WriterHandle {
     inner: MosaicWriter<JniOutputFile>,
     _stream_ref: GlobalRef,
+    callback_exception: Arc<JavaExceptionSlot>,
 }
 
 // ======================== Writer ========================
@@ -258,9 +356,11 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
             }
         };
 
+        let callback_exception = Arc::new(JavaExceptionSlot::default());
         let jni_stream = JniOutputFile {
             jvm,
             stream_ref: stream_global.clone(),
+            callback_exception: callback_exception.clone(),
             write_mid,
             flush_mid,
             pos: 0,
@@ -317,13 +417,18 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
         let writer = match MosaicWriter::new(jni_stream, &arrow_schema, opts) {
             Ok(w) => w,
             Err(e) => {
-                throw(&mut env, &format!("writer open failed: {}", e));
+                throw_callback_or_runtime(
+                    &mut env,
+                    &callback_exception,
+                    &format!("writer open failed: {}", e),
+                );
                 return 0;
             }
         };
         let handle = Box::new(WriterHandle {
             inner: writer,
             _stream_ref: stream_global,
+            callback_exception,
         });
         Box::into_raw(handle) as jlong
     }));
@@ -350,7 +455,11 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterClose
         }
         let writer = unsafe { &mut *(handle as *mut WriterHandle) };
         if let Err(e) = writer.inner.close() {
-            throw(&mut env, &format!("close failed: {}", e));
+            throw_callback_or_runtime(
+                &mut env,
+                &writer.callback_exception,
+                &format!("close failed: {}", e),
+            );
         }
     }));
     if let Err(e) = result {
@@ -565,7 +674,11 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWrite
         let struct_array = StructArray::from(arr_data);
         let batch = RecordBatch::from(struct_array);
         if let Err(e) = writer.inner.write_batch(&batch) {
-            throw(&mut env, &format!("write_batch failed: {}", e));
+            throw_callback_or_runtime(
+                &mut env,
+                &writer.callback_exception,
+                &format!("write_batch failed: {}", e),
+            );
         }
     }));
     if let Err(e) = result {
@@ -578,6 +691,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWrite
 
 struct RowGroupReaderHandle {
     inner: RowGroupReader,
+    callback_exception: Arc<JavaExceptionSlot>,
 }
 
 #[no_mangle]
@@ -589,6 +703,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen(
 ) -> jlong {
     let raw_env = env.get_raw();
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let callback_exception = Arc::new(JavaExceptionSlot::default());
         let global = match env.new_global_ref(&input_file) {
             Ok(g) => g,
             Err(e) => {
@@ -610,6 +725,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen(
         let input = JniInputFile {
             jvm,
             input_file_ref: global.clone(),
+            callback_exception: callback_exception.clone(),
         };
 
         match MosaicReader::new(input, length) {
@@ -617,11 +733,17 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen(
                 let rh = ReaderHandle {
                     reader: Box::new(reader),
                     _input_file_ref: Some(global),
+                    callback_exception,
                 };
                 Box::into_raw(Box::new(rh)) as jlong
             }
             Err(e) => {
-                throw(&mut env, &format!("open failed: {}", e));
+                drop(global);
+                throw_callback_or_runtime(
+                    &mut env,
+                    &callback_exception,
+                    &format!("open failed: {}", e),
+                );
                 0
             }
         }
@@ -713,11 +835,18 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenR
         let rh = unsafe { &*(handle as *const ReaderHandle) };
         match rh.reader.row_group_reader(rg_index as usize) {
             Ok(rg) => {
-                let rg_handle = Box::new(RowGroupReaderHandle { inner: rg });
+                let rg_handle = Box::new(RowGroupReaderHandle {
+                    inner: rg,
+                    callback_exception: rh.callback_exception.clone(),
+                });
                 Box::into_raw(rg_handle) as jlong
             }
             Err(e) => {
-                throw(&mut env, &format!("open row group failed: {}", e));
+                throw_callback_or_runtime(
+                    &mut env,
+                    &rh.callback_exception,
+                    &format!("open row group failed: {}", e),
+                );
                 0
             }
         }
@@ -976,7 +1105,11 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
         let batch = match rg.inner.read_columns() {
             Ok(b) => b,
             Err(e) => {
-                throw(&mut env, &format!("read_columns failed: {}", e));
+                throw_callback_or_runtime(
+                    &mut env,
+                    &rg.callback_exception,
+                    &format!("read_columns failed: {}", e),
+                );
                 return -1;
             }
         };
