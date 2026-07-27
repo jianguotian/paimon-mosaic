@@ -123,6 +123,8 @@ final class NativeLib {
     static native int nativeReaderNumRowGroups(long handle);
     static native long nativeReaderOpenRowGroup(long handle, int rgIndex);
     static native void nativeReaderSetProjection(long handle, String[] columns);
+    static native boolean nativeReaderWriteRowGroupColumnarJson(
+            long handle, int rgIndex, OutputStream output);
 
     // RowGroupReader
     static native int nativeRowGroupReaderNumRows(long handle);
