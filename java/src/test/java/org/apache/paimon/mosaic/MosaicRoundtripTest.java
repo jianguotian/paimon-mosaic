@@ -907,6 +907,136 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testNativeColumnarJsonWritesExactPrimitiveProtocol() throws Exception {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable("i\"8", new ArrowType.Int(8, true)),
+                                Field.nullable("i16", new ArrowType.Int(16, true)),
+                                Field.nullable("i32", new ArrowType.Int(32, true)),
+                                Field.nullable("i64", new ArrowType.Int(64, true)),
+                                Field.nullable(
+                                        "double",
+                                        new ArrowType.FloatingPoint(
+                                                FloatingPointPrecision.DOUBLE)),
+                                Field.nullable("text", ArrowType.Utf8.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            TinyIntVector int8 = (TinyIntVector) root.getVector("i\"8");
+            SmallIntVector int16 = (SmallIntVector) root.getVector("i16");
+            IntVector int32 = (IntVector) root.getVector("i32");
+            BigIntVector int64 = (BigIntVector) root.getVector("i64");
+            Float8Vector doubles = (Float8Vector) root.getVector("double");
+            VarCharVector text = (VarCharVector) root.getVector("text");
+
+            int8.allocateNew(3);
+            int16.allocateNew(3);
+            int32.allocateNew(3);
+            int64.allocateNew(3);
+            doubles.allocateNew(3);
+            text.allocateNew();
+
+            int8.set(0, -1);
+            int8.setNull(1);
+            int8.set(2, 9);
+            int16.set(0, 0);
+            int16.set(1, -7);
+            int16.set(2, 12);
+            int32.set(0, Integer.MIN_VALUE);
+            int32.set(1, 0);
+            int32.set(2, Integer.MAX_VALUE);
+            int64.set(0, Long.MIN_VALUE);
+            int64.setNull(1);
+            int64.set(2, Long.MAX_VALUE);
+            doubles.set(0, -0.0);
+            doubles.set(1, 1.2);
+            doubles.set(2, 9_999_999.0);
+            text.setSafe(0, "a\"\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            text.setNull(1);
+            text.setSafe(2, "中\t".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(3);
+
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertTrue(reader.writeRowGroupColumnarJson(0, output));
+            assertEquals(
+                    "{\"i\\\"8\":\"-1,,9\",\"i16\":\"0,-7,12\","
+                            + "\"i32\":\"-2147483648,0,2147483647\","
+                            + "\"i64\":\"-9223372036854775808,,9223372036854775807\","
+                            + "\"double\":\"-0.0,1.2,9999999.0\","
+                            + "\"text\":\"a\\\"\\n,,中\\t\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testNativeColumnarJsonMatchesJavaDoubleFormattingBoundaries() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.FloatingPoint(
+                                                FloatingPointPrecision.DOUBLE))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            Float8Vector values = (Float8Vector) root.getVector("value");
+            values.allocateNew(5);
+            values.set(0, 1.25);
+            values.set(1, 0.0001);
+            values.set(2, 10_000_000.0);
+            values.set(3, 429_496_729.5);
+            values.set(4, 1_812_576.4000000001);
+            root.setRowCount(5);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertTrue(reader.writeRowGroupColumnarJson(0, output));
+            assertEquals(
+                    "{\"value\":\"1.25,1.0E-4,1.0E7,4.294967295E8,1812576.4000000001\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testNativeColumnarJsonUnsupportedDoubleDoesNotTouchOutput() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.FloatingPoint(
+                                                FloatingPointPrecision.DOUBLE))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            Float8Vector values = (Float8Vector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, Double.MIN_VALUE);
+            root.setRowCount(1);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(7);
+            assertFalse(reader.writeRowGroupColumnarJson(0, output));
+            assertArrayEquals(new byte[] {7}, output.toByteArray());
+        }
+    }
+
+    @Test
     public void testNullValues() {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),

@@ -27,6 +27,279 @@ use crate::types;
 use crate::values::Value;
 use crate::varint;
 
+/// Borrowed view of one encoded physical column.
+///
+/// This exposes the on-disk encoding to sinks which can consume values directly without first
+/// materializing an Arrow array.
+#[derive(Clone, Copy)]
+pub struct EncodedColumn<'a> {
+    data_type: &'a DataType,
+    encoding: u8,
+    has_nulls: bool,
+    null_bitmap: &'a [u8],
+    const_value: &'a Value,
+    dict_values: &'a [Value],
+    dict_bit_width: usize,
+    data: &'a [u8],
+    data_cursor: usize,
+    num_rows: usize,
+}
+
+impl<'a> EncodedColumn<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        data_type: &'a DataType,
+        encoding: u8,
+        has_nulls: bool,
+        null_bitmap: &'a [u8],
+        const_value: &'a Value,
+        dict_values: &'a [Value],
+        dict_bit_width: usize,
+        data: &'a [u8],
+        data_cursor: usize,
+        num_rows: usize,
+    ) -> Self {
+        Self {
+            data_type,
+            encoding,
+            has_nulls,
+            null_bitmap,
+            const_value,
+            dict_values,
+            dict_bit_width,
+            data,
+            data_cursor,
+            num_rows,
+        }
+    }
+
+    pub fn data_type(&self) -> &DataType {
+        self.data_type
+    }
+
+    pub fn encoding(&self) -> u8 {
+        self.encoding
+    }
+
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    pub fn has_nulls(&self) -> bool {
+        self.has_nulls || self.encoding == ENCODING_ALL_NULL
+    }
+
+    /// Returns the physical null bitmap when one is present.
+    ///
+    /// A set bit means that the corresponding row is null.
+    pub fn null_bitmap(&self) -> Option<&'a [u8]> {
+        self.has_nulls.then_some(self.null_bitmap)
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        debug_assert!(row < self.num_rows);
+        self.encoding == ENCODING_ALL_NULL || (self.has_nulls && is_null(self.null_bitmap, row))
+    }
+
+    pub fn constant(&self) -> Option<EncodedValueRef<'a>> {
+        (self.encoding == ENCODING_CONST).then(|| encoded_value_ref(self.const_value))
+    }
+
+    pub fn values(&self) -> EncodedColumnValues<'a> {
+        EncodedColumnValues {
+            column: *self,
+            row: 0,
+            data_cursor: self.data_cursor,
+            bit_offset: 0,
+            done: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum EncodedValueRef<'a> {
+    Null,
+    Boolean(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
+    Utf8(&'a [u8]),
+    Binary(&'a [u8]),
+    DecimalCompact(i64),
+    DecimalLarge(&'a [u8]),
+    Date32(i32),
+    Time32(i32),
+    TimestampMillis(i64),
+    TimestampMicros(i64),
+    TimestampNanos { millis: i64, nanos_of_milli: i32 },
+}
+
+pub struct EncodedColumnValues<'a> {
+    column: EncodedColumn<'a>,
+    row: usize,
+    data_cursor: usize,
+    bit_offset: usize,
+    done: bool,
+}
+
+impl<'a> Iterator for EncodedColumnValues<'a> {
+    type Item = io::Result<EncodedValueRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.row >= self.column.num_rows {
+            return None;
+        }
+
+        let row = self.row;
+        self.row += 1;
+        if self.column.is_null(row) {
+            return Some(Ok(EncodedValueRef::Null));
+        }
+
+        let value = match self.column.encoding {
+            ENCODING_CONST => Ok(encoded_value_ref(self.column.const_value)),
+            ENCODING_DICT => {
+                let index = read_bit_packed(
+                    self.column.data,
+                    self.column.data_cursor,
+                    self.bit_offset,
+                    self.column.dict_bit_width,
+                );
+                self.bit_offset += self.column.dict_bit_width;
+                self.column
+                    .dict_values
+                    .get(index)
+                    .map(encoded_value_ref)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt dict index"))
+            }
+            ENCODING_PLAIN => {
+                let result =
+                    read_encoded_value(self.column.data_type, self.column.data, self.data_cursor);
+                if let Ok((_, size)) = result {
+                    self.data_cursor += size;
+                }
+                result.map(|(value, _)| value)
+            }
+            ENCODING_ALL_NULL => Ok(EncodedValueRef::Null),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported encoding {}", self.column.encoding),
+            )),
+        };
+        if value.is_err() {
+            self.done = true;
+        }
+        Some(value)
+    }
+}
+
+fn encoded_value_ref(value: &Value) -> EncodedValueRef<'_> {
+    match value {
+        Value::Null => EncodedValueRef::Null,
+        Value::Boolean(value) => EncodedValueRef::Boolean(*value),
+        Value::TinyInt(value) => EncodedValueRef::Int8(*value),
+        Value::SmallInt(value) => EncodedValueRef::Int16(*value),
+        Value::Integer(value) => EncodedValueRef::Int32(*value),
+        Value::BigInt(value) => EncodedValueRef::Int64(*value),
+        Value::Float(value) => EncodedValueRef::Float32(*value),
+        Value::Double(value) => EncodedValueRef::Float64(*value),
+        Value::Date(value) => EncodedValueRef::Date32(*value),
+        Value::Time(value) => EncodedValueRef::Time32(*value),
+        Value::String(value) => EncodedValueRef::Utf8(value),
+        Value::Bytes(value) => EncodedValueRef::Binary(value),
+        Value::DecimalCompact(value) => EncodedValueRef::DecimalCompact(*value),
+        Value::DecimalLarge(value) => EncodedValueRef::DecimalLarge(value),
+        Value::TimestampMillis(value) => EncodedValueRef::TimestampMillis(*value),
+        Value::TimestampMicros(value) => EncodedValueRef::TimestampMicros(*value),
+        Value::TimestampNanos {
+            millis,
+            nanos_of_milli,
+        } => EncodedValueRef::TimestampNanos {
+            millis: *millis,
+            nanos_of_milli: *nanos_of_milli,
+        },
+    }
+}
+
+fn read_encoded_value<'a>(
+    data_type: &DataType,
+    data: &'a [u8],
+    position: usize,
+) -> io::Result<(EncodedValueRef<'a>, usize)> {
+    let width = types::fixed_width(data_type);
+    if width <= 0 {
+        let mut payload = position;
+        let length = varint::decode(data, &mut payload).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated varint in variable-length value",
+            )
+        })? as usize;
+        let end = payload
+            .checked_add(length)
+            .filter(|end| *end <= data.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "buffer truncated in variable-length value",
+                )
+            })?;
+        let value = match data_type {
+            DataType::Utf8 => EncodedValueRef::Utf8(&data[payload..end]),
+            DataType::Binary => EncodedValueRef::Binary(&data[payload..end]),
+            DataType::Decimal128(_, _) => EncodedValueRef::DecimalLarge(&data[payload..end]),
+            _ => EncodedValueRef::Null,
+        };
+        return Ok((value, end - position));
+    }
+
+    let width = width as usize;
+    let end = position
+        .checked_add(width)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "column data truncated"))?;
+    let bytes = &data[position..end];
+    let value = match data_type {
+        DataType::Boolean => EncodedValueRef::Boolean(bytes[0] != 0),
+        DataType::Int8 => EncodedValueRef::Int8(bytes[0] as i8),
+        DataType::Int16 => EncodedValueRef::Int16(i16::from_be_bytes([bytes[0], bytes[1]])),
+        DataType::Int32 => {
+            EncodedValueRef::Int32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Date32 => {
+            EncodedValueRef::Date32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Time32(_) => {
+            EncodedValueRef::Time32(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        DataType::Float32 => EncodedValueRef::Float32(f32::from_bits(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        DataType::Int64 => EncodedValueRef::Int64(read_i64(data, position)),
+        DataType::Float64 => EncodedValueRef::Float64(f64::from_bits(read_u64(data, position))),
+        DataType::Decimal128(_, _) => EncodedValueRef::DecimalCompact(read_i64(data, position)),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            EncodedValueRef::TimestampMillis(read_i64(data, position))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            EncodedValueRef::TimestampMicros(read_i64(data, position))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) | DataType::Struct(_)
+            if types::is_timestamp_nanos(data_type) =>
+        {
+            EncodedValueRef::TimestampNanos {
+                millis: read_i64(data, position),
+                nanos_of_milli: i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            }
+        }
+        _ => EncodedValueRef::Null,
+    };
+    Ok((value, width))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataVariant {
     Boolean,
@@ -549,6 +822,30 @@ pub struct BucketReader {
 }
 
 impl BucketReader {
+    pub(crate) fn encoded_column(&self, column: usize) -> io::Result<EncodedColumn<'_>> {
+        if column >= self.total_columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "column index {} out of range (num_columns={})",
+                    column, self.total_columns
+                ),
+            ));
+        }
+        Ok(EncodedColumn::new(
+            &self.col_types[column],
+            self.encodings[column],
+            self.has_nulls[column],
+            &self.null_bitmaps[column],
+            &self.const_values[column],
+            &self.dict_values[column],
+            self.dict_bit_widths[column],
+            &self.data,
+            self.data_cursors[column],
+            self.col_num_rows(column),
+        ))
+    }
+
     fn col_num_rows(&self, col: usize) -> usize {
         if col < self.num_primary {
             self.num_rows
@@ -832,6 +1129,21 @@ pub struct ColumnPageReader {
 }
 
 impl ColumnPageReader {
+    pub(crate) fn encoded_column(&self) -> EncodedColumn<'_> {
+        EncodedColumn::new(
+            &self.col_type,
+            self.encoding,
+            self.has_nulls,
+            &self.null_bitmap,
+            &self.const_value,
+            &self.dict_values,
+            self.dict_bit_width,
+            &self.data,
+            self.data_cursor,
+            self.num_rows,
+        )
+    }
+
     pub fn new(
         col_type: DataType,
         encoding: u8,
