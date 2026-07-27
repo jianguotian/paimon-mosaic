@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,8 @@ use arrow_schema::{DataType, Schema};
 use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess, RowGroupReader};
 use mosaic_core::spec::*;
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+
+mod columnar_json;
 
 fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<String>() {
@@ -190,6 +192,47 @@ impl OutputFile for JniOutputFile {
     fn pos(&self) -> u64 {
         self.pos
     }
+}
+
+impl Write for JniOutputFile {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        OutputFile::write(self, data)?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        OutputFile::flush(self)
+    }
+}
+
+fn new_jni_output_file(
+    env: &mut JNIEnv<'_>,
+    output: &JObject<'_>,
+    callback_exception: Arc<JavaExceptionSlot>,
+) -> Result<JniOutputFile, String> {
+    let stream_ref = env
+        .new_global_ref(output)
+        .map_err(|e| format!("failed to create global ref: {}", e))?;
+    let write_mid = env
+        .get_method_id("java/io/OutputStream", "write", "([BII)V")
+        .map_err(|e| format!("cannot find OutputStream.write: {}", e))?;
+    let flush_mid = env
+        .get_method_id("java/io/OutputStream", "flush", "()V")
+        .map_err(|e| format!("cannot find OutputStream.flush: {}", e))?;
+    let jvm = env
+        .get_java_vm()
+        .map(Arc::new)
+        .map_err(|e| format!("cannot get JavaVM: {}", e))?;
+    Ok(JniOutputFile {
+        jvm,
+        stream_ref,
+        callback_exception,
+        write_mid,
+        flush_mid,
+        pos: 0,
+        cached_array: None,
+        cached_array_len: 0,
+    })
 }
 
 // ======================== JniInputFile ========================
@@ -1166,6 +1209,87 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGr
         }
     }
     arr
+}
+
+// ======================== Native Columnar JSON ========================
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWriteRowGroupColumnarJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    rg_index: jint,
+    output: JObject,
+) -> jboolean {
+    const JSON_BUFFER_BYTES: usize = 256 * 1024;
+
+    let raw_env = env.get_raw();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle == 0 {
+            throw(&mut env, "null reader handle");
+            return 0;
+        }
+
+        let rh = unsafe { &*(handle as *const ReaderHandle) };
+        let row_group = match rh.reader.row_group_reader(rg_index as usize) {
+            Ok(row_group) => row_group,
+            Err(e) => {
+                throw_callback_or_runtime(
+                    &mut env,
+                    &rh.callback_exception,
+                    &format!("open row group failed: {}", e),
+                );
+                return 0;
+            }
+        };
+        match columnar_json::is_encoded_supported(&row_group) {
+            Ok(false) => return 0,
+            Ok(true) => {}
+            Err(e) => {
+                throw_callback_or_runtime(
+                    &mut env,
+                    &rh.callback_exception,
+                    &format!("columnar JSON compatibility check failed: {}", e),
+                );
+                return 0;
+            }
+        }
+
+        let output_exception = Arc::new(JavaExceptionSlot::default());
+        let output = match new_jni_output_file(&mut env, &output, output_exception.clone()) {
+            Ok(output) => output,
+            Err(e) => {
+                throw(&mut env, &e);
+                return 0;
+            }
+        };
+        let mut buffered = BufWriter::with_capacity(JSON_BUFFER_BYTES, output);
+        if let Err(e) = columnar_json::write_encoded_supported(&row_group, &mut buffered) {
+            throw_callback_or_runtime(
+                &mut env,
+                &output_exception,
+                &format!("columnar JSON write failed: {}", e),
+            );
+            return 0;
+        }
+        if let Err(e) = buffered.into_inner() {
+            throw_callback_or_runtime(
+                &mut env,
+                &output_exception,
+                &format!("columnar JSON output flush failed: {}", e.into_error()),
+            );
+            return 0;
+        }
+        1
+    }));
+    match result {
+        Ok(value) => value,
+        Err(e) => {
+            let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
+            throw(&mut env, &panic_message(&e));
+            0
+        }
+    }
 }
 
 // ======================== Columnar Read (Arrow C Data Interface) ========================

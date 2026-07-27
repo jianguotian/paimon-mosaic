@@ -19,6 +19,7 @@
 
 package org.apache.paimon.mosaic;
 
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -174,6 +175,22 @@ public class MosaicReader implements AutoCloseable {
         } finally {
             NativeLib.nativeRowGroupReaderFree(rgHandle);
         }
+    }
+
+    /**
+     * Writes one row group using the customer column-oriented JSON protocol.
+     *
+     * <p>Returns {@code false} without touching {@code output} when a column type or floating-point
+     * value is not supported by the byte-exact native fast path.
+     */
+    public boolean writeRowGroupColumnarJson(int rgIndex, OutputStream output) {
+        if (handle == 0) {
+            throw new IllegalStateException("reader is closed");
+        }
+        if (output == null) {
+            throw new NullPointerException("output");
+        }
+        return NativeLib.nativeReaderWriteRowGroupColumnarJson(handle, rgIndex, output);
     }
 
     private StructVector readRowGroupStructHandle(long rgHandle, BufferAllocator allocator) {

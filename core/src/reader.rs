@@ -23,6 +23,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 use crate::bucket_reader::{
     read_typed_value, read_variable_value, AllNullArrayCache, BucketReader, ColumnPageReader,
+    EncodedColumn,
 };
 use crate::schema::MosaicSchema;
 use crate::spec::*;
@@ -1503,6 +1504,53 @@ impl RowGroupReader {
 
     pub fn num_rows(&self) -> usize {
         self.num_rows
+    }
+
+    /// Visits projected columns in output order without materializing Arrow arrays.
+    pub fn visit_encoded_columns<F>(&self, mut visitor: F) -> io::Result<()>
+    where
+        F: FnMut(&str, &DataType, bool, EncodedColumn<'_>) -> io::Result<()>,
+    {
+        for &global_index in &self.output_order {
+            if !self.projected_columns[global_index] {
+                continue;
+            }
+
+            let column = &self.schema.columns[global_index];
+            let bucket_id = column.bucket_id;
+            let local_index = self.bucket_to_global[bucket_id]
+                .binary_search(&global_index)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("column {} missing from bucket {}", global_index, bucket_id),
+                    )
+                })?;
+            let state = self.bucket_states[bucket_id].as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("projected bucket {} was not loaded", bucket_id),
+                )
+            })?;
+            let encoded = match state {
+                BucketState::Monolithic { reader } => reader.encoded_column(local_index)?,
+                BucketState::Paged { column_readers } => column_readers
+                    .get(local_index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "projected column {} missing from paged bucket {}",
+                                global_index, bucket_id
+                            ),
+                        )
+                    })?
+                    .encoded_column(),
+            };
+            visitor(&column.name, &column.data_type, column.nullable, encoded)?;
+        }
+        Ok(())
     }
 
     pub fn read_columns(&mut self) -> io::Result<RecordBatch> {
