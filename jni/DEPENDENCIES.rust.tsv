@@ -88,6 +88,6 @@ windows_x86_64_msvc@0.42.2	X					X
 wit-bindgen@0.57.1	X	X				X		
 zerocopy@0.8.52	X		X			X		
 zerocopy-derive@0.8.52	X		X			X		
-zstd@0.13.3						X		
-zstd-safe@7.2.4	X					X		
-zstd-sys@2.0.16+zstd.1.5.7	X					X		
+zstd@0.13.0					X
+zstd-safe@7.0.0	X					X
+zstd-sys@2.0.9+zstd.1.5.5	X					X

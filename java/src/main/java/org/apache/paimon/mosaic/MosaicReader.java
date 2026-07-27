@@ -112,6 +112,24 @@ public class MosaicReader implements AutoCloseable {
         return NativeLib.nativeReaderWriteRowGroupColumnarJson(handle, rgIndex, output);
     }
 
+    /**
+     * Writes one row group using the customer column-oriented JSON protocol and Zstd compression.
+     *
+     * <p>Returns {@code false} without touching {@code output} when a column type or floating-point
+     * value is not supported by the byte-exact native fast path.
+     */
+    public boolean writeRowGroupColumnarJsonZstd(
+            int rgIndex, OutputStream output, int zstdLevel) {
+        if (handle == 0) {
+            throw new IllegalStateException("reader is closed");
+        }
+        if (output == null) {
+            throw new NullPointerException("output");
+        }
+        return NativeLib.nativeReaderWriteRowGroupColumnarJsonZstd(
+                handle, rgIndex, output, zstdLevel);
+    }
+
     public int rowGroupNumRows(int rgIndex) {
         int result = NativeLib.nativeReaderRowGroupNumRows(handle, rgIndex);
         if (result < 0) {

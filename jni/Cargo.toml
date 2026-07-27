@@ -31,3 +31,7 @@ jni = "0.21"
 arrow-schema = "58"
 arrow-array = { version = "58", features = ["ffi"] }
 ryu = "1"
+# Match Morax's zstd-jni 1.5.5 runtime so the native fast path keeps the
+# existing frame bytes and compression cost.
+zstd-safe = "=7.0.0"
+zstd-sys = "=2.0.9"
