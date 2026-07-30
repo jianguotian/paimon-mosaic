@@ -182,6 +182,108 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testWriteFromIndependentRootAllocator() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", ArrowType.Utf8.INSTANCE)
+        ));
+
+        byte[] data;
+        try (BufferAllocator inputAllocator = new RootAllocator();
+             VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            VarCharVector names = (VarCharVector) root.getVector("name");
+
+            ids.allocateNew(3);
+            names.allocateNew(3);
+            for (int i = 0; i < 3; i++) {
+                ids.set(i, i + 1);
+                names.setSafe(i, ("input_" + i).getBytes());
+            }
+            root.setRowCount(3);
+
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(3, batch.getRowCount());
+            IntVector ids = (IntVector) batch.getVector("id");
+            VarCharVector names = (VarCharVector) batch.getVector("name");
+            for (int i = 0; i < 3; i++) {
+                assertEquals(i + 1, ids.get(i));
+                assertEquals("input_" + i, new String(names.get(i)));
+            }
+        }
+    }
+
+    @Test
+    public void testWriteSequentialBundlesFromDifferentRootAllocators() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data = writeToBytes(arrowSchema, writer -> {
+            for (int batch = 0; batch < 2; batch++) {
+                try (BufferAllocator inputAllocator = new RootAllocator();
+                     VectorSchemaRoot root =
+                             VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+                    IntVector ids = (IntVector) root.getVector("id");
+                    ids.allocateNew(2);
+                    ids.set(0, batch * 2);
+                    ids.set(1, batch * 2 + 1);
+                    root.setRowCount(2);
+                    writer.write(root);
+                }
+            }
+        });
+
+        boolean[] seen = new boolean[4];
+        int totalRows = 0;
+        try (MosaicReader reader = readerFromBytes(data)) {
+            for (int rg = 0; rg < reader.numRowGroups(); rg++) {
+                try (VectorSchemaRoot batch = reader.readRowGroup(rg, allocator)) {
+                    IntVector ids = (IntVector) batch.getVector("id");
+                    for (int i = 0; i < batch.getRowCount(); i++) {
+                        seen[ids.get(i)] = true;
+                        totalRows++;
+                    }
+                }
+            }
+        }
+        assertEquals(4, totalRows);
+        assertArrayEquals(new boolean[]{true, true, true, true}, seen);
+    }
+
+    @Test
+    public void testRejectsFieldVectorsFromDifferentAllocatorRoots() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", ArrowType.Utf8.INSTANCE)
+        ));
+
+        try (BufferAllocator idAllocator = new RootAllocator();
+             BufferAllocator nameAllocator = new RootAllocator()) {
+            IntVector ids = new IntVector("id", idAllocator);
+            VarCharVector names = new VarCharVector("name", nameAllocator);
+            try (VectorSchemaRoot root = VectorSchemaRoot.of(ids, names)) {
+                ids.allocateNew(1);
+                names.allocateNew(1);
+                ids.set(0, 1);
+                names.setSafe(0, "one".getBytes());
+                root.setRowCount(1);
+
+                IllegalArgumentException error =
+                        assertThrows(
+                                IllegalArgumentException.class,
+                                () -> writeToBytes(arrowSchema, writer -> writer.write(root)));
+                assertTrue(error.getMessage().contains("same allocator root"));
+                assertTrue(error.getMessage().contains("name"));
+            }
+        }
+    }
+
+    @Test
     public void testNullValues() {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),

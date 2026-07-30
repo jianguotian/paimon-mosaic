@@ -30,6 +30,7 @@ import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -73,16 +74,38 @@ public class MosaicWriter implements AutoCloseable {
         if (closed || handle == 0) {
             throw new IllegalStateException("writer is closed");
         }
-        try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
-             ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+        BufferAllocator exportAllocator = exportAllocator(root);
+        try (ArrowArray arrowArray = ArrowArray.allocateNew(exportAllocator);
+             ArrowSchema arrowSchema = ArrowSchema.allocateNew(exportAllocator)) {
             try {
-                Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
+                Data.exportVectorSchemaRoot(
+                        exportAllocator, root, null, arrowArray, arrowSchema);
                 NativeLib.nativeWriterWriteBatch(handle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
             } finally {
                 releaseExported(arrowArray);
                 releaseExported(arrowSchema);
             }
         }
+    }
+
+    private BufferAllocator exportAllocator(VectorSchemaRoot root) {
+        List<FieldVector> vectors = root.getFieldVectors();
+        if (vectors.isEmpty()) {
+            return allocator;
+        }
+
+        BufferAllocator exportAllocator = vectors.get(0).getAllocator();
+        BufferAllocator exportRoot = exportAllocator.getRoot();
+        for (int i = 1; i < vectors.size(); i++) {
+            FieldVector vector = vectors.get(i);
+            if (vector.getAllocator().getRoot() != exportRoot) {
+                throw new IllegalArgumentException(
+                        "All field vectors must share the same allocator root; field '"
+                                + vector.getField().getName()
+                                + "' uses a different root");
+            }
+        }
+        return exportAllocator;
     }
 
     private static void releaseExported(ArrowSchema schema) {
