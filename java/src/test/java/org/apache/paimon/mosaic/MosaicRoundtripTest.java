@@ -218,6 +218,33 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testWriteFromLimitedChildAllocator() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (BufferAllocator inputRoot = new RootAllocator();
+             BufferAllocator limitedAllocator =
+                     inputRoot.newChildAllocator("limited-input", 0, 512);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, limitedAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(1, batch.getRowCount());
+            assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
+        }
+    }
+
+    @Test
     public void testWriteSequentialBundlesFromDifferentRootAllocators() {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true))

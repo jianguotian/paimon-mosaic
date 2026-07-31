@@ -94,8 +94,7 @@ public class MosaicWriter implements AutoCloseable {
             return allocator;
         }
 
-        BufferAllocator exportAllocator = vectors.get(0).getAllocator();
-        BufferAllocator exportRoot = exportAllocator.getRoot();
+        BufferAllocator exportRoot = vectors.get(0).getAllocator().getRoot();
         for (int i = 1; i < vectors.size(); i++) {
             FieldVector vector = vectors.get(i);
             if (vector.getAllocator().getRoot() != exportRoot) {
@@ -105,7 +104,7 @@ public class MosaicWriter implements AutoCloseable {
                                 + "' uses a different root");
             }
         }
-        return exportAllocator;
+        return exportRoot;
     }
 
     private static void releaseExported(ArrowSchema schema) {
