@@ -29,6 +29,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
@@ -58,6 +59,17 @@ import static org.junit.Assert.*;
 public class MosaicRoundtripTest {
 
     private BufferAllocator allocator;
+
+    private static final class InjectableListVector extends ListVector {
+
+        private InjectableListVector(String name, BufferAllocator allocator) {
+            super(name, allocator, FieldType.nullable(ArrowType.List.INSTANCE), null);
+        }
+
+        private void setDataVector(FieldVector vector) {
+            replaceDataVector(vector);
+        }
+    }
 
     @Before
     public void setUp() {
@@ -307,6 +319,42 @@ public class MosaicRoundtripTest {
                 assertTrue(error.getMessage().contains("same allocator root"));
                 assertTrue(error.getMessage().contains("name"));
             }
+        }
+    }
+
+    @Test
+    public void testRejectsNestedFieldVectorFromDifferentAllocatorRootWithoutLeak() {
+        try (RootAllocator parentAllocator = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator nestedAllocator = new RootAllocator(16L * 1024 * 1024)) {
+            InjectableListVector list = new InjectableListVector("items", parentAllocator);
+            IntVector data = new IntVector(ListVector.DATA_VECTOR_NAME, nestedAllocator);
+            list.setDataVector(data);
+
+            try (VectorSchemaRoot root = VectorSchemaRoot.of(list)) {
+                list.allocateNew();
+                list.startNewValue(0);
+                data.set(0, 7);
+                list.endValue(0, 1);
+                list.setValueCount(1);
+                root.setRowCount(1);
+
+                long parentBefore = parentAllocator.getAllocatedMemory();
+                long nestedBefore = nestedAllocator.getAllocatedMemory();
+
+                IllegalArgumentException error =
+                        assertThrows(
+                                IllegalArgumentException.class,
+                                () -> writeToBytes(root.getSchema(), writer -> writer.write(root)));
+                assertTrue(error.getMessage().contains("same allocator root"));
+                assertTrue(error.getMessage().contains("items." + ListVector.DATA_VECTOR_NAME));
+                assertEquals(parentBefore, parentAllocator.getAllocatedMemory());
+                assertEquals(nestedBefore, nestedAllocator.getAllocatedMemory());
+            } finally {
+                data.close();
+            }
+
+            assertEquals(0, parentAllocator.getAllocatedMemory());
+            assertEquals(0, nestedAllocator.getAllocatedMemory());
         }
     }
 

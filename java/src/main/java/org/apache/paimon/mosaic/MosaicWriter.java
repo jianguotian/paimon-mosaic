@@ -95,16 +95,24 @@ public class MosaicWriter implements AutoCloseable {
         }
 
         BufferAllocator exportRoot = vectors.get(0).getAllocator().getRoot();
-        for (int i = 1; i < vectors.size(); i++) {
-            FieldVector vector = vectors.get(i);
-            if (vector.getAllocator().getRoot() != exportRoot) {
-                throw new IllegalArgumentException(
-                        "All field vectors must share the same allocator root; field '"
-                                + vector.getField().getName()
-                                + "' uses a different root");
-            }
+        for (FieldVector vector : vectors) {
+            validateAllocatorRoot(vector, exportRoot, vector.getField().getName());
         }
         return exportRoot;
+    }
+
+    private static void validateAllocatorRoot(
+            FieldVector vector, BufferAllocator exportRoot, String fieldPath) {
+        if (vector.getAllocator().getRoot() != exportRoot) {
+            throw new IllegalArgumentException(
+                    "All field vectors must share the same allocator root; field '"
+                            + fieldPath
+                            + "' uses a different root");
+        }
+        for (FieldVector child : vector.getChildrenFromFields()) {
+            validateAllocatorRoot(
+                    child, exportRoot, fieldPath + "." + child.getField().getName());
+        }
     }
 
     private static void releaseExported(ArrowSchema schema) {
