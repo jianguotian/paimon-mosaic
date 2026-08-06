@@ -29,6 +29,9 @@ import java.util.Map;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
+import org.apache.arrow.c.jni.JniWrapper;
+import org.apache.arrow.c.jni.PrivateData;
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -74,20 +77,101 @@ public class MosaicWriter implements AutoCloseable {
         if (closed || handle == 0) {
             throw new IllegalStateException("writer is closed");
         }
-        // Arrow may associate input buffers with this allocator before export completes.
-        // Use the long-lived common root so a failed export never leaves those buffers
-        // attached to a short-lived child allocator.
         BufferAllocator exportRoot = exportRoot(root);
         try (ArrowArray arrowArray = ArrowArray.allocateNew(exportRoot);
              ArrowSchema arrowSchema = ArrowSchema.allocateNew(exportRoot)) {
             try {
-                Data.exportVectorSchemaRoot(
-                        exportRoot, root, null, arrowArray, arrowSchema);
+                Data.exportSchema(exportRoot, root.getSchema(), null, arrowSchema);
+                exportRootArray(exportRoot, root, arrowArray);
                 NativeLib.nativeWriterWriteBatch(handle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
             } finally {
                 releaseExported(arrowArray);
                 releaseExported(arrowSchema);
             }
+        }
+    }
+
+    private static void exportRootArray(
+            BufferAllocator exportRoot, VectorSchemaRoot root, ArrowArray arrowArray) {
+        // Data.exportVectorSchemaRoot reloads every field into a temporary StructVector.
+        // If that reload fails partway through, Arrow 15 can retain already-associated
+        // input buffers. Export the non-nullable root struct directly instead.
+        RootArrayPrivateData privateData = new RootArrayPrivateData();
+        try {
+            privateData.bufferPointers = exportRoot.buffer(Long.BYTES);
+            privateData.bufferPointers.writeLong(0L);
+
+            List<FieldVector> vectors = root.getFieldVectors();
+            if (!vectors.isEmpty()) {
+                privateData.childPointers =
+                        exportRoot.buffer((long) vectors.size() * Long.BYTES);
+                for (int i = 0; i < vectors.size(); i++) {
+                    ArrowArray child = ArrowArray.allocateNew(exportRoot);
+                    privateData.children.add(child);
+                    privateData.childPointers.writeLong(child.memoryAddress());
+                }
+                for (int i = 0; i < vectors.size(); i++) {
+                    Data.exportVector(
+                            exportRoot, vectors.get(i), null, privateData.children.get(i));
+                }
+            }
+
+            ArrowArray.Snapshot snapshot = new ArrowArray.Snapshot();
+            snapshot.length = root.getRowCount();
+            snapshot.null_count = 0;
+            snapshot.offset = 0;
+            snapshot.n_buffers = 1;
+            snapshot.n_children = vectors.size();
+            snapshot.buffers = privateData.bufferPointers.memoryAddress();
+            snapshot.children =
+                    privateData.childPointers == null
+                            ? 0
+                            : privateData.childPointers.memoryAddress();
+            snapshot.dictionary = 0;
+            snapshot.release = 0;
+            arrowArray.save(snapshot);
+            JniWrapper.get().exportArray(arrowArray.memoryAddress(), privateData);
+        } catch (RuntimeException | Error failure) {
+            privateData.abort(failure);
+            throw failure;
+        }
+    }
+
+    private static final class RootArrayPrivateData implements PrivateData {
+
+        private ArrowBuf bufferPointers;
+        private ArrowBuf childPointers;
+        private final List<ArrowArray> children = new ArrayList<>();
+
+        private void abort(Throwable failure) {
+            for (ArrowArray child : children) {
+                try {
+                    releaseExported(child);
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            try {
+                close();
+            } catch (RuntimeException | Error cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+        }
+
+        @Override
+        public void close() {
+            if (bufferPointers != null) {
+                bufferPointers.close();
+                bufferPointers = null;
+            }
+            if (childPointers != null) {
+                childPointers.close();
+                childPointers = null;
+            }
+            for (ArrowArray child : children) {
+                child.close();
+            }
+            children.clear();
         }
     }
 
