@@ -81,6 +81,7 @@ public class MosaicWriter implements AutoCloseable {
      * to the writer allocator supplied at construction time. The caller retains ownership of the
      * batch and must keep it open until this method returns.
      *
+     * @param root batch to write
      * @throws IllegalArgumentException if field vectors use different allocator roots
      * @throws IllegalStateException if the writer is closed
      */
