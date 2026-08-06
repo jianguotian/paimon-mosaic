@@ -73,20 +73,31 @@ public class MosaicWriter implements AutoCloseable {
         }
     }
 
+    /**
+     * Writes an Arrow batch synchronously.
+     *
+     * <p>All top-level and nested field vectors must share one allocator root. That root may be
+     * independent from the writer allocator root; temporary Arrow C Data metadata remains charged
+     * to the writer allocator supplied at construction time. The caller retains ownership of the
+     * batch and must keep it open until this method returns.
+     *
+     * @throws IllegalArgumentException if field vectors use different allocator roots
+     * @throws IllegalStateException if the writer is closed
+     */
     public void write(VectorSchemaRoot root) {
         if (closed || handle == 0) {
             throw new IllegalStateException("writer is closed");
         }
-        BufferAllocator exportAllocator = exportAllocator(root);
-        try (ArrowArray arrowArray = ArrowArray.allocateNew(exportAllocator);
-             ArrowSchema arrowSchema = ArrowSchema.allocateNew(exportAllocator)) {
+        boolean sameAllocatorRoot = sharesWriterAllocatorRoot(root);
+        try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
+             ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
             try {
-                if (exportAllocator == allocator) {
+                if (sameAllocatorRoot) {
                     Data.exportVectorSchemaRoot(
-                            exportAllocator, root, null, arrowArray, arrowSchema);
+                            allocator, root, null, arrowArray, arrowSchema);
                 } else {
-                    Data.exportSchema(exportAllocator, root.getSchema(), null, arrowSchema);
-                    exportCrossRootArray(exportAllocator, root, arrowArray);
+                    Data.exportSchema(allocator, root.getSchema(), null, arrowSchema);
+                    exportCrossRootArray(allocator, root, arrowArray);
                 }
                 NativeLib.nativeWriterWriteBatch(handle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
             } finally {
@@ -97,28 +108,29 @@ public class MosaicWriter implements AutoCloseable {
     }
 
     private static void exportCrossRootArray(
-            BufferAllocator exportRoot, VectorSchemaRoot root, ArrowArray arrowArray) {
+            BufferAllocator exportAllocator, VectorSchemaRoot root, ArrowArray arrowArray) {
         // Data.exportVectorSchemaRoot reloads every field into a temporary StructVector. If that
         // reload fails before the root ArrowArray owns a release callback, Arrow 15 can retain
-        // already-associated input buffers. Preallocate the root metadata, then export each child
-        // directly so allocator OOM happens before input buffers are retained.
+        // already-associated input buffers. Export each child directly instead: input buffers are
+        // retained without being associated with the writer allocator, while temporary C Data
+        // metadata remains charged to that allocator.
         RootArrayPrivateData privateData = new RootArrayPrivateData();
         try {
-            privateData.bufferPointers = exportRoot.buffer(Long.BYTES);
+            privateData.bufferPointers = exportAllocator.buffer(Long.BYTES);
             privateData.bufferPointers.writeLong(0L);
 
             List<FieldVector> vectors = root.getFieldVectors();
             if (!vectors.isEmpty()) {
                 privateData.childPointers =
-                        exportRoot.buffer((long) vectors.size() * Long.BYTES);
+                        exportAllocator.buffer((long) vectors.size() * Long.BYTES);
                 for (int i = 0; i < vectors.size(); i++) {
-                    ArrowArray child = ArrowArray.allocateNew(exportRoot);
+                    ArrowArray child = ArrowArray.allocateNew(exportAllocator);
                     privateData.children.add(child);
                     privateData.childPointers.writeLong(child.memoryAddress());
                 }
                 for (int i = 0; i < vectors.size(); i++) {
                     Data.exportVector(
-                            exportRoot, vectors.get(i), null, privateData.children.get(i));
+                            exportAllocator, vectors.get(i), null, privateData.children.get(i));
                 }
             }
 
@@ -181,21 +193,17 @@ public class MosaicWriter implements AutoCloseable {
         }
     }
 
-    private BufferAllocator exportAllocator(VectorSchemaRoot root) {
+    private boolean sharesWriterAllocatorRoot(VectorSchemaRoot root) {
         List<FieldVector> vectors = root.getFieldVectors();
         if (vectors.isEmpty()) {
-            return allocator;
+            return true;
         }
 
         BufferAllocator inputRoot = vectors.get(0).getAllocator().getRoot();
         for (FieldVector vector : vectors) {
             validateAllocatorRoot(vector, inputRoot, vector.getField().getName());
         }
-
-        // Preserve the writer allocator, including its limits and accounting, whenever Arrow can
-        // legally associate the input buffers with it. Use the input root only for the independent
-        // root case that would otherwise fail during C Data export.
-        return inputRoot == allocator.getRoot() ? allocator : inputRoot;
+        return inputRoot == allocator.getRoot();
     }
 
     private static void validateAllocatorRoot(

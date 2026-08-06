@@ -258,12 +258,14 @@ public class MosaicRoundtripTest {
             root.setRowCount(1);
 
             long inputBytes = inputRoot.getAllocatedMemory();
+            long inputPeak = limitedAllocator.getPeakMemoryAllocation();
             int inputChildren = inputRoot.getChildAllocators().size();
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             try (MosaicWriter writer =
                     new MosaicWriter(output, arrowSchema, allocator)) {
                 writer.write(root);
                 assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                assertEquals(inputPeak, limitedAllocator.getPeakMemoryAllocation());
                 assertEquals(inputChildren, inputRoot.getChildAllocators().size());
             }
             data = output.toByteArray();
@@ -277,7 +279,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCrossRootExportUsesInputRootAndReleasesMetadata() {
+    public void testCrossRootExportUsesWriterAllocatorAndReleasesMetadata() {
         Schema arrowSchema = wideIntSchema(5_000);
 
         byte[] data;
@@ -295,13 +297,15 @@ public class MosaicRoundtripTest {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             try (MosaicWriter writer =
                     new MosaicWriter(output, arrowSchema, allocator)) {
+                long writerPeak = allocator.getPeakMemoryAllocation();
                 writer.write(root);
                 assertEquals(inputBytes, inputRoot.getAllocatedMemory());
-                assertTrue(
-                        "expected Arrow C Data metadata on the shared input root",
-                        inputRoot.getPeakMemoryAllocation() > inputPeak);
+                assertEquals(inputPeak, inputRoot.getPeakMemoryAllocation());
                 assertEquals(inputChildren, inputRoot.getChildAllocators().size());
                 assertEquals(writerBytes, allocator.getAllocatedMemory());
+                assertTrue(
+                        "expected Arrow C Data metadata on the writer allocator",
+                        allocator.getPeakMemoryAllocation() > writerPeak);
             }
             data = output.toByteArray();
         }
@@ -353,7 +357,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCrossRootExportOutOfMemoryCanRetryWithoutLeak() {
+    public void testCrossRootWriterAllocatorOutOfMemoryCanRetryWithoutLeak() {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true))
         ));
@@ -361,7 +365,9 @@ public class MosaicRoundtripTest {
         byte[] data;
         try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
              RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024)) {
-            try (BufferAllocator inputAllocator =
+            try (BufferAllocator writerAllocator =
+                         writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+                 BufferAllocator inputAllocator =
                          inputRoot.newChildAllocator("limited-input", 0, 16L * 1024 * 1024);
                  VectorSchemaRoot root =
                          VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
@@ -376,14 +382,16 @@ public class MosaicRoundtripTest {
                 long inputBytes = inputRoot.getAllocatedMemory();
                 ByteArrayOutputStream output = new ByteArrayOutputStream();
                 try (MosaicWriter writer =
-                        new MosaicWriter(output, arrowSchema, writerRoot)) {
-                    inputRoot.setLimit(inputBytes + 512);
+                        new MosaicWriter(output, arrowSchema, writerAllocator)) {
+                    long writerBytes = writerAllocator.getAllocatedMemory();
+                    writerAllocator.setLimit(writerBytes + 512);
                     assertThrows(OutOfMemoryException.class, () -> writer.write(root));
                     assertEquals(inputBytes, inputRoot.getAllocatedMemory());
                     assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                    assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
                     assertEquals(rowCount - 1, ids.get(rowCount - 1));
 
-                    inputRoot.setLimit(16L * 1024 * 1024);
+                    writerAllocator.setLimit(16L * 1024 * 1024);
                     writer.write(root);
                 }
                 data = output.toByteArray();
