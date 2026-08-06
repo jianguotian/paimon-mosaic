@@ -28,6 +28,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
@@ -348,6 +349,53 @@ public class MosaicRoundtripTest {
              VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
             assertEquals(1, batch.getRowCount());
             assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
+        }
+    }
+
+    @Test
+    public void testCrossRootExportOutOfMemoryCanRetryWithoutLeak() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024)) {
+            try (BufferAllocator inputAllocator =
+                         inputRoot.newChildAllocator("limited-input", 0, 16L * 1024 * 1024);
+                 VectorSchemaRoot root =
+                         VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+                IntVector ids = (IntVector) root.getVector("id");
+                int rowCount = 65_536;
+                ids.allocateNew(rowCount);
+                for (int i = 0; i < rowCount; i++) {
+                    ids.set(i, i);
+                }
+                root.setRowCount(rowCount);
+
+                long inputBytes = inputRoot.getAllocatedMemory();
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                try (MosaicWriter writer =
+                        new MosaicWriter(output, arrowSchema, writerRoot)) {
+                    inputRoot.setLimit(inputBytes + 512);
+                    assertThrows(OutOfMemoryException.class, () -> writer.write(root));
+                    assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                    assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                    assertEquals(rowCount - 1, ids.get(rowCount - 1));
+
+                    inputRoot.setLimit(16L * 1024 * 1024);
+                    writer.write(root);
+                }
+                data = output.toByteArray();
+            }
+            assertEquals(0, inputRoot.getAllocatedMemory());
+            assertEquals(0, writerRoot.getAllocatedMemory());
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(65_536, batch.getRowCount());
+            assertEquals(65_535, ((IntVector) batch.getVector("id")).get(65_535));
         }
     }
 
