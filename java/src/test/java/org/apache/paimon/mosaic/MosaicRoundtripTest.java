@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.memory.RootAllocator;
@@ -71,6 +72,27 @@ public class MosaicRoundtripTest {
 
         private void setDataVector(FieldVector vector) {
             replaceDataVector(vector);
+        }
+    }
+
+    private static final class InjectedExportException extends RuntimeException {}
+
+    private static final class FailOnceListVector extends ListVector {
+
+        private boolean fail = true;
+
+        private FailOnceListVector(String name, BufferAllocator allocator) {
+            super(name, allocator, FieldType.nullable(ArrowType.List.INSTANCE), null);
+            replaceDataVector(new IntVector(ListVector.DATA_VECTOR_NAME, allocator));
+        }
+
+        @Override
+        public List<ArrowBuf> getFieldBuffers() {
+            if (fail) {
+                fail = false;
+                throw new InjectedExportException();
+            }
+            return super.getFieldBuffers();
         }
     }
 
@@ -404,6 +426,64 @@ public class MosaicRoundtripTest {
              VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
             assertEquals(65_536, batch.getRowCount());
             assertEquals(65_535, ((IntVector) batch.getVector("id")).get(65_535));
+        }
+    }
+
+    @Test
+    public void testCrossRootPartialExportFailureCanRetryWithoutLeak() {
+        byte[] data;
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024)) {
+            try (BufferAllocator writerAllocator =
+                         writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+                 BufferAllocator inputAllocator =
+                         inputRoot.newChildAllocator("input", 0, 16L * 1024 * 1024)) {
+                IntVector first = new IntVector("first", inputAllocator);
+                FailOnceListVector second = new FailOnceListVector("second", inputAllocator);
+                try (VectorSchemaRoot root = VectorSchemaRoot.of(first, second)) {
+                    first.allocateNew(2);
+                    second.allocateNew();
+                    first.set(0, 1);
+                    first.set(1, 2);
+                    UnionListWriter listWriter = second.getWriter();
+                    listWriter.setPosition(0);
+                    listWriter.startList();
+                    listWriter.writeInt(3);
+                    listWriter.endList();
+                    listWriter.setPosition(1);
+                    listWriter.startList();
+                    listWriter.writeInt(4);
+                    listWriter.endList();
+                    root.setRowCount(2);
+
+                    long inputBytes = inputRoot.getAllocatedMemory();
+                    ByteArrayOutputStream output = new ByteArrayOutputStream();
+                    try (MosaicWriter writer =
+                            new MosaicWriter(output, root.getSchema(), writerAllocator)) {
+                        long writerBytes = writerAllocator.getAllocatedMemory();
+                        assertThrows(InjectedExportException.class, () -> writer.write(root));
+                        assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                        assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                        assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                        assertEquals(2, first.get(1));
+                        assertEquals("[4]", second.getObject(1).toString());
+
+                        writer.write(root);
+                    }
+                    data = output.toByteArray();
+                }
+            }
+            assertEquals(0, inputRoot.getAllocatedMemory());
+            assertEquals(0, writerRoot.getAllocatedMemory());
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(2, batch.getRowCount());
+            assertEquals(1, ((IntVector) batch.getVector("first")).get(0));
+            assertEquals(2, ((IntVector) batch.getVector("first")).get(1));
+            assertEquals("[3]", batch.getVector("second").getObject(0).toString());
+            assertEquals("[4]", batch.getVector("second").getObject(1).toString());
         }
     }
 
