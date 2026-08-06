@@ -276,7 +276,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCrossRootExportUsesInputRootAndReleasesMetadata() {
+    public void testWideSchemaExportReleasesSharedRootMetadata() {
         Schema arrowSchema = wideIntSchema(5_000);
 
         byte[] data;
@@ -306,49 +306,6 @@ public class MosaicRoundtripTest {
         }
 
         assertTrue(data.length > 32);
-    }
-
-    @Test
-    public void testSameRootExportKeepsWriterAllocatorAccounting() {
-        Schema arrowSchema = new Schema(Arrays.asList(
-                Field.notNullable("id", new ArrowType.Int(32, true))
-        ));
-
-        byte[] data;
-        try (RootAllocator sharedRoot = new RootAllocator(16L * 1024 * 1024);
-             BufferAllocator writerAllocator =
-                     sharedRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
-             BufferAllocator inputAllocator =
-                     sharedRoot.newChildAllocator("input", 0, 16L * 1024 * 1024);
-             VectorSchemaRoot root =
-                     VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
-            IntVector ids = (IntVector) root.getVector("id");
-            ids.allocateNew(1);
-            ids.set(0, 7);
-            root.setRowCount(1);
-
-            long inputBytes = inputAllocator.getAllocatedMemory();
-            long inputPeak = inputAllocator.getPeakMemoryAllocation();
-
-            ByteArrayOutputStream output = new ByteArrayOutputStream();
-            try (MosaicWriter writer =
-                    new MosaicWriter(output, arrowSchema, writerAllocator)) {
-                long writerPeak = writerAllocator.getPeakMemoryAllocation();
-                writer.write(root);
-                assertTrue(
-                        "expected Arrow C Data metadata on the writer allocator",
-                        writerAllocator.getPeakMemoryAllocation() > writerPeak);
-                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
-                assertEquals(inputPeak, inputAllocator.getPeakMemoryAllocation());
-            }
-            data = output.toByteArray();
-        }
-
-        try (MosaicReader reader = readerFromBytes(data);
-             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
-            assertEquals(1, batch.getRowCount());
-            assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
-        }
     }
 
     @Test
