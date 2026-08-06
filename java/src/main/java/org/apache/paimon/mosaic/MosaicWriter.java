@@ -74,12 +74,15 @@ public class MosaicWriter implements AutoCloseable {
         if (closed || handle == 0) {
             throw new IllegalStateException("writer is closed");
         }
-        BufferAllocator exportAllocator = exportAllocator(root);
-        try (ArrowArray arrowArray = ArrowArray.allocateNew(exportAllocator);
-             ArrowSchema arrowSchema = ArrowSchema.allocateNew(exportAllocator)) {
+        // Arrow may associate input buffers with this allocator before export completes.
+        // Use the long-lived common root so a failed export never leaves those buffers
+        // attached to a short-lived child allocator.
+        BufferAllocator exportRoot = exportRoot(root);
+        try (ArrowArray arrowArray = ArrowArray.allocateNew(exportRoot);
+             ArrowSchema arrowSchema = ArrowSchema.allocateNew(exportRoot)) {
             try {
                 Data.exportVectorSchemaRoot(
-                        exportAllocator, root, null, arrowArray, arrowSchema);
+                        exportRoot, root, null, arrowArray, arrowSchema);
                 NativeLib.nativeWriterWriteBatch(handle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
             } finally {
                 releaseExported(arrowArray);
@@ -88,7 +91,7 @@ public class MosaicWriter implements AutoCloseable {
         }
     }
 
-    private BufferAllocator exportAllocator(VectorSchemaRoot root) {
+    private BufferAllocator exportRoot(VectorSchemaRoot root) {
         List<FieldVector> vectors = root.getFieldVectors();
         if (vectors.isEmpty()) {
             return allocator;

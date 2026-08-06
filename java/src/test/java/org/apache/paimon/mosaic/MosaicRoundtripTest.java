@@ -23,7 +23,9 @@ import java.io.ByteArrayOutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -98,6 +100,14 @@ public class MosaicRoundtripTest {
             System.arraycopy(data, (int) position, buffer, offset, length);
         };
         return MosaicReader.open(inputFile, data.length, allocator);
+    }
+
+    private static Schema wideIntSchema(int width) {
+        List<Field> fields = new ArrayList<>(width);
+        for (int i = 0; i < width; i++) {
+            fields.add(Field.nullable("c" + i, new ArrowType.Int(32, true)));
+        }
+        return new Schema(fields);
     }
 
     private static void awaitGarbageCollection(WeakReference<?> reference) throws InterruptedException {
@@ -246,7 +256,16 @@ public class MosaicRoundtripTest {
             ids.set(0, 7);
             root.setRowCount(1);
 
-            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+            long inputBytes = inputRoot.getAllocatedMemory();
+            int inputChildren = inputRoot.getChildAllocators().size();
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, allocator)) {
+                writer.write(root);
+                assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                assertEquals(inputChildren, inputRoot.getChildAllocators().size());
+            }
+            data = output.toByteArray();
         }
 
         try (MosaicReader reader = readerFromBytes(data);
@@ -254,6 +273,39 @@ public class MosaicRoundtripTest {
             assertEquals(1, batch.getRowCount());
             assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
         }
+    }
+
+    @Test
+    public void testWideSchemaExportReleasesSharedRootMetadata() {
+        Schema arrowSchema = wideIntSchema(5_000);
+
+        byte[] data;
+        try (RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024);
+             BufferAllocator limitedAllocator =
+                     inputRoot.newChildAllocator("limited-input", 0, 512);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, limitedAllocator)) {
+            root.setRowCount(0);
+            long inputBytes = inputRoot.getAllocatedMemory();
+            long inputPeak = inputRoot.getPeakMemoryAllocation();
+            int inputChildren = inputRoot.getChildAllocators().size();
+            long writerBytes = allocator.getAllocatedMemory();
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, allocator)) {
+                writer.write(root);
+                assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                assertTrue(
+                        "expected Arrow C Data metadata on the shared input root",
+                        inputRoot.getPeakMemoryAllocation() > inputPeak);
+                assertEquals(inputChildren, inputRoot.getChildAllocators().size());
+                assertEquals(writerBytes, allocator.getAllocatedMemory());
+            }
+            data = output.toByteArray();
+        }
+
+        assertTrue(data.length > 32);
     }
 
     @Test
