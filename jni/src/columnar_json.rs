@@ -29,7 +29,7 @@ use mosaic_core::spec::{ENCODING_ALL_NULL, ENCODING_CONST, ENCODING_DICT, ENCODI
 
 const MIN_EXACT_DOUBLE_ABS: f64 = 1.0e-6;
 const MAX_EXACT_DOUBLE_ABS: f64 = 1.0e9;
-const COMMA_BLOCK: [u8; 64] = [b','; 64];
+const COMMA_BLOCK: [u8; 4 * 1024] = [b','; 4 * 1024];
 #[cfg(test)]
 const ZERO_INT16_FIRST_BLOCK: &[u8] = b"0,0,0,0,0,0,0,0";
 #[cfg(test)]
@@ -69,30 +69,78 @@ const fn zero_int16_blocks(first_block: bool) -> ZeroInt16Blocks {
     blocks
 }
 
-/// Checks whether the encoded row group can be emitted byte-for-byte like the Java fast path.
+pub(crate) enum SingleUtf8Value {
+    NotRequested,
+    Invalid,
+    Valid(Vec<u8>),
+}
+
+pub(crate) struct EncodedPreflight {
+    pub(crate) supported: bool,
+    pub(crate) single_utf8_value: SingleUtf8Value,
+}
+
+/// Preflights native JSON and optionally resolves one projected UTF-8 column that must contain
+/// exactly one non-empty value across all rows.
 ///
-/// No output object is created until this preflight succeeds. In addition to type and floating
-/// point compatibility, it validates dictionary indexes and UTF-8 payloads which Arrow
-/// materialization previously checked before touching output.
-pub(crate) fn is_encoded_supported(row_group: &RowGroupReader) -> io::Result<bool> {
+/// Contract-invalid single-value columns are reported separately from corrupt encoded data so the
+/// Java caller can preserve its schema-incompatible error classification without touching output.
+pub(crate) fn preflight_encoded(
+    row_group: &RowGroupReader,
+    single_utf8_column: Option<usize>,
+) -> io::Result<EncodedPreflight> {
     let mut columns = 0usize;
     let mut supported = true;
+    let mut single_utf8_value = SingleUtf8Value::NotRequested;
+    let mut requested_column_seen = single_utf8_column.is_none();
     row_group.visit_encoded_columns(|_, data_type, _, column| {
+        let column_index = columns;
         columns += 1;
-        if !supported {
-            return Ok(());
-        }
-        supported = match data_type {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                validate_integer_column(column)?
+        let mut selected_utf8_prevalidated = false;
+
+        if single_utf8_column == Some(column_index) {
+            requested_column_seen = true;
+            if matches!(data_type, DataType::Utf8) {
+                let inspection = inspect_single_utf8_column(column)?;
+                selected_utf8_prevalidated = inspection.supported;
+                single_utf8_value = match inspection.value {
+                    Some(value) => SingleUtf8Value::Valid(value),
+                    None => SingleUtf8Value::Invalid,
+                };
+                if supported {
+                    supported = inspection.supported;
+                }
+            } else {
+                single_utf8_value = SingleUtf8Value::Invalid;
             }
-            DataType::Float64 => validate_float64_column(column)?,
-            DataType::Utf8 => validate_utf8_column(column)?,
-            _ => false,
-        };
+        }
+
+        if supported && !selected_utf8_prevalidated {
+            supported = match data_type {
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    validate_integer_column(column)?
+                }
+                DataType::Float64 => validate_float64_column(column)?,
+                DataType::Utf8 => validate_utf8_column(column)?,
+                _ => false,
+            };
+        }
         Ok(())
     })?;
-    Ok(columns > 0 && supported)
+    if !requested_column_seen {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "single UTF-8 column index {} out of range (num_columns={})",
+                single_utf8_column.unwrap(),
+                columns
+            ),
+        ));
+    }
+    Ok(EncodedPreflight {
+        supported: columns > 0 && supported,
+        single_utf8_value,
+    })
 }
 
 pub(crate) fn write_encoded_supported<W: Write>(
@@ -161,12 +209,7 @@ fn validate_utf8_column(column: EncodedColumn<'_>) -> io::Result<bool> {
             }
             match column.constant() {
                 Some(EncodedValueRef::Utf8(value)) => {
-                    std::str::from_utf8(value).map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid UTF-8 column value: {}", error),
-                        )
-                    })?;
+                    std::str::from_utf8(value).map_err(invalid_utf8)?;
                     Ok(true)
                 }
                 _ => Err(encoded_type_mismatch(column.data_type())),
@@ -177,12 +220,7 @@ fn validate_utf8_column(column: EncodedColumn<'_>) -> io::Result<bool> {
                 match value? {
                     EncodedValueRef::Null => {}
                     EncodedValueRef::Utf8(value) => {
-                        std::str::from_utf8(value).map_err(|error| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid UTF-8 column value: {}", error),
-                            )
-                        })?;
+                        std::str::from_utf8(value).map_err(invalid_utf8)?;
                     }
                     _ => return Err(encoded_type_mismatch(column.data_type())),
                 }
@@ -191,6 +229,116 @@ fn validate_utf8_column(column: EncodedColumn<'_>) -> io::Result<bool> {
         }
         _ => Ok(false),
     }
+}
+
+struct SingleUtf8Inspection {
+    supported: bool,
+    value: Option<Vec<u8>>,
+}
+
+fn inspect_single_utf8_column(column: EncodedColumn<'_>) -> io::Result<SingleUtf8Inspection> {
+    if column.num_rows() == 0 {
+        return Ok(SingleUtf8Inspection {
+            supported: matches!(
+                column.encoding(),
+                ENCODING_ALL_NULL | ENCODING_CONST | ENCODING_DICT | ENCODING_PLAIN
+            ),
+            value: None,
+        });
+    }
+
+    match column.encoding() {
+        ENCODING_ALL_NULL => Ok(SingleUtf8Inspection {
+            supported: true,
+            value: None,
+        }),
+        ENCODING_CONST => inspect_single_const_utf8_column(column),
+        ENCODING_DICT | ENCODING_PLAIN => Ok(SingleUtf8Inspection {
+            supported: true,
+            value: inspect_single_utf8_values(column.values())?,
+        }),
+        encoding => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported single UTF-8 column encoding {}", encoding),
+        )),
+    }
+}
+
+fn inspect_single_const_utf8_column(column: EncodedColumn<'_>) -> io::Result<SingleUtf8Inspection> {
+    let mut has_null = false;
+    let mut has_non_null = column.num_rows() > 0;
+    if column.has_nulls() {
+        has_non_null = false;
+        for row in 0..column.num_rows() {
+            if column.is_null(row) {
+                has_null = true;
+            } else {
+                has_non_null = true;
+            }
+            if has_null && has_non_null {
+                break;
+            }
+        }
+    }
+
+    let value = if has_non_null {
+        match column.constant() {
+            Some(EncodedValueRef::Utf8(value)) => {
+                std::str::from_utf8(value).map_err(invalid_utf8)?;
+                (!has_null && !value.is_empty()).then(|| value.to_vec())
+            }
+            _ => return Err(encoded_type_mismatch(column.data_type())),
+        }
+    } else {
+        None
+    };
+    Ok(SingleUtf8Inspection {
+        supported: true,
+        value,
+    })
+}
+
+fn inspect_single_utf8_values<'a>(
+    values: impl Iterator<Item = io::Result<EncodedValueRef<'a>>>,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut unique: Option<Vec<u8>> = None;
+    let mut contract_valid = true;
+    for value in values {
+        let value = match value? {
+            EncodedValueRef::Null => {
+                contract_valid = false;
+                unique = None;
+                continue;
+            }
+            EncodedValueRef::Utf8(value) => value,
+            _ => return Err(encoded_type_mismatch(&DataType::Utf8)),
+        };
+        std::str::from_utf8(value).map_err(invalid_utf8)?;
+        if value.is_empty() {
+            contract_valid = false;
+            unique = None;
+            continue;
+        }
+        if !contract_valid {
+            continue;
+        }
+        match &unique {
+            Some(expected) if expected.as_slice() != value => {
+                contract_valid = false;
+                unique = None;
+            }
+            Some(_) => {}
+            None => unique = Some(value.to_vec()),
+        }
+    }
+    Ok(contract_valid.then_some(unique).flatten())
+}
+
+fn invalid_utf8(error: std::str::Utf8Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid UTF-8 column value: {}", error),
+    )
 }
 
 fn has_non_null(column: &EncodedColumn<'_>) -> bool {
@@ -258,13 +406,25 @@ impl<W: Write> EncodedJsonWriter<'_, W> {
                 &mut self.repeated_buffer,
             );
         }
+        if let (DataType::Utf8, EncodedValueRef::Utf8(value)) = (data_type, value) {
+            return write_utf8_constant(
+                self.output,
+                value,
+                column.num_rows(),
+                column.has_nulls(),
+                |row| column.is_null(row),
+                &mut self.value_buffer,
+                &mut self.repeated_buffer,
+            );
+        }
         self.value_buffer.clear();
         write_encoded_value(&mut self.value_buffer, data_type, value, false)?;
         if column.has_nulls() {
             return write_nullable_repeated_value(
                 self.output,
                 &self.value_buffer,
-                column,
+                column.num_rows(),
+                |row| column.is_null(row),
                 &mut self.repeated_buffer,
             );
         }
@@ -275,6 +435,67 @@ impl<W: Write> EncodedJsonWriter<'_, W> {
             &mut self.repeated_buffer,
         )
     }
+}
+
+fn write_utf8_constant<W, F>(
+    output: &mut W,
+    value: &[u8],
+    row_count: usize,
+    has_nulls: bool,
+    mut is_null: F,
+    value_buffer: &mut Vec<u8>,
+    repeated_buffer: &mut Vec<u8>,
+) -> io::Result<()>
+where
+    W: Write,
+    F: FnMut(usize) -> bool,
+{
+    if is_oversized_escaped_utf8(value) {
+        for row in 0..row_count {
+            if row > 0 {
+                output.write_all(b",")?;
+            }
+            if !has_nulls || !is_null(row) {
+                write_escaped_utf8_chunked(output, value)?;
+            }
+        }
+        return Ok(());
+    }
+
+    value_buffer.clear();
+    write_escaped_utf8(value_buffer, value)?;
+    if has_nulls {
+        write_nullable_repeated_value(output, value_buffer, row_count, is_null, repeated_buffer)
+    } else {
+        write_repeated_value(output, value_buffer, row_count, repeated_buffer)
+    }
+}
+
+fn is_oversized_escaped_utf8(value: &[u8]) -> bool {
+    if value.len() >= REPEATED_VALUE_BUFFER_BYTES {
+        return true;
+    }
+
+    let mut escaped_len = value.len();
+    for current in value {
+        let extra = match current {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 1,
+            0x00..=0x1f => 5,
+            _ => 0,
+        };
+        escaped_len += extra;
+        if escaped_len >= REPEATED_VALUE_BUFFER_BYTES {
+            return true;
+        }
+    }
+    false
+}
+
+fn write_escaped_utf8_chunked<W: Write>(output: &mut W, value: &[u8]) -> io::Result<()> {
+    for chunk in value.chunks(REPEATED_VALUE_BUFFER_BYTES) {
+        write_escaped_utf8(output, chunk)?;
+    }
+    Ok(())
 }
 
 fn write_encoded_value<W: Write>(
@@ -404,15 +625,20 @@ fn write_nullable_zero_int16_constant<W: Write>(
     Ok(())
 }
 
-fn write_nullable_repeated_value<W: Write>(
+fn write_nullable_repeated_value<W, F>(
     output: &mut W,
     value: &[u8],
-    column: EncodedColumn<'_>,
+    row_count: usize,
+    mut is_null: F,
     repeated_buffer: &mut Vec<u8>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    W: Write,
+    F: FnMut(usize) -> bool,
+{
     repeated_buffer.clear();
-    for row in 0..column.num_rows() {
-        let value_size = if column.is_null(row) { 0 } else { value.len() };
+    for row in 0..row_count {
+        let value_size = if is_null(row) { 0 } else { value.len() };
         let row_size = usize::from(row > 0) + value_size;
         if !repeated_buffer.is_empty()
             && repeated_buffer.len().saturating_add(row_size) > REPEATED_VALUE_BUFFER_BYTES
@@ -992,6 +1218,7 @@ fn write_escaped_utf8<W: Write>(output: &mut W, value: &[u8]) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::sync::Arc;
 
     use arrow_array::{
@@ -999,8 +1226,131 @@ mod tests {
         RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use mosaic_core::bucket_reader::EncodedValueRef;
 
-    use super::write_if_supported;
+    use super::{
+        inspect_single_utf8_values, is_oversized_escaped_utf8, write_empty_array,
+        write_escaped_utf8, write_if_supported, write_utf8_constant, COMMA_BLOCK,
+        REPEATED_VALUE_BUFFER_BYTES,
+    };
+
+    #[derive(Default)]
+    struct TrackingWriter {
+        output: Vec<u8>,
+        writes: usize,
+        max_write: usize,
+    }
+
+    impl Write for TrackingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            self.writes += 1;
+            self.max_write = self.max_write.max(buf.len());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn repeated_utf8_expected(
+        value: &[u8],
+        row_count: usize,
+        mut is_null: impl FnMut(usize) -> bool,
+    ) -> Vec<u8> {
+        let mut escaped = Vec::new();
+        write_escaped_utf8(&mut escaped, value).unwrap();
+
+        let mut expected = Vec::new();
+        for row in 0..row_count {
+            if row > 0 {
+                expected.push(b',');
+            }
+            if !is_null(row) {
+                expected.extend_from_slice(&escaped);
+            }
+        }
+        expected
+    }
+
+    #[test]
+    fn oversized_utf8_constants_stream_without_staging_or_byte_changes() {
+        let mut value = vec![b'x'; REPEATED_VALUE_BUFFER_BYTES + 17];
+        value[1] = b'"';
+        value[2] = b'\\';
+        value[3] = b'\n';
+        value[4] = 0x01;
+        assert!(is_oversized_escaped_utf8(&value));
+
+        let mut output = TrackingWriter::default();
+        let mut value_buffer = b"value sentinel".to_vec();
+        let mut repeated_buffer = b"repeated sentinel".to_vec();
+        write_utf8_constant(
+            &mut output,
+            &value,
+            3,
+            true,
+            |row| row == 1,
+            &mut value_buffer,
+            &mut repeated_buffer,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.output,
+            repeated_utf8_expected(&value, 3, |row| row == 1)
+        );
+        assert!(output.max_write <= REPEATED_VALUE_BUFFER_BYTES);
+        assert_eq!(value_buffer, b"value sentinel");
+        assert_eq!(repeated_buffer, b"repeated sentinel");
+    }
+
+    #[test]
+    fn escaped_size_selects_streaming_before_the_repeat_buffer_would_overflow() {
+        let safe = vec![b'x'; REPEATED_VALUE_BUFFER_BYTES - 1];
+        assert!(!is_oversized_escaped_utf8(&safe));
+
+        let mut escaped_to_limit = safe;
+        escaped_to_limit[0] = b'"';
+        assert!(is_oversized_escaped_utf8(&escaped_to_limit));
+    }
+
+    #[test]
+    fn selected_utf8_inspection_replaces_a_second_full_validation_pass() {
+        let repeated = [
+            Ok(EncodedValueRef::Utf8(b"VIN-001")),
+            Ok(EncodedValueRef::Utf8(b"VIN-001")),
+        ];
+        assert_eq!(
+            inspect_single_utf8_values(repeated.into_iter()).unwrap(),
+            Some(b"VIN-001".to_vec())
+        );
+
+        let invalid_utf8 = [0xff];
+        let contract_invalid_then_corrupt = [
+            Ok(EncodedValueRef::Utf8(b"VIN-001")),
+            Ok(EncodedValueRef::Utf8(b"VIN-002")),
+            Ok(EncodedValueRef::Utf8(&invalid_utf8)),
+        ];
+        let error =
+            inspect_single_utf8_values(contract_invalid_then_corrupt.into_iter()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid UTF-8 column value"));
+    }
+
+    #[test]
+    fn writes_all_null_arrays_in_large_comma_blocks() {
+        let row_count = COMMA_BLOCK.len() * 2 + 17;
+        let mut output = TrackingWriter::default();
+
+        write_empty_array(&mut output, row_count).unwrap();
+
+        assert_eq!(output.output.len(), row_count - 1);
+        assert!(output.output.iter().all(|value| *value == b','));
+        assert_eq!(output.writes, 3);
+        assert_eq!(output.max_write, COMMA_BLOCK.len());
+    }
 
     #[test]
     fn writes_exact_primitive_protocol() {

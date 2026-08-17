@@ -30,7 +30,7 @@
 
     <groupId>org.apache.paimon</groupId>
     <artifactId>mosaic</artifactId>
-    <version>0.3.0-SNAPSHOT</version>
+    <version>0.3.0-geely-zstd-native-vin-20260817-1</version>
     <packaging>jar</packaging>
 
     <name>Mosaic</name>
@@ -105,6 +105,13 @@
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
             <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.github.luben</groupId>
+            <artifactId>zstd-jni</artifactId>
+            <version>1.5.5-11</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

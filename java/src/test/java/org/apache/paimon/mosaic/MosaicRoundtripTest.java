@@ -19,18 +19,22 @@
 
 package org.apache.paimon.mosaic;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.github.luben.zstd.ZstdInputStream;
+import com.github.luben.zstd.ZstdOutputStream;
 import org.apache.arrow.c.jni.JniWrapper;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
@@ -197,6 +201,13 @@ public class MosaicRoundtripTest {
         assertNull("expected input file to be released after failed open", reference.get());
     }
 
+    private static void awaitGarbageCollection(List<WeakReference<?>> references)
+            throws InterruptedException {
+        for (WeakReference<?> reference : references) {
+            awaitGarbageCollection(reference);
+        }
+    }
+
     private WeakReference<InputFile> openReaderWithClosedAllocator(byte[] data) {
         BufferAllocator failingAllocator = new RootAllocator();
         failingAllocator.close();
@@ -263,9 +274,7 @@ public class MosaicRoundtripTest {
             IOException actual =
                     assertThrows(
                             IOException.class,
-                            () ->
-                                    NativeLib.nativeReaderWriteRowGroupColumnarJsonZstd(
-                                            handle, 0, new ByteArrayOutputStream(), 3));
+                            () -> NativeLib.nativeReaderOpenRowGroup(handle, 0));
             assertSame(expected, actual);
             assertTrue("expected a row-group read", reads.get() >= 2);
             assertNotEquals(callingThreadId, failingThreadId.get());
@@ -277,7 +286,7 @@ public class MosaicRoundtripTest {
     }
 
     private List<WeakReference<?>> writeWithFailingNativeOutput(
-            MosaicReader reader, boolean failOnFlush) {
+            MosaicRowGroupReader rowGroup, boolean failOnFlush) {
         String message =
                 failOnFlush
                         ? "intentional native flush failure"
@@ -313,9 +322,37 @@ public class MosaicRoundtripTest {
         IOException error =
                 assertThrows(
                         IOException.class,
-                        () -> reader.writeRowGroupColumnarJsonZstd(0, output, 3));
+                        () -> rowGroup.writeColumnarJsonZstd(output, 3, 1));
         assertSame(expected, error);
         return Arrays.asList(outputReference, exceptionReference);
+    }
+
+    private byte[] writeConstrained(
+            MosaicReader reader, OutputStream output, int singleUtf8ColumnIndex) {
+        try (MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            return rowGroup.writeColumnarJsonZstd(output, 3, singleUtf8ColumnIndex);
+        }
+    }
+
+    private static String decompressZstd(byte[] compressed) throws IOException {
+        try (ZstdInputStream input =
+                        new ZstdInputStream(new ByteArrayInputStream(compressed));
+                ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                output.write(buffer, 0, read);
+            }
+            return new String(output.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static byte[] compressWithZstdJni(String value) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try (ZstdOutputStream compressed = new ZstdOutputStream(output, 3)) {
+            compressed.write(value.getBytes(StandardCharsets.UTF_8));
+        }
+        return output.toByteArray();
     }
 
     @Test
@@ -1014,7 +1051,53 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testNativeColumnarJsonWritesExactPrimitiveProtocol() throws Exception {
+    public void testNativeColumnarJsonZstdResolvesSingleNonEmptyUtf8Value() throws Exception {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("id", new ArrowType.Int(32, true)),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            ids.allocateNew(3);
+            vins.allocateNew();
+            for (int row = 0; row < 3; row++) {
+                ids.set(row, row + 1);
+                vins.setSafe(
+                        row,
+                        "VIN-001".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            root.setRowCount(3);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream expected = new ByteArrayOutputStream();
+            byte[] expectedVin = rowGroup.writeColumnarJsonZstd(expected, 3, 1);
+
+            ByteArrayOutputStream actual = new ByteArrayOutputStream();
+            byte[] vin = rowGroup.writeColumnarJsonZstd(actual, 3, 1);
+            assertArrayEquals(
+                    "VIN-001".getBytes(java.nio.charset.StandardCharsets.UTF_8), vin);
+            assertArrayEquals(vin, expectedVin);
+            assertArrayEquals(expected.toByteArray(), actual.toByteArray());
+
+            List<WeakReference<?>> writeFailure =
+                    writeWithFailingNativeOutput(rowGroup, false);
+            awaitGarbageCollection(writeFailure);
+            List<WeakReference<?>> flushFailure =
+                    writeWithFailingNativeOutput(rowGroup, true);
+            awaitGarbageCollection(flushFailure);
+            assertEquals(1, reader.numRowGroups());
+        }
+    }
+
+    @Test
+    public void testNativeColumnarJsonZstdWritesExactPrimitiveProtocol() throws Exception {
         Schema arrowSchema =
                 new Schema(
                         Arrays.asList(
@@ -1026,7 +1109,8 @@ public class MosaicRoundtripTest {
                                         "double",
                                         new ArrowType.FloatingPoint(
                                                 FloatingPointPrecision.DOUBLE)),
-                                Field.nullable("text", ArrowType.Utf8.INSTANCE)));
+                                Field.nullable("text", ArrowType.Utf8.INSTANCE),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
@@ -1036,6 +1120,7 @@ public class MosaicRoundtripTest {
             BigIntVector int64 = (BigIntVector) root.getVector("i64");
             Float8Vector doubles = (Float8Vector) root.getVector("double");
             VarCharVector text = (VarCharVector) root.getVector("text");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
 
             int8.allocateNew(3);
             int16.allocateNew(3);
@@ -1043,6 +1128,7 @@ public class MosaicRoundtripTest {
             int64.allocateNew(3);
             doubles.allocateNew(3);
             text.allocateNew();
+            vins.allocateNew();
 
             int8.set(0, -1);
             int8.setNull(1);
@@ -1059,52 +1145,53 @@ public class MosaicRoundtripTest {
             doubles.set(0, -0.0);
             doubles.set(1, 1.2);
             doubles.set(2, 9_999_999.0);
-            text.setSafe(0, "a\"\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            text.setSafe(0, "a\"\n".getBytes(StandardCharsets.UTF_8));
             text.setNull(1);
-            text.setSafe(2, "中\t".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            text.setSafe(2, "中\t".getBytes(StandardCharsets.UTF_8));
+            for (int row = 0; row < 3; row++) {
+                vins.setSafe(row, "VIN-001".getBytes(StandardCharsets.UTF_8));
+            }
             root.setRowCount(3);
-
             data = writeToBytes(arrowSchema, writer -> writer.write(root));
         }
 
         try (MosaicReader reader = readerFromBytes(data)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
-            assertTrue(reader.writeRowGroupColumnarJson(0, output));
-            assertEquals(
+            assertArrayEquals(
+                    "VIN-001".getBytes(StandardCharsets.UTF_8),
+                    writeConstrained(reader, output, 6));
+            String expected =
                     "{\"i\\\"8\":\"-1,,9\",\"i16\":\"0,-7,12\","
                             + "\"i32\":\"-2147483648,0,2147483647\","
                             + "\"i64\":\"-9223372036854775808,,9223372036854775807\","
                             + "\"double\":\"-0.0,1.2,9999999.0\","
-                            + "\"text\":\"a\\\"\\n,,中\\t\"}",
-                    new String(
-                            output.toByteArray(),
-                            java.nio.charset.StandardCharsets.UTF_8));
-
-            List<WeakReference<?>> writeFailure =
-                    writeWithFailingNativeOutput(reader, false);
-            awaitGarbageCollection(writeFailure);
-
-            List<WeakReference<?>> flushFailure =
-                    writeWithFailingNativeOutput(reader, true);
-            awaitGarbageCollection(flushFailure);
-            assertEquals(1, reader.numRowGroups());
+                            + "\"text\":\"a\\\"\\n,,中\\t\","
+                            + "\"vin\":\"VIN-001,VIN-001,VIN-001\"}";
+            assertEquals(expected, decompressZstd(output.toByteArray()));
+            assertArrayEquals(compressWithZstdJni(expected), output.toByteArray());
         }
     }
 
     @Test
-    public void testNativeColumnarJsonWritesNullableConstantInt16Blocks() {
+    public void testNativeColumnarJsonZstdWritesNullableConstantInt16Blocks() throws Exception {
         Schema arrowSchema =
                 new Schema(
                         Arrays.asList(
-                                Field.nullable("i16", new ArrowType.Int(16, true))));
+                                Field.nullable("i16", new ArrowType.Int(16, true)),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
             SmallIntVector values = (SmallIntVector) root.getVector("i16");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
             values.allocateNew(17);
+            vins.allocateNew();
             int[] nonNullRows = {1, 3, 4, 7, 8, 10, 12, 13, 15, 16};
             for (int row : nonNullRows) {
                 values.set(row, 0);
+            }
+            for (int row = 0; row < 17; row++) {
+                vins.setSafe(row, "VIN-001".getBytes(StandardCharsets.UTF_8));
             }
             root.setRowCount(17);
             data = writeToBytes(arrowSchema, writer -> writer.write(root));
@@ -1112,64 +1199,79 @@ public class MosaicRoundtripTest {
 
         try (MosaicReader reader = readerFromBytes(data)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
-            assertTrue(reader.writeRowGroupColumnarJson(0, output));
+            assertArrayEquals(
+                    "VIN-001".getBytes(StandardCharsets.UTF_8),
+                    writeConstrained(reader, output, 1));
             assertEquals(
-                    "{\"i16\":\",0,,0,0,,,0,0,,0,,0,0,,0,0\"}",
-                    new String(
-                            output.toByteArray(),
-                            java.nio.charset.StandardCharsets.UTF_8));
+                    "{\"i16\":\",0,,0,0,,,0,0,,0,,0,0,,0,0\","
+                            + "\"vin\":\"VIN-001,VIN-001,VIN-001,VIN-001,VIN-001,"
+                            + "VIN-001,VIN-001,VIN-001,VIN-001,VIN-001,VIN-001,"
+                            + "VIN-001,VIN-001,VIN-001,VIN-001,VIN-001,VIN-001\"}",
+                    decompressZstd(output.toByteArray()));
         }
     }
 
     @Test
-    public void testNativeColumnarJsonMatchesJavaDoubleFormattingBoundaries() {
+    public void testNativeColumnarJsonZstdMatchesJavaDoubleFormattingBoundaries()
+            throws Exception {
         Schema arrowSchema =
                 new Schema(
                         Arrays.asList(
                                 Field.notNullable(
                                         "value",
                                         new ArrowType.FloatingPoint(
-                                                FloatingPointPrecision.DOUBLE))));
+                                                FloatingPointPrecision.DOUBLE)),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
             Float8Vector values = (Float8Vector) root.getVector("value");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
             values.allocateNew(5);
+            vins.allocateNew();
             values.set(0, 1.25);
             values.set(1, 0.0001);
             values.set(2, 10_000_000.0);
             values.set(3, 429_496_729.5);
             values.set(4, 1_812_576.4000000001);
+            for (int row = 0; row < 5; row++) {
+                vins.setSafe(row, "VIN-001".getBytes(StandardCharsets.UTF_8));
+            }
             root.setRowCount(5);
             data = writeToBytes(arrowSchema, writer -> writer.write(root));
         }
 
         try (MosaicReader reader = readerFromBytes(data)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
-            assertTrue(reader.writeRowGroupColumnarJson(0, output));
+            assertArrayEquals(
+                    "VIN-001".getBytes(StandardCharsets.UTF_8),
+                    writeConstrained(reader, output, 1));
             assertEquals(
-                    "{\"value\":\"1.25,1.0E-4,1.0E7,4.294967295E8,1812576.4000000001\"}",
-                    new String(
-                            output.toByteArray(),
-                            java.nio.charset.StandardCharsets.UTF_8));
+                    "{\"value\":\"1.25,1.0E-4,1.0E7,4.294967295E8,1812576.4000000001\","
+                            + "\"vin\":\"VIN-001,VIN-001,VIN-001,VIN-001,VIN-001\"}",
+                    decompressZstd(output.toByteArray()));
         }
     }
 
     @Test
-    public void testNativeColumnarJsonUnsupportedDoubleDoesNotTouchOutput() {
+    public void testNativeColumnarJsonZstdUnsupportedDoubleDoesNotTouchOutput() {
         Schema arrowSchema =
                 new Schema(
                         Arrays.asList(
                                 Field.notNullable(
                                         "value",
                                         new ArrowType.FloatingPoint(
-                                                FloatingPointPrecision.DOUBLE))));
+                                                FloatingPointPrecision.DOUBLE)),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
 
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
             Float8Vector values = (Float8Vector) root.getVector("value");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
             values.allocateNew(1);
+            vins.allocateNew();
             values.set(0, Double.MIN_VALUE);
+            vins.setSafe(0, "VIN-001".getBytes(StandardCharsets.UTF_8));
             root.setRowCount(1);
             data = writeToBytes(arrowSchema, writer -> writer.write(root));
         }
@@ -1177,13 +1279,219 @@ public class MosaicRoundtripTest {
         try (MosaicReader reader = readerFromBytes(data)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             output.write(7);
-            assertFalse(reader.writeRowGroupColumnarJson(0, output));
+            assertNull(writeConstrained(reader, output, 1));
             assertArrayEquals(new byte[] {7}, output.toByteArray());
+        }
+    }
 
-            ByteArrayOutputStream compressed = new ByteArrayOutputStream();
-            compressed.write(9);
-            assertFalse(reader.writeRowGroupColumnarJsonZstd(0, compressed, 3));
-            assertArrayEquals(new byte[] {9}, compressed.toByteArray());
+    @Test
+    public void testNativeColumnarJsonZstdRejectsInvalidSingleUtf8ValueBeforeOutput() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            vins.allocateNew();
+            vins.setSafe(0, "VIN-001".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            vins.setSafe(1, "VIN-002".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(2);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(7);
+            assertArrayEquals(
+                    new byte[0], writeConstrained(reader, output, 0));
+            assertArrayEquals(new byte[] {7}, output.toByteArray());
+        }
+    }
+
+    @Test
+    public void testNativeColumnarJsonZstdRejectsNullAndEmptySingleUtf8ValuesBeforeOutput() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(Field.nullable("vin", ArrowType.Utf8.INSTANCE)));
+
+        byte[] nullData;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            vins.allocateNew();
+            vins.setSafe(0, "VIN-001".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            vins.setNull(1);
+            root.setRowCount(2);
+            nullData = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        byte[] emptyData;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            vins.allocateNew();
+            vins.setSafe(0, new byte[0]);
+            root.setRowCount(1);
+            emptyData = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        for (byte[] data : Arrays.asList(nullData, emptyData)) {
+            try (MosaicReader reader = readerFromBytes(data)) {
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                output.write(11);
+                assertArrayEquals(
+                        new byte[0],
+                        writeConstrained(reader, output, 0));
+                assertArrayEquals(new byte[] {11}, output.toByteArray());
+            }
+        }
+    }
+
+    @Test
+    public void testNativeColumnarJsonZstdUnsupportedPathDoesNotTouchOutputOrResolveValue() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("enabled", ArrowType.Bool.INSTANCE),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            BitVector enabled = (BitVector) root.getVector("enabled");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            enabled.allocateNew(1);
+            vins.allocateNew();
+            enabled.set(0, 1);
+            vins.setSafe(0, "VIN-001".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(1);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        AtomicInteger reads = new AtomicInteger();
+        InputFile input =
+                new InputFile() {
+                    @Override
+                    public void readFully(long position, byte[] buffer, int offset, int length) {
+                        reads.incrementAndGet();
+                        System.arraycopy(data, (int) position, buffer, offset, length);
+                    }
+                };
+        try (MosaicReader reader = MosaicReader.open(input, data.length, allocator);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            int readsAfterOpen = reads.get();
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(9);
+            assertNull(rowGroup.writeColumnarJsonZstd(output, 3, 1));
+            assertArrayEquals(new byte[] {9}, output.toByteArray());
+            try (VectorSchemaRoot root = rowGroup.readColumns(allocator)) {
+                assertEquals(1, root.getRowCount());
+                assertEquals("VIN-001", root.getVector("vin").getObject(0).toString());
+            }
+            assertEquals(
+                    "fallback must reuse the prepared row group",
+                    readsAfterOpen,
+                    reads.get());
+        }
+    }
+
+    @Test
+    public void testNativeColumnarJsonZstdRejectsInvalidVinBeforeUnsupportedFallback() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("enabled", ArrowType.Bool.INSTANCE),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            BitVector enabled = (BitVector) root.getVector("enabled");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            enabled.allocateNew(2);
+            vins.allocateNew();
+            enabled.set(0, 1);
+            enabled.set(1, 0);
+            vins.setSafe(0, "VIN-001".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            vins.setSafe(1, "VIN-002".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(2);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(13);
+            assertArrayEquals(
+                    new byte[0], writeConstrained(reader, output, 1));
+            assertArrayEquals(new byte[] {13}, output.toByteArray());
+        }
+    }
+
+    @Test
+    public void testNativeColumnarJsonZstdRejectsWrongOrOutOfRangeSingleUtf8Column() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("id", new ArrowType.Int(32, true)),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            ids.allocateNew(1);
+            vins.allocateNew();
+            ids.set(0, 1);
+            vins.setSafe(0, "VIN-001".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(1);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            ByteArrayOutputStream wrongType = new ByteArrayOutputStream();
+            wrongType.write(15);
+            assertArrayEquals(
+                    new byte[0],
+                    writeConstrained(reader, wrongType, 0));
+            assertArrayEquals(new byte[] {15}, wrongType.toByteArray());
+
+            ByteArrayOutputStream outOfRange = new ByteArrayOutputStream();
+            outOfRange.write(17);
+            assertThrows(
+                    RuntimeException.class,
+                    () -> writeConstrained(reader, outOfRange, 2));
+            assertArrayEquals(new byte[] {17}, outOfRange.toByteArray());
+        }
+    }
+
+    @Test
+    public void testNativeColumnarJsonZstdRejectsProjectedRowGroup() {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("id", new ArrowType.Int(32, true)),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            ids.allocateNew(1);
+            vins.allocateNew();
+            ids.set(0, 1);
+            vins.setSafe(0, "VIN-001".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(1);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            reader.project(new String[] {"vin"});
+            try (MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                output.write(19);
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> rowGroup.writeColumnarJsonZstd(output, 3, 0));
+                assertArrayEquals(new byte[] {19}, output.toByteArray());
+            }
         }
     }
 

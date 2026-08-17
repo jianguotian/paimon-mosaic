@@ -18,13 +18,13 @@
 use std::io::{self, BufWriter, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use jni::errors::Error as JniError;
 use jni::objects::{
     GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JThrowable, JValue,
 };
-use jni::sys::{jboolean, jint, jlong, jlongArray};
+use jni::sys::{jbyteArray, jint, jlong, jlongArray};
 use jni::JNIEnv;
 use jni::JavaVM;
 
@@ -49,9 +49,66 @@ fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+#[derive(Default)]
+struct JavaExceptionSlot {
+    throwable: Mutex<Option<GlobalRef>>,
+}
+
+impl JavaExceptionSlot {
+    fn capture(&self, env: &mut JNIEnv<'_>) -> io::Result<()> {
+        let throwable = env
+            .exception_occurred()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        env.exception_clear()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let global = env
+            .new_global_ref(&throwable)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.store(global);
+        Ok(())
+    }
+
+    fn store(&self, throwable: GlobalRef) {
+        let mut pending = self
+            .throwable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_none() {
+            *pending = Some(throwable);
+        }
+    }
+
+    fn take(&self) -> Option<GlobalRef> {
+        self.throwable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+fn callback_result<T>(
+    env: &mut JNIEnv<'_>,
+    exception: &JavaExceptionSlot,
+    result: jni::errors::Result<T>,
+    callback: &str,
+) -> io::Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(JniError::JavaException) => {
+            exception.capture(env)?;
+            Err(io::Error::other(format!(
+                "{} threw a Java exception",
+                callback
+            )))
+        }
+        Err(error) => Err(io::Error::other(error.to_string())),
+    }
+}
+
 struct JniOutputFile {
     jvm: Arc<JavaVM>,
     stream_ref: GlobalRef,
+    callback_exception: Arc<JavaExceptionSlot>,
     write_mid: JMethodID,
     flush_mid: JMethodID,
     pos: u64,
@@ -68,13 +125,14 @@ impl JniOutputFile {
             return io::Error::other(error.to_string());
         }
 
-        let captured = (|| -> jni::errors::Result<Option<GlobalRef>> {
+        let captured = (|| -> jni::errors::Result<Option<(GlobalRef, GlobalRef)>> {
             let exception = env.exception_occurred()?;
             env.exception_clear()?;
             if exception.is_null() || self.pending_exception.is_some() {
                 return Ok(None);
             }
-            let global = env.new_global_ref(exception)?;
+            let global = env.new_global_ref(&exception)?;
+            let callback_global = env.new_global_ref(&exception)?;
             let exception_pending = env.exception_check()?;
             if exception_pending {
                 env.exception_clear()?;
@@ -82,11 +140,12 @@ impl JniOutputFile {
             if global.as_obj().is_null() || exception_pending {
                 return Err(JniError::NullPtr("NewGlobalRef for pending Java exception"));
             }
-            Ok(Some(global))
+            Ok(Some((global, callback_global)))
         })();
 
         match captured {
-            Ok(Some(exception)) => {
+            Ok(Some((exception, callback_exception))) => {
+                self.callback_exception.store(callback_exception);
                 self.pending_exception = Some(exception);
                 io::Error::other(error.to_string())
             }
@@ -237,6 +296,7 @@ fn new_jni_output_file(
         pos: 0,
         cached_array: None,
         cached_array_len: 0,
+        pending_exception: None,
     })
 }
 
@@ -245,6 +305,7 @@ fn new_jni_output_file(
 struct JniInputFile {
     jvm: Arc<JavaVM>,
     input_file_ref: GlobalRef,
+    callback_exception: Arc<JavaExceptionSlot>,
 }
 
 unsafe impl Send for JniInputFile {}
@@ -264,7 +325,7 @@ impl InputFile for JniInputFile {
             .new_byte_array(buf.len() as i32)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        env.call_method(
+        let result = env.call_method(
             &self.input_file_ref,
             "readFully",
             "(J[BII)V",
@@ -274,8 +335,13 @@ impl InputFile for JniInputFile {
                 JValue::Int(0),
                 JValue::Int(buf.len() as jint),
             ],
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        );
+        callback_result(
+            &mut env,
+            &self.callback_exception,
+            result,
+            "InputFile.readFully",
+        )?;
 
         let i8_buf: &mut [i8] =
             unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut i8, buf.len()) };
@@ -289,6 +355,7 @@ impl InputFile for JniInputFile {
 struct ReaderHandle {
     reader: Box<dyn ReaderAccess>,
     _input_file_ref: Option<GlobalRef>,
+    callback_exception: Arc<JavaExceptionSlot>,
 }
 
 fn bytemuck_cast(data: &[u8]) -> &[i8] {
@@ -296,7 +363,9 @@ fn bytemuck_cast(data: &[u8]) -> &[i8] {
 }
 
 fn throw(env: &mut JNIEnv, msg: &str) {
-    let _ = env.throw_new("java/lang/RuntimeException", msg);
+    if matches!(env.exception_check(), Ok(false)) {
+        let _ = env.throw_new("java/lang/RuntimeException", msg);
+    }
 }
 
 fn rethrow(env: &mut JNIEnv, exception: &GlobalRef) {
@@ -326,6 +395,14 @@ fn rethrow(env: &mut JNIEnv, exception: &GlobalRef) {
             );
         }
     }
+}
+
+fn throw_callback_or_runtime(env: &mut JNIEnv<'_>, exception: &JavaExceptionSlot, message: &str) {
+    let Some(throwable) = exception.take() else {
+        throw(env, message);
+        return;
+    };
+    rethrow(env, &throwable);
 }
 
 struct WriterHandle {
@@ -389,6 +466,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterOpen(
         let jni_stream = JniOutputFile {
             jvm,
             stream_ref: stream_global.clone(),
+            callback_exception: Arc::new(JavaExceptionSlot::default()),
             write_mid,
             flush_mid,
             pos: 0,
@@ -724,6 +802,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWrite
 
 struct RowGroupReaderHandle {
     inner: RowGroupReader,
+    callback_exception: Arc<JavaExceptionSlot>,
 }
 
 #[no_mangle]
@@ -735,6 +814,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen(
 ) -> jlong {
     let raw_env = env.get_raw();
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let callback_exception = Arc::new(JavaExceptionSlot::default());
         let global = match env.new_global_ref(&input_file) {
             Ok(g) => g,
             Err(e) => {
@@ -756,6 +836,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen(
         let input = JniInputFile {
             jvm,
             input_file_ref: global.clone(),
+            callback_exception: callback_exception.clone(),
         };
 
         match MosaicReader::new(input, length) {
@@ -763,11 +844,17 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpen(
                 let rh = ReaderHandle {
                     reader: Box::new(reader),
                     _input_file_ref: Some(global),
+                    callback_exception,
                 };
                 Box::into_raw(Box::new(rh)) as jlong
             }
             Err(e) => {
-                throw(&mut env, &format!("open failed: {}", e));
+                drop(global);
+                throw_callback_or_runtime(
+                    &mut env,
+                    &callback_exception,
+                    &format!("open failed: {}", e),
+                );
                 0
             }
         }
@@ -859,11 +946,18 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenR
         let rh = unsafe { &*(handle as *const ReaderHandle) };
         match rh.reader.row_group_reader(rg_index as usize) {
             Ok(rg) => {
-                let rg_handle = Box::new(RowGroupReaderHandle { inner: rg });
+                let rg_handle = Box::new(RowGroupReaderHandle {
+                    inner: rg,
+                    callback_exception: rh.callback_exception.clone(),
+                });
                 Box::into_raw(rg_handle) as jlong
             }
             Err(e) => {
-                throw(&mut env, &format!("open row group failed: {}", e));
+                throw_callback_or_runtime(
+                    &mut env,
+                    &rh.callback_exception,
+                    &format!("open row group failed: {}", e),
+                );
                 0
             }
         }
@@ -1101,133 +1195,82 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderRowGr
 // ======================== Native Columnar JSON ========================
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWriteRowGroupColumnarJson(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteColumnarJsonZstdWithSingleUtf8Value(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
-    rg_index: jint,
-    output: JObject,
-) -> jboolean {
-    const JSON_BUFFER_BYTES: usize = 256 * 1024;
-
-    let raw_env = env.get_raw();
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        if handle == 0 {
-            throw(&mut env, "null reader handle");
-            return 0;
-        }
-
-        let rh = unsafe { &*(handle as *const ReaderHandle) };
-        let row_group = match rh.reader.row_group_reader(rg_index as usize) {
-            Ok(row_group) => row_group,
-            Err(e) => {
-                throw_callback_or_runtime(
-                    &mut env,
-                    &rh.callback_exception,
-                    &format!("open row group failed: {}", e),
-                );
-                return 0;
-            }
-        };
-        match columnar_json::is_encoded_supported(&row_group) {
-            Ok(false) => return 0,
-            Ok(true) => {}
-            Err(e) => {
-                throw_callback_or_runtime(
-                    &mut env,
-                    &rh.callback_exception,
-                    &format!("columnar JSON compatibility check failed: {}", e),
-                );
-                return 0;
-            }
-        }
-
-        let output_exception = Arc::new(JavaExceptionSlot::default());
-        let output = match new_jni_output_file(&mut env, &output, output_exception.clone()) {
-            Ok(output) => output,
-            Err(e) => {
-                throw(&mut env, &e);
-                return 0;
-            }
-        };
-        let mut buffered = BufWriter::with_capacity(JSON_BUFFER_BYTES, output);
-        if let Err(e) = columnar_json::write_encoded_supported(&row_group, &mut buffered) {
-            throw_callback_or_runtime(
-                &mut env,
-                &output_exception,
-                &format!("columnar JSON write failed: {}", e),
-            );
-            return 0;
-        }
-        if let Err(e) = buffered.into_inner() {
-            throw_callback_or_runtime(
-                &mut env,
-                &output_exception,
-                &format!("columnar JSON output flush failed: {}", e.into_error()),
-            );
-            return 0;
-        }
-        1
-    }));
-    match result {
-        Ok(value) => value,
-        Err(e) => {
-            let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
-            throw(&mut env, &panic_message(&e));
-            0
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWriteRowGroupColumnarJsonZstd(
-    mut env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    rg_index: jint,
     output: JObject,
     zstd_level: jint,
-) -> jboolean {
+    single_utf8_column_index: jint,
+) -> jbyteArray {
     const JSON_BUFFER_BYTES: usize = 256 * 1024;
 
     let raw_env = env.get_raw();
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         if handle == 0 {
-            throw(&mut env, "null reader handle");
-            return 0;
+            throw(&mut env, "null row group handle");
+            return ptr::null_mut();
+        }
+        if single_utf8_column_index < 0 {
+            throw(&mut env, "single UTF-8 column index must be non-negative");
+            return ptr::null_mut();
         }
 
-        let rh = unsafe { &*(handle as *const ReaderHandle) };
-        let row_group = match rh.reader.row_group_reader(rg_index as usize) {
-            Ok(row_group) => row_group,
+        let row_group = unsafe { &*(handle as *const RowGroupReaderHandle) };
+        let preflight = match columnar_json::preflight_encoded(
+            &row_group.inner,
+            Some(single_utf8_column_index as usize),
+        ) {
+            Ok(preflight) => preflight,
             Err(e) => {
                 throw_callback_or_runtime(
                     &mut env,
-                    &rh.callback_exception,
-                    &format!("open row group failed: {}", e),
+                    &row_group.callback_exception,
+                    &format!("columnar JSON compatibility check failed: {}", e),
                 );
-                return 0;
+                return ptr::null_mut();
             }
         };
+        let single_utf8_value = match preflight.single_utf8_value {
+            columnar_json::SingleUtf8Value::Invalid => {
+                return match env.new_byte_array(0) {
+                    Ok(value) => value.into_raw(),
+                    Err(e) => {
+                        throw(
+                            &mut env,
+                            &format!("create invalid single-value result failed: {}", e),
+                        );
+                        ptr::null_mut()
+                    }
+                };
+            }
+            columnar_json::SingleUtf8Value::Valid(value) => value,
+            columnar_json::SingleUtf8Value::NotRequested => {
+                throw(&mut env, "single UTF-8 value was not preflighted");
+                return ptr::null_mut();
+            }
+        };
+        if !preflight.supported {
+            return ptr::null_mut();
+        }
 
-        match columnar_json::is_encoded_supported(&row_group) {
-            Ok(false) => return 0,
-            Ok(true) => {}
+        let result_value = match env.byte_array_from_slice(&single_utf8_value) {
+            Ok(value) => value,
             Err(e) => {
                 throw(
                     &mut env,
-                    &format!("columnar JSON compatibility check failed: {}", e),
+                    &format!("create single UTF-8 value result failed: {}", e),
                 );
-                return 0;
+                return ptr::null_mut();
             }
-        }
+        };
 
         let output_exception = Arc::new(JavaExceptionSlot::default());
         let output = match new_jni_output_file(&mut env, &output, output_exception.clone()) {
             Ok(output) => output,
             Err(e) => {
                 throw(&mut env, &e);
-                return 0;
+                return ptr::null_mut();
             }
         };
         let encoder = match java_compatible_zstd::JavaCompatibleZstdEncoder::new(output, zstd_level)
@@ -1235,17 +1278,17 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWrite
             Ok(encoder) => encoder,
             Err(e) => {
                 throw(&mut env, &format!("create Zstd encoder failed: {}", e));
-                return 0;
+                return ptr::null_mut();
             }
         };
         let mut buffered = BufWriter::with_capacity(JSON_BUFFER_BYTES, encoder);
-        if let Err(e) = columnar_json::write_encoded_supported(&row_group, &mut buffered) {
+        if let Err(e) = columnar_json::write_encoded_supported(&row_group.inner, &mut buffered) {
             throw_callback_or_runtime(
                 &mut env,
                 &output_exception,
                 &format!("columnar JSON write failed: {}", e),
             );
-            return 0;
+            return ptr::null_mut();
         }
         let encoder = match buffered.into_inner() {
             Ok(encoder) => encoder,
@@ -1255,7 +1298,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWrite
                     &output_exception,
                     &format!("columnar JSON buffer flush failed: {}", e.into_error()),
                 );
-                return 0;
+                return ptr::null_mut();
             }
         };
         let mut output = match encoder.finish() {
@@ -1266,7 +1309,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWrite
                     &output_exception,
                     &format!("finish Zstd output failed: {}", e),
                 );
-                return 0;
+                return ptr::null_mut();
             }
         };
         if let Err(e) = OutputFile::flush(&mut output) {
@@ -1275,16 +1318,16 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderWrite
                 &output_exception,
                 &format!("flush Zstd output failed: {}", e),
             );
-            return 0;
+            return ptr::null_mut();
         }
-        1
+        result_value.into_raw()
     }));
     match result {
         Ok(value) => value,
         Err(e) => {
             let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
             throw(&mut env, &panic_message(&e));
-            0
+            ptr::null_mut()
         }
     }
 }
@@ -1313,7 +1356,11 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
         let batch = match rg.inner.read_columns() {
             Ok(b) => b,
             Err(e) => {
-                throw(&mut env, &format!("read_columns failed: {}", e));
+                throw_callback_or_runtime(
+                    &mut env,
+                    &rg.callback_exception,
+                    &format!("read_columns failed: {}", e),
+                );
                 return -1;
             }
         };

@@ -19,12 +19,10 @@
 
 package org.apache.paimon.mosaic;
 
-import java.io.OutputStream;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
@@ -35,6 +33,7 @@ public class MosaicReader implements AutoCloseable {
 
     private long handle;
     private final Schema schema;
+    private boolean projected;
 
     private MosaicReader(long handle, BufferAllocator allocator) {
         this.handle = handle;
@@ -70,64 +69,24 @@ public class MosaicReader implements AutoCloseable {
 
     public void project(String[] columns) {
         NativeLib.nativeReaderSetProjection(handle, columns);
+        projected = true;
     }
 
-    public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) {
+    public MosaicRowGroupReader openRowGroup(int rgIndex) {
+        if (handle == 0) {
+            throw new IllegalStateException("reader is closed");
+        }
         long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
         if (rgHandle == 0) {
             throw new RuntimeException("failed to open row group " + rgIndex);
         }
-        try {
-            return readRowGroupHandle(rgHandle, allocator);
-        } finally {
-            NativeLib.nativeRowGroupReaderFree(rgHandle);
-        }
+        return new MosaicRowGroupReader(rgHandle, !projected);
     }
 
-    private VectorSchemaRoot readRowGroupHandle(long rgHandle, BufferAllocator allocator) {
-        try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
-             ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
-            int rc = NativeLib.nativeRowGroupReaderReadColumns(
-                    rgHandle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
-            if (rc != 0) {
-                throw new RuntimeException("readColumns failed");
-            }
-            return Data.importVectorSchemaRoot(allocator, arrowArray, arrowSchema, null);
+    public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) {
+        try (MosaicRowGroupReader rowGroup = openRowGroup(rgIndex)) {
+            return rowGroup.readColumns(allocator);
         }
-    }
-
-    /**
-     * Writes one row group using the customer column-oriented JSON protocol.
-     *
-     * <p>Returns {@code false} without touching {@code output} when a column type or floating-point
-     * value is not supported by the byte-exact native fast path.
-     */
-    public boolean writeRowGroupColumnarJson(int rgIndex, OutputStream output) {
-        if (handle == 0) {
-            throw new IllegalStateException("reader is closed");
-        }
-        if (output == null) {
-            throw new NullPointerException("output");
-        }
-        return NativeLib.nativeReaderWriteRowGroupColumnarJson(handle, rgIndex, output);
-    }
-
-    /**
-     * Writes one row group using the customer column-oriented JSON protocol and Zstd compression.
-     *
-     * <p>Returns {@code false} without touching {@code output} when a column type or floating-point
-     * value is not supported by the byte-exact native fast path.
-     */
-    public boolean writeRowGroupColumnarJsonZstd(
-            int rgIndex, OutputStream output, int zstdLevel) {
-        if (handle == 0) {
-            throw new IllegalStateException("reader is closed");
-        }
-        if (output == null) {
-            throw new NullPointerException("output");
-        }
-        return NativeLib.nativeReaderWriteRowGroupColumnarJsonZstd(
-                handle, rgIndex, output, zstdLevel);
     }
 
     public int rowGroupNumRows(int rgIndex) {
