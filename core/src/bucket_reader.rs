@@ -66,6 +66,8 @@ fn const_values_are_dense(variant: DataVariant) -> bool {
     !matches!(variant, DataVariant::Binary)
 }
 
+const CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR: usize = 8;
+
 #[derive(Debug, Clone)]
 enum RawColumnData {
     Boolean(Vec<u8>),
@@ -120,6 +122,68 @@ fn empty_raw_data_for_type(dt: &DataType) -> RawColumnData {
 
 fn invert_bitmap(bitmap: &[u8]) -> Vec<u8> {
     bitmap.iter().map(|b| !b).collect()
+}
+
+fn for_each_non_null(null_bitmap: &[u8], num_rows: usize, mut f: impl FnMut(usize)) {
+    for (byte_index, &nulls) in null_bitmap.iter().enumerate() {
+        let row_base = byte_index * 8;
+        if row_base >= num_rows {
+            break;
+        }
+
+        let rows_in_byte = (num_rows - row_base).min(8);
+        let row_mask = if rows_in_byte == 8 {
+            u8::MAX
+        } else {
+            (1u8 << rows_in_byte) - 1
+        };
+        let mut non_nulls = !nulls & row_mask;
+        while non_nulls != 0 {
+            let bit = non_nulls.trailing_zeros() as usize;
+            f(row_base + bit);
+            non_nulls &= non_nulls - 1;
+        }
+    }
+}
+
+fn materialize_fixed_const<T: Default + Copy>(
+    value: T,
+    num_rows: usize,
+    fill_all_slots: bool,
+    null_bitmap: &[u8],
+) -> Vec<T> {
+    if fill_all_slots {
+        return vec![value; num_rows];
+    }
+
+    let mut out = vec![T::default(); num_rows];
+    for_each_non_null(null_bitmap, num_rows, |row| out[row] = value);
+    out
+}
+
+fn materialize_boolean_const(
+    value: bool,
+    num_rows: usize,
+    fill_all_slots: bool,
+    null_bitmap: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![0u8; num_rows.div_ceil(8)];
+    if !value {
+        return out;
+    }
+
+    if fill_all_slots {
+        out.fill(u8::MAX);
+        if !num_rows.is_multiple_of(8) {
+            let last = out.len() - 1;
+            out[last] &= (1u8 << (num_rows % 8)) - 1;
+        }
+    } else {
+        for_each_non_null(null_bitmap, num_rows, |row| {
+            out[row / 8] |= 1 << (row % 8);
+        });
+    }
+    out
 }
 
 fn make_null_buffer(bitmap: Option<Vec<u8>>, num_rows: usize) -> Option<NullBuffer> {
@@ -1191,14 +1255,17 @@ fn read_all_const(
     null_bitmap: &[u8],
     variant: DataVariant,
 ) -> io::Result<RawColumnData> {
-    // Fixed-width values can be materialized densely and use the Arrow null bitmap to hide null
-    // slots. Keep variable-width values compact: repeating their payload into null slots can
-    // significantly amplify memory for large constants and sparse columns.
-    let stored_values = if matches!(variant, DataVariant::Binary) && has_nulls {
+    let non_null_count = if has_nulls {
         count_non_null(null_bitmap, num_rows)
     } else {
         num_rows
     };
+    // Fixed-width CONST arrays are always materialized at row cardinality, so build_array can
+    // wrap them without another scatter buffer. Filling every null slot is fastest for ordinary
+    // densities, but on very sparse columns it commits large null-only value ranges. Below 1/8
+    // non-null density, initialize the final buffer lazily and write only valid positions.
+    let fill_all_slots =
+        !has_nulls || non_null_count >= num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR);
 
     match variant {
         DataVariant::Boolean => {
@@ -1206,40 +1273,48 @@ fn read_all_const(
                 Value::Boolean(v) => *v,
                 _ => false,
             };
-            let mut buf = vec![0u8; num_rows.div_ceil(8)];
-            if b {
-                for row in 0..num_rows {
-                    buf[row / 8] |= 1 << (row % 8);
-                }
-            }
-            Ok(RawColumnData::Boolean(buf))
+            Ok(RawColumnData::Boolean(materialize_boolean_const(
+                b,
+                num_rows,
+                fill_all_slots,
+                null_bitmap,
+            )))
         }
         DataVariant::Int8 => {
             let v = match const_value {
                 Value::TinyInt(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i8; num_rows];
-            out.fill(v);
-            Ok(RawColumnData::Int8(out))
+            Ok(RawColumnData::Int8(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_all_slots,
+                null_bitmap,
+            )))
         }
         DataVariant::Int16 => {
             let v = match const_value {
                 Value::SmallInt(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i16; num_rows];
-            out.fill(v);
-            Ok(RawColumnData::Int16(out))
+            Ok(RawColumnData::Int16(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_all_slots,
+                null_bitmap,
+            )))
         }
         DataVariant::Int32 => {
             let v = match const_value {
                 Value::Integer(x) | Value::Date(x) | Value::Time(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i32; num_rows];
-            out.fill(v);
-            Ok(RawColumnData::Int32(out))
+            Ok(RawColumnData::Int32(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_all_slots,
+                null_bitmap,
+            )))
         }
         DataVariant::Int64 => {
             let v = match const_value {
@@ -1249,37 +1324,46 @@ fn read_all_const(
                 | Value::TimestampMicros(x) => *x,
                 _ => 0,
             };
-            let mut out = vec![0i64; num_rows];
-            out.fill(v);
-            Ok(RawColumnData::Int64(out))
+            Ok(RawColumnData::Int64(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_all_slots,
+                null_bitmap,
+            )))
         }
         DataVariant::Float32 => {
             let v = match const_value {
                 Value::Float(x) => *x,
                 _ => 0.0,
             };
-            let mut out = vec![0.0f32; num_rows];
-            out.fill(v);
-            Ok(RawColumnData::Float32(out))
+            Ok(RawColumnData::Float32(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_all_slots,
+                null_bitmap,
+            )))
         }
         DataVariant::Float64 => {
             let v = match const_value {
                 Value::Double(x) => *x,
                 _ => 0.0,
             };
-            let mut out = vec![0.0f64; num_rows];
-            out.fill(v);
-            Ok(RawColumnData::Float64(out))
+            Ok(RawColumnData::Float64(materialize_fixed_const(
+                v,
+                num_rows,
+                fill_all_slots,
+                null_bitmap,
+            )))
         }
         DataVariant::Binary => {
             let bytes = match const_value {
                 Value::String(b) | Value::Bytes(b) | Value::DecimalLarge(b) => b.as_slice(),
                 _ => &[],
             };
-            let mut offsets = Vec::with_capacity(stored_values + 1);
-            let mut data = Vec::with_capacity(stored_values * bytes.len());
+            let mut offsets = Vec::with_capacity(non_null_count + 1);
+            let mut data = Vec::with_capacity(non_null_count * bytes.len());
             offsets.push(0u32);
-            for _ in 0..stored_values {
+            for _ in 0..non_null_count {
                 data.extend_from_slice(bytes);
                 offsets.push(data.len() as u32);
             }
@@ -1293,13 +1377,9 @@ fn read_all_const(
                 } => (*millis, *nanos_of_milli),
                 _ => (0, 0),
             };
-            let mut millis_out = vec![0i64; num_rows];
-            let mut nanos_out = vec![0i32; num_rows];
-            millis_out.fill(m);
-            nanos_out.fill(n);
             Ok(RawColumnData::TimestampNanos {
-                millis: millis_out,
-                nanos_of_milli: nanos_out,
+                millis: materialize_fixed_const(m, num_rows, fill_all_slots, null_bitmap),
+                nanos_of_milli: materialize_fixed_const(n, num_rows, fill_all_slots, null_bitmap),
             })
         }
     }
@@ -1654,4 +1734,59 @@ fn read_u64(buf: &[u8], pos: usize) -> u64 {
         buf[pos + 6],
         buf[pos + 7],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn null_bitmap(num_rows: usize, non_null_rows: &[usize]) -> Vec<u8> {
+        let mut bitmap = vec![u8::MAX; num_rows.div_ceil(8)];
+        for &row in non_null_rows {
+            bitmap[row / 8] &= !(1 << (row % 8));
+        }
+        bitmap
+    }
+
+    #[test]
+    fn test_sparse_fixed_const_writes_only_non_null_slots() {
+        let num_rows = 32;
+        let bitmap = null_bitmap(num_rows, &[0, 31]);
+        let data = read_all_const(
+            &Value::BigInt(42),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Int64,
+        )
+        .unwrap();
+
+        let RawColumnData::Int64(values) = data else {
+            panic!("expected Int64 CONST data");
+        };
+        assert_eq!(values.len(), num_rows);
+        assert_eq!(values[0], 42);
+        assert_eq!(values[31], 42);
+        assert!(values[1..31].iter().all(|&value| value == 0));
+    }
+
+    #[test]
+    fn test_dense_fixed_const_fills_null_slots() {
+        let num_rows = 32;
+        let non_null_rows = (0..24).collect::<Vec<_>>();
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+        let data = read_all_const(
+            &Value::BigInt(42),
+            num_rows,
+            true,
+            &bitmap,
+            DataVariant::Int64,
+        )
+        .unwrap();
+
+        let RawColumnData::Int64(values) = data else {
+            panic!("expected Int64 CONST data");
+        };
+        assert_eq!(values, vec![42; num_rows]);
+    }
 }

@@ -1686,6 +1686,46 @@ fn test_const_encoding_with_nulls() {
     }
 }
 
+fn assert_const_encoding_with_nulls_all_primitive_types(batch: &RecordBatch, num_rows: usize) {
+    let bools = batch_col_bool(batch, "bool");
+    let tiny = batch_col_i8(batch, "tiny");
+    let small = batch_col_i16(batch, "small");
+    let ints = batch_col_i32(batch, "int");
+    let big = batch_col_i64(batch, "big");
+    let floats = batch_col_f32(batch, "float");
+    let doubles = batch_col_f64(batch, "double");
+    let strings = batch_col_string(batch, "string");
+    assert_eq!(
+        strings.value_data().len(),
+        18 * "constant".len(),
+        "variable-width CONST values should remain compact at null positions"
+    );
+    for i in 0..num_rows {
+        // This fixture is dense enough to use the fill-all path. Inspect the hidden fixed-width
+        // payload at null positions so the old compact-plus-scatter implementation fails.
+        assert!(bools.value(i));
+        assert_eq!(tiny.value(i), -7);
+        assert_eq!(small.value(i), 1234);
+        assert_eq!(ints.value(i), -56789);
+        assert_eq!(big.value(i), 9_876_543_210);
+        assert_eq!(floats.value(i), 1.25);
+        assert_eq!(doubles.value(i), -12.5);
+
+        if i % 4 == 0 {
+            assert!(bools.is_null(i));
+            assert!(tiny.is_null(i));
+            assert!(small.is_null(i));
+            assert!(ints.is_null(i));
+            assert!(big.is_null(i));
+            assert!(floats.is_null(i));
+            assert!(doubles.is_null(i));
+            assert!(strings.is_null(i));
+        } else {
+            assert_eq!(strings.value(i), "constant");
+        }
+    }
+}
+
 #[test]
 fn test_const_encoding_with_nulls_all_primitive_types() {
     let columns = vec![
@@ -1717,44 +1757,15 @@ fn test_const_encoding_with_nulls_all_primitive_types() {
         })
         .collect();
 
-    let (reader, _) = write_and_read(columns, &rows);
+    let (reader, _) = write_and_read(columns.clone(), &rows);
     let mut rg = reader.row_group_reader(0).unwrap();
     let batch = rg.read_columns().unwrap();
+    assert_const_encoding_with_nulls_all_primitive_types(&batch, rows.len());
 
-    let bools = batch_col_bool(&batch, "bool");
-    let tiny = batch_col_i8(&batch, "tiny");
-    let small = batch_col_i16(&batch, "small");
-    let ints = batch_col_i32(&batch, "int");
-    let big = batch_col_i64(&batch, "big");
-    let floats = batch_col_f32(&batch, "float");
-    let doubles = batch_col_f64(&batch, "double");
-    let strings = batch_col_string(&batch, "string");
-    assert_eq!(
-        strings.value_data().len(),
-        18 * "constant".len(),
-        "variable-width CONST values should remain compact at null positions"
-    );
-    for i in 0..rows.len() {
-        if i % 4 == 0 {
-            assert!(bools.is_null(i));
-            assert!(tiny.is_null(i));
-            assert!(small.is_null(i));
-            assert!(ints.is_null(i));
-            assert!(big.is_null(i));
-            assert!(floats.is_null(i));
-            assert!(doubles.is_null(i));
-            assert!(strings.is_null(i));
-        } else {
-            assert!(bools.value(i));
-            assert_eq!(tiny.value(i), -7);
-            assert_eq!(small.value(i), 1234);
-            assert_eq!(ints.value(i), -56789);
-            assert_eq!(big.value(i), 9_876_543_210);
-            assert_eq!(floats.value(i), 1.25);
-            assert_eq!(doubles.value(i), -12.5);
-            assert_eq!(strings.value(i), "constant");
-        }
-    }
+    let (reader, _) = write_and_read_paged(columns, &rows);
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_const_encoding_with_nulls_all_primitive_types(&batch, rows.len());
 }
 
 #[test]
