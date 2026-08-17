@@ -29,6 +29,9 @@ use mosaic_core::spec::{ENCODING_ALL_NULL, ENCODING_CONST, ENCODING_DICT, ENCODI
 
 const MIN_EXACT_DOUBLE_ABS: f64 = 1.0e-6;
 const MAX_EXACT_DOUBLE_ABS: f64 = 1.0e9;
+const MAX_COLUMNAR_JSON_ROWS: usize = 1_000_000;
+const MAX_UNCOMPRESSED_JSON_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DOUBLE_VALUE_BYTES: usize = 32;
 const COMMA_BLOCK: [u8; 4 * 1024] = [b','; 4 * 1024];
 #[cfg(test)]
 const ZERO_INT16_FIRST_BLOCK: &[u8] = b"0,0,0,0,0,0,0,0";
@@ -80,6 +83,81 @@ pub(crate) struct EncodedPreflight {
     pub(crate) single_utf8_value: SingleUtf8Value,
 }
 
+struct OutputBudget {
+    estimated_bytes: usize,
+}
+
+impl OutputBudget {
+    fn new() -> Self {
+        Self { estimated_bytes: 2 }
+    }
+
+    fn add(&mut self, bytes: usize) -> io::Result<()> {
+        self.estimated_bytes = self
+            .estimated_bytes
+            .checked_add(bytes)
+            .ok_or_else(output_budget_exceeded)?;
+        if self.estimated_bytes > MAX_UNCOMPRESSED_JSON_BYTES {
+            return Err(output_budget_exceeded());
+        }
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        MAX_UNCOMPRESSED_JSON_BYTES - self.estimated_bytes
+    }
+
+    fn add_column_structure(
+        &mut self,
+        name: &str,
+        column_index: usize,
+        row_count: usize,
+    ) -> io::Result<()> {
+        self.add(usize::from(column_index > 0))?;
+        self.add(escaped_utf8_len(name.as_bytes())?)?;
+        // Quotes around the name and value, plus the colon.
+        self.add(5)?;
+        self.add(row_count.saturating_sub(1))
+    }
+}
+
+fn output_budget_exceeded() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "columnar JSON exceeds the {} byte uncompressed output budget",
+            MAX_UNCOMPRESSED_JSON_BYTES
+        ),
+    )
+}
+
+fn checked_estimated_bytes(
+    count: usize,
+    bytes_per_value: usize,
+    limit: usize,
+) -> io::Result<usize> {
+    let estimated = count
+        .checked_mul(bytes_per_value)
+        .ok_or_else(output_budget_exceeded)?;
+    if estimated > limit {
+        return Err(output_budget_exceeded());
+    }
+    Ok(estimated)
+}
+
+fn check_row_count(row_count: usize) -> io::Result<()> {
+    if row_count > MAX_COLUMNAR_JSON_ROWS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "columnar JSON row count {} exceeds the {} row budget",
+                row_count, MAX_COLUMNAR_JSON_ROWS
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Preflights native JSON and optionally resolves one projected UTF-8 column that must contain
 /// exactly one non-empty value across all rows.
 ///
@@ -89,20 +167,39 @@ pub(crate) fn preflight_encoded(
     row_group: &RowGroupReader,
     single_utf8_column: Option<usize>,
 ) -> io::Result<EncodedPreflight> {
+    check_row_count(row_group.num_rows())?;
+
     let mut columns = 0usize;
     let mut supported = true;
     let mut single_utf8_value = SingleUtf8Value::NotRequested;
     let mut requested_column_seen = single_utf8_column.is_none();
-    row_group.visit_encoded_columns(|_, data_type, _, column| {
+    let mut output_budget = OutputBudget::new();
+    row_group.visit_encoded_columns(|name, data_type, _, column| {
         let column_index = columns;
         columns += 1;
         let mut selected_utf8_prevalidated = false;
 
+        if column.num_rows() != row_group.num_rows() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "column '{}' row count {} does not match row group row count {}",
+                    name,
+                    column.num_rows(),
+                    row_group.num_rows()
+                ),
+            ));
+        }
+        output_budget.add_column_structure(name, column_index, column.num_rows())?;
+
         if single_utf8_column == Some(column_index) {
             requested_column_seen = true;
             if matches!(data_type, DataType::Utf8) {
-                let inspection = inspect_single_utf8_column(column)?;
+                let inspection = inspect_single_utf8_column(column, output_budget.remaining())?;
                 selected_utf8_prevalidated = inspection.supported;
+                if inspection.supported {
+                    output_budget.add(inspection.estimated_value_bytes)?;
+                }
                 single_utf8_value = match inspection.value {
                     Some(value) => SingleUtf8Value::Valid(value),
                     None => SingleUtf8Value::Invalid,
@@ -118,10 +215,34 @@ pub(crate) fn preflight_encoded(
         if supported && !selected_utf8_prevalidated {
             supported = match data_type {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    validate_integer_column(column)?
+                    let column_supported = validate_integer_column(column)?;
+                    if column_supported {
+                        output_budget.add(estimate_integer_value_bytes(
+                            data_type,
+                            column,
+                            output_budget.remaining(),
+                        )?)?;
+                    }
+                    column_supported
                 }
-                DataType::Float64 => validate_float64_column(column)?,
-                DataType::Utf8 => validate_utf8_column(column)?,
+                DataType::Float64 => {
+                    let column_supported = validate_float64_column(column)?;
+                    if column_supported {
+                        output_budget.add(estimate_fixed_value_bytes(
+                            column,
+                            MAX_DOUBLE_VALUE_BYTES,
+                            output_budget.remaining(),
+                        )?)?;
+                    }
+                    column_supported
+                }
+                DataType::Utf8 => {
+                    let validation = validate_utf8_column(column, output_budget.remaining())?;
+                    if validation.supported {
+                        output_budget.add(validation.estimated_value_bytes)?;
+                    }
+                    validation.supported
+                }
                 _ => false,
             };
         }
@@ -143,6 +264,35 @@ pub(crate) fn preflight_encoded(
     })
 }
 
+fn estimate_integer_value_bytes(
+    data_type: &DataType,
+    column: EncodedColumn<'_>,
+    limit: usize,
+) -> io::Result<usize> {
+    if column.encoding() == ENCODING_ALL_NULL || !has_non_null(&column) {
+        return Ok(0);
+    }
+    let max_value_bytes = match data_type {
+        DataType::Int8 => 4,
+        DataType::Int16 => 6,
+        DataType::Int32 => 11,
+        DataType::Int64 => 20,
+        _ => return Err(encoded_type_mismatch(data_type)),
+    };
+    estimate_fixed_value_bytes(column, max_value_bytes, limit)
+}
+
+fn estimate_fixed_value_bytes(
+    column: EncodedColumn<'_>,
+    max_value_bytes: usize,
+    limit: usize,
+) -> io::Result<usize> {
+    if column.encoding() == ENCODING_ALL_NULL || !has_non_null(&column) {
+        return Ok(0);
+    }
+    checked_estimated_bytes(column.num_rows(), max_value_bytes, limit)
+}
+
 pub(crate) fn write_encoded_supported<W: Write>(
     row_group: &RowGroupReader,
     output: &mut W,
@@ -162,7 +312,24 @@ pub(crate) fn write_encoded_supported<W: Write>(
 
 fn validate_integer_column(column: EncodedColumn<'_>) -> io::Result<bool> {
     match column.encoding() {
-        ENCODING_ALL_NULL | ENCODING_CONST | ENCODING_PLAIN => Ok(true),
+        ENCODING_ALL_NULL | ENCODING_PLAIN => Ok(true),
+        ENCODING_CONST => {
+            if !has_non_null(&column) {
+                return Ok(true);
+            }
+            let type_matches = matches!(
+                (column.data_type(), column.constant()),
+                (DataType::Int8, Some(EncodedValueRef::Int8(_)))
+                    | (DataType::Int16, Some(EncodedValueRef::Int16(_)))
+                    | (DataType::Int32, Some(EncodedValueRef::Int32(_)))
+                    | (DataType::Int64, Some(EncodedValueRef::Int64(_)))
+            );
+            if type_matches {
+                Ok(true)
+            } else {
+                Err(encoded_type_mismatch(column.data_type()))
+            }
+        }
         ENCODING_DICT => {
             for value in column.values() {
                 value?;
@@ -200,43 +367,79 @@ fn validate_float64_column(column: EncodedColumn<'_>) -> io::Result<bool> {
     }
 }
 
-fn validate_utf8_column(column: EncodedColumn<'_>) -> io::Result<bool> {
+struct ColumnValidation {
+    supported: bool,
+    estimated_value_bytes: usize,
+}
+
+fn validate_utf8_column(column: EncodedColumn<'_>, limit: usize) -> io::Result<ColumnValidation> {
     match column.encoding() {
-        ENCODING_ALL_NULL => Ok(true),
+        ENCODING_ALL_NULL => Ok(ColumnValidation {
+            supported: true,
+            estimated_value_bytes: 0,
+        }),
         ENCODING_CONST => {
             if !has_non_null(&column) {
-                return Ok(true);
+                return Ok(ColumnValidation {
+                    supported: true,
+                    estimated_value_bytes: 0,
+                });
             }
             match column.constant() {
                 Some(EncodedValueRef::Utf8(value)) => {
                     std::str::from_utf8(value).map_err(invalid_utf8)?;
-                    Ok(true)
+                    Ok(ColumnValidation {
+                        supported: true,
+                        estimated_value_bytes: checked_estimated_bytes(
+                            column.num_rows(),
+                            escaped_utf8_len(value)?,
+                            limit,
+                        )?,
+                    })
                 }
                 _ => Err(encoded_type_mismatch(column.data_type())),
             }
         }
         ENCODING_DICT | ENCODING_PLAIN => {
+            let mut estimated_value_bytes = 0usize;
             for value in column.values() {
                 match value? {
                     EncodedValueRef::Null => {}
                     EncodedValueRef::Utf8(value) => {
                         std::str::from_utf8(value).map_err(invalid_utf8)?;
+                        estimated_value_bytes = estimated_value_bytes
+                            .checked_add(escaped_utf8_len(value)?)
+                            .ok_or_else(output_budget_exceeded)?;
+                        if estimated_value_bytes > limit {
+                            return Err(output_budget_exceeded());
+                        }
                     }
                     _ => return Err(encoded_type_mismatch(column.data_type())),
                 }
             }
-            Ok(true)
+            Ok(ColumnValidation {
+                supported: true,
+                estimated_value_bytes,
+            })
         }
-        _ => Ok(false),
+        _ => Ok(ColumnValidation {
+            supported: false,
+            estimated_value_bytes: 0,
+        }),
     }
 }
 
+#[derive(Debug)]
 struct SingleUtf8Inspection {
     supported: bool,
     value: Option<Vec<u8>>,
+    estimated_value_bytes: usize,
 }
 
-fn inspect_single_utf8_column(column: EncodedColumn<'_>) -> io::Result<SingleUtf8Inspection> {
+fn inspect_single_utf8_column(
+    column: EncodedColumn<'_>,
+    limit: usize,
+) -> io::Result<SingleUtf8Inspection> {
     if column.num_rows() == 0 {
         return Ok(SingleUtf8Inspection {
             supported: matches!(
@@ -244,6 +447,7 @@ fn inspect_single_utf8_column(column: EncodedColumn<'_>) -> io::Result<SingleUtf
                 ENCODING_ALL_NULL | ENCODING_CONST | ENCODING_DICT | ENCODING_PLAIN
             ),
             value: None,
+            estimated_value_bytes: 0,
         });
     }
 
@@ -251,12 +455,10 @@ fn inspect_single_utf8_column(column: EncodedColumn<'_>) -> io::Result<SingleUtf
         ENCODING_ALL_NULL => Ok(SingleUtf8Inspection {
             supported: true,
             value: None,
+            estimated_value_bytes: 0,
         }),
-        ENCODING_CONST => inspect_single_const_utf8_column(column),
-        ENCODING_DICT | ENCODING_PLAIN => Ok(SingleUtf8Inspection {
-            supported: true,
-            value: inspect_single_utf8_values(column.values())?,
-        }),
+        ENCODING_CONST => inspect_single_const_utf8_column(column, limit),
+        ENCODING_DICT | ENCODING_PLAIN => inspect_single_utf8_values(column.values(), limit),
         encoding => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported single UTF-8 column encoding {}", encoding),
@@ -264,45 +466,41 @@ fn inspect_single_utf8_column(column: EncodedColumn<'_>) -> io::Result<SingleUtf
     }
 }
 
-fn inspect_single_const_utf8_column(column: EncodedColumn<'_>) -> io::Result<SingleUtf8Inspection> {
-    let mut has_null = false;
-    let mut has_non_null = column.num_rows() > 0;
-    if column.has_nulls() {
-        has_non_null = false;
-        for row in 0..column.num_rows() {
-            if column.is_null(row) {
-                has_null = true;
-            } else {
-                has_non_null = true;
-            }
-            if has_null && has_non_null {
-                break;
-            }
-        }
-    }
+fn inspect_single_const_utf8_column(
+    column: EncodedColumn<'_>,
+    limit: usize,
+) -> io::Result<SingleUtf8Inspection> {
+    let has_null = column.has_nulls();
+    let has_non_null = has_non_null(&column);
 
-    let value = if has_non_null {
+    let (value, estimated_value_bytes) = if has_non_null {
         match column.constant() {
             Some(EncodedValueRef::Utf8(value)) => {
                 std::str::from_utf8(value).map_err(invalid_utf8)?;
-                (!has_null && !value.is_empty()).then(|| value.to_vec())
+                (
+                    (!has_null && !value.is_empty()).then(|| value.to_vec()),
+                    checked_estimated_bytes(column.num_rows(), escaped_utf8_len(value)?, limit)?,
+                )
             }
             _ => return Err(encoded_type_mismatch(column.data_type())),
         }
     } else {
-        None
+        (None, 0)
     };
     Ok(SingleUtf8Inspection {
         supported: true,
         value,
+        estimated_value_bytes,
     })
 }
 
 fn inspect_single_utf8_values<'a>(
     values: impl Iterator<Item = io::Result<EncodedValueRef<'a>>>,
-) -> io::Result<Option<Vec<u8>>> {
+    limit: usize,
+) -> io::Result<SingleUtf8Inspection> {
     let mut unique: Option<Vec<u8>> = None;
     let mut contract_valid = true;
+    let mut estimated_value_bytes = 0usize;
     for value in values {
         let value = match value? {
             EncodedValueRef::Null => {
@@ -314,6 +512,12 @@ fn inspect_single_utf8_values<'a>(
             _ => return Err(encoded_type_mismatch(&DataType::Utf8)),
         };
         std::str::from_utf8(value).map_err(invalid_utf8)?;
+        estimated_value_bytes = estimated_value_bytes
+            .checked_add(escaped_utf8_len(value)?)
+            .ok_or_else(output_budget_exceeded)?;
+        if estimated_value_bytes > limit {
+            return Err(output_budget_exceeded());
+        }
         if value.is_empty() {
             contract_valid = false;
             unique = None;
@@ -331,7 +535,11 @@ fn inspect_single_utf8_values<'a>(
             None => unique = Some(value.to_vec()),
         }
     }
-    Ok(contract_valid.then_some(unique).flatten())
+    Ok(SingleUtf8Inspection {
+        supported: true,
+        value: contract_valid.then_some(unique).flatten(),
+        estimated_value_bytes,
+    })
 }
 
 fn invalid_utf8(error: std::str::Utf8Error) -> io::Error {
@@ -342,8 +550,19 @@ fn invalid_utf8(error: std::str::Utf8Error) -> io::Error {
 }
 
 fn has_non_null(column: &EncodedColumn<'_>) -> bool {
-    column.num_rows() > 0
-        && (!column.has_nulls() || (0..column.num_rows()).any(|row| !column.is_null(row)))
+    if column.num_rows() == 0 || column.encoding() == ENCODING_ALL_NULL {
+        return false;
+    }
+    let Some(bitmap) = column.null_bitmap() else {
+        return true;
+    };
+
+    let full_bytes = column.num_rows() / 8;
+    if bitmap[..full_bytes].iter().any(|value| *value != u8::MAX) {
+        return true;
+    }
+    let remaining = column.num_rows() % 8;
+    remaining > 0 && bitmap[full_bytes] & ((1u8 << remaining) - 1) != (1u8 << remaining) - 1
 }
 
 struct EncodedJsonWriter<'a, W> {
@@ -1216,6 +1435,21 @@ fn write_escaped_utf8<W: Write>(output: &mut W, value: &[u8]) -> io::Result<()> 
     Ok(())
 }
 
+fn escaped_utf8_len(value: &[u8]) -> io::Result<usize> {
+    let mut length = 0usize;
+    for current in value {
+        let bytes = match current {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        };
+        length = length
+            .checked_add(bytes)
+            .ok_or_else(output_budget_exceeded)?;
+    }
+    Ok(length)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
@@ -1229,9 +1463,9 @@ mod tests {
     use mosaic_core::bucket_reader::EncodedValueRef;
 
     use super::{
-        inspect_single_utf8_values, is_oversized_escaped_utf8, write_empty_array,
-        write_escaped_utf8, write_if_supported, write_utf8_constant, COMMA_BLOCK,
-        REPEATED_VALUE_BUFFER_BYTES,
+        check_row_count, inspect_single_utf8_values, is_oversized_escaped_utf8, write_empty_array,
+        write_escaped_utf8, write_if_supported, write_utf8_constant, OutputBudget, COMMA_BLOCK,
+        MAX_COLUMNAR_JSON_ROWS, MAX_UNCOMPRESSED_JSON_BYTES, REPEATED_VALUE_BUFFER_BYTES,
     };
 
     #[derive(Default)]
@@ -1323,7 +1557,9 @@ mod tests {
             Ok(EncodedValueRef::Utf8(b"VIN-001")),
         ];
         assert_eq!(
-            inspect_single_utf8_values(repeated.into_iter()).unwrap(),
+            inspect_single_utf8_values(repeated.into_iter(), MAX_UNCOMPRESSED_JSON_BYTES)
+                .unwrap()
+                .value,
             Some(b"VIN-001".to_vec())
         );
 
@@ -1333,10 +1569,38 @@ mod tests {
             Ok(EncodedValueRef::Utf8(b"VIN-002")),
             Ok(EncodedValueRef::Utf8(&invalid_utf8)),
         ];
-        let error =
-            inspect_single_utf8_values(contract_invalid_then_corrupt.into_iter()).unwrap_err();
+        let error = inspect_single_utf8_values(
+            contract_invalid_then_corrupt.into_iter(),
+            MAX_UNCOMPRESSED_JSON_BYTES,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("invalid UTF-8 column value"));
+    }
+
+    #[test]
+    fn rejects_row_counts_above_the_native_work_budget() {
+        let error = check_row_count(MAX_COLUMNAR_JSON_ROWS + 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("row budget"));
+    }
+
+    #[test]
+    fn rejects_highly_compressible_output_above_the_uncompressed_budget() {
+        let mut budget = OutputBudget::new();
+        let row_count = MAX_COLUMNAR_JSON_ROWS;
+        let mut column = 0usize;
+        loop {
+            match budget.add_column_structure("all_null", column, row_count) {
+                Ok(()) => column += 1,
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                    assert!(error.to_string().contains("uncompressed output budget"));
+                    assert!(column > 0);
+                    break;
+                }
+            }
+        }
     }
 
     #[test]

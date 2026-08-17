@@ -63,19 +63,19 @@ public class MosaicReader implements AutoCloseable {
         return schema;
     }
 
-    public int numRowGroups() {
+    public synchronized int numRowGroups() {
+        checkOpen();
         return NativeLib.nativeReaderNumRowGroups(handle);
     }
 
-    public void project(String[] columns) {
+    public synchronized void project(String[] columns) {
+        checkOpen();
         NativeLib.nativeReaderSetProjection(handle, columns);
         projected = true;
     }
 
-    public MosaicRowGroupReader openRowGroup(int rgIndex) {
-        if (handle == 0) {
-            throw new IllegalStateException("reader is closed");
-        }
+    public synchronized MosaicRowGroupReader openRowGroup(int rgIndex) {
+        checkOpen();
         long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
         if (rgHandle == 0) {
             throw new RuntimeException("failed to open row group " + rgIndex);
@@ -89,7 +89,8 @@ public class MosaicReader implements AutoCloseable {
         }
     }
 
-    public int rowGroupNumRows(int rgIndex) {
+    public synchronized int rowGroupNumRows(int rgIndex) {
+        checkOpen();
         int result = NativeLib.nativeReaderRowGroupNumRows(handle, rgIndex);
         if (result < 0) {
             throw new RuntimeException("failed to get row group num rows for index " + rgIndex);
@@ -100,7 +101,8 @@ public class MosaicReader implements AutoCloseable {
     /**
      * Returns column statistics for the given row group, keyed by column name.
      */
-    public Map<String, ColumnStatistics> getRowGroupStatistics(int rgIndex) {
+    public synchronized Map<String, ColumnStatistics> getRowGroupStatistics(int rgIndex) {
+        checkOpen();
         String[] names = NativeLib.nativeReaderRowGroupStatNames(handle, rgIndex);
         if (names == null || names.length == 0) {
             return Collections.emptyMap();
@@ -116,10 +118,16 @@ public class MosaicReader implements AutoCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (handle != 0) {
             NativeLib.nativeReaderFree(handle);
             handle = 0;
+        }
+    }
+
+    private void checkOpen() {
+        if (handle == 0) {
+            throw new IllegalStateException("reader is closed");
         }
     }
 }

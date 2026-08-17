@@ -40,22 +40,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
             os_name: linux
             arch: x86_64
-            lib_name: libpaimon_mosaic_jni.so
+            lib_name: libpaimon_mosaic_geely_jni_v1.so
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             os_name: linux
             arch: aarch64
-            lib_name: libpaimon_mosaic_jni.so
+            lib_name: libpaimon_mosaic_geely_jni_v1.so
           - os: macos-latest
             target: aarch64-apple-darwin
             os_name: macos
             arch: aarch64
-            lib_name: libpaimon_mosaic_jni.dylib
+            lib_name: libpaimon_mosaic_geely_jni_v1.dylib
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             os_name: windows
             arch: x86_64
-            lib_name: paimon_mosaic_jni.dll
+            lib_name: paimon_mosaic_geely_jni_v1.dll
     steps:
       - uses: actions/checkout@v6
 
@@ -83,7 +83,7 @@ jobs:
           rustup target add "${{ matrix.target }}"
           unset ZSTD_SYS_USE_PKG_CONFIG
 
-          cargo zigbuild --release -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
+          cargo zigbuild --locked --release -p paimon-mosaic-jni --target "${{ matrix.target }}.2.17"
 
           artifact="target/${{ matrix.target }}/release/${{ matrix.lib_name }}"
           test -f "$artifact"
@@ -111,7 +111,7 @@ jobs:
         if: matrix.os_name != 'linux'
         run: |
           rustup target add "${{ matrix.target }}"
-          cargo build --release -p paimon-mosaic-jni --target "${{ matrix.target }}"
+          cargo build --locked --release -p paimon-mosaic-jni --target "${{ matrix.target }}"
 
       - name: Upload native library
         uses: actions/upload-artifact@v5

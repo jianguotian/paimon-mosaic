@@ -30,7 +30,7 @@
 
     <groupId>org.apache.paimon</groupId>
     <artifactId>mosaic</artifactId>
-    <version>0.3.0-geely-zstd-native-vin-20260817-1</version>
+    <version>0.3.0-geely-zstd-native-vin-20260817-2</version>
     <packaging>jar</packaging>
 
     <name>Mosaic</name>

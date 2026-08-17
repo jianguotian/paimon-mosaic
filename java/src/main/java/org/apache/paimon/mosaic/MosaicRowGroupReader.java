@@ -43,7 +43,7 @@ public final class MosaicRowGroupReader implements AutoCloseable {
         this.columnarJsonAllowed = columnarJsonAllowed;
     }
 
-    public VectorSchemaRoot readColumns(BufferAllocator allocator) {
+    public synchronized VectorSchemaRoot readColumns(BufferAllocator allocator) {
         checkOpen();
         try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
                 ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
@@ -68,7 +68,7 @@ public final class MosaicRowGroupReader implements AutoCloseable {
      * caller may invoke {@link #readColumns(BufferAllocator)} on this same object without reopening
      * or decompressing the row group.
      */
-    public byte[] writeColumnarJsonZstd(
+    public synchronized byte[] writeColumnarJsonZstd(
             OutputStream output, int zstdLevel, int singleUtf8ColumnIndex) {
         checkOpen();
         if (!columnarJsonAllowed) {
@@ -92,7 +92,7 @@ public final class MosaicRowGroupReader implements AutoCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (handle != 0) {
             NativeLib.nativeRowGroupReaderFree(handle);
             handle = 0;

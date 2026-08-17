@@ -144,7 +144,7 @@ jobs:
           distribution: 'temurin'
 
       - name: Build JNI library
-        run: cargo build -p paimon-mosaic-jni --release
+        run: cargo build --locked -p paimon-mosaic-jni --release
 
       - name: Write interop files (Rust)
         run: cargo test --release -p paimon-mosaic-core --test interop_write_test

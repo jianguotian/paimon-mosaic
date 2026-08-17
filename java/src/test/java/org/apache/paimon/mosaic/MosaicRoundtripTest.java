@@ -30,6 +30,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -152,6 +157,35 @@ public class MosaicRoundtripTest {
 
         private int size() {
             return delegate.size();
+        }
+    }
+
+    private static final class BlockingOutputStream extends OutputStream {
+
+        private final ByteArrayOutputStream delegate = new ByteArrayOutputStream();
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final AtomicBoolean blocked = new AtomicBoolean();
+
+        @Override
+        public void write(int value) throws IOException {
+            write(new byte[] {(byte) value}, 0, 1);
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length) throws IOException {
+            if (blocked.compareAndSet(false, true)) {
+                entered.countDown();
+                try {
+                    if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                        throw new IOException("timed out waiting to release native output");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while blocking native output", e);
+                }
+            }
+            delegate.write(bytes, offset, length);
         }
     }
 
@@ -1093,6 +1127,63 @@ public class MosaicRoundtripTest {
                     writeWithFailingNativeOutput(rowGroup, true);
             awaitGarbageCollection(flushFailure);
             assertEquals(1, reader.numRowGroups());
+        }
+    }
+
+    @Test
+    public void testRowGroupCloseWaitsForInFlightNativeWrite() throws Exception {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("id", new ArrowType.Int(32, true)),
+                                Field.notNullable("vin", ArrowType.Utf8.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            VarCharVector vins = (VarCharVector) root.getVector("vin");
+            ids.allocateNew(2);
+            vins.allocateNew();
+            for (int row = 0; row < 2; row++) {
+                ids.set(row, row + 1);
+                vins.setSafe(row, "VIN-001".getBytes(StandardCharsets.UTF_8));
+            }
+            root.setRowCount(2);
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch closeStarted = new CountDownLatch(1);
+        BlockingOutputStream output = new BlockingOutputStream();
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            Future<byte[]> write =
+                    executor.submit(() -> rowGroup.writeColumnarJsonZstd(output, 3, 1));
+            assertTrue(output.entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+
+            Future<?> close =
+                    executor.submit(
+                            () -> {
+                                closeStarted.countDown();
+                                rowGroup.close();
+                            });
+            assertTrue(closeStarted.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            Thread.sleep(100);
+            assertFalse("close must wait for the in-flight native call", close.isDone());
+
+            output.release.countDown();
+            assertArrayEquals(
+                    "VIN-001".getBytes(StandardCharsets.UTF_8),
+                    write.get(5, java.util.concurrent.TimeUnit.SECONDS));
+            close.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> rowGroup.readColumns(allocator));
+        } finally {
+            output.release.countDown();
+            executor.shutdownNow();
+            assertTrue(
+                    executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS));
         }
     }
 
