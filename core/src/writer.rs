@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io;
+use std::{io, sync::Arc};
 
 use arrow_array::*;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{Schema, SchemaRef};
 
 use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
 use crate::schema::MosaicSchema;
@@ -46,31 +46,6 @@ fn check_zstd_block_size(size: usize, field: &str) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn data_types_match(expected: &DataType, actual: &DataType) -> bool {
-    match (expected, actual) {
-        (DataType::List(expected_field), DataType::List(actual_field)) => {
-            fields_match(expected_field, actual_field)
-        }
-        (
-            DataType::Map(expected_field, expected_sorted),
-            DataType::Map(actual_field, actual_sorted),
-        ) => expected_sorted == actual_sorted && fields_match(expected_field, actual_field),
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
-            expected_fields.len() == actual_fields.len()
-                && expected_fields.iter().zip(actual_fields.iter()).all(
-                    |(expected_field, actual_field)| fields_match(expected_field, actual_field),
-                )
-        }
-        _ => expected == actual,
-    }
-}
-
-fn fields_match(expected: &Field, actual: &Field) -> bool {
-    expected.name() == actual.name()
-        && expected.is_nullable() == actual.is_nullable()
-        && data_types_match(expected.data_type(), actual.data_type())
 }
 
 pub trait OutputFile {
@@ -163,6 +138,7 @@ pub struct MosaicWriter<S: OutputFile> {
     row_group_max_size: u64,
     page_size_threshold: usize,
     batch_col_map: Vec<usize>,
+    validated_batch_schema: Option<SchemaRef>,
 
     row_group_metas: Vec<RowGroupMeta>,
     current_row_group_rows: usize,
@@ -276,6 +252,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             row_group_max_size: options.row_group_max_size,
             page_size_threshold: options.page_size_threshold,
             batch_col_map,
+            validated_batch_schema: None,
             row_group_metas: Vec::new(),
             current_row_group_rows: 0,
             current_buffered_size: 0,
@@ -343,7 +320,7 @@ impl<S: OutputFile> MosaicWriter<S> {
         result
     }
 
-    fn validate_batch(&self, batch: &RecordBatch) -> io::Result<()> {
+    fn validate_batch(&mut self, batch: &RecordBatch) -> io::Result<()> {
         let num_cols = self.schema.columns.len();
         if batch.num_columns() != num_cols {
             return Err(io::Error::new(
@@ -355,7 +332,28 @@ impl<S: OutputFile> MosaicWriter<S> {
                 ),
             ));
         }
-        self.validate_batch_schema(batch)?;
+
+        let schema_is_cached = self
+            .validated_batch_schema
+            .as_ref()
+            .is_some_and(|schema| Arc::ptr_eq(schema, batch.schema_ref()));
+        if !schema_is_cached {
+            let batch_schema = batch.schema_ref();
+            for (i, col) in self.schema.columns.iter().enumerate() {
+                let batch_field = batch_schema.field(self.batch_col_map[i]);
+                if batch_field.name() != &col.name {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "field name mismatch at column {}: schema has '{}' but batch has '{}'",
+                            i,
+                            col.name,
+                            batch_field.name()
+                        ),
+                    ));
+                }
+            }
+        }
 
         for (i, col) in self.schema.columns.iter().enumerate() {
             let array = batch.column(self.batch_col_map[i]);
@@ -380,6 +378,9 @@ impl<S: OutputFile> MosaicWriter<S> {
                     ),
                 ));
             }
+        }
+        if !schema_is_cached {
+            self.validated_batch_schema = Some(Arc::clone(batch.schema_ref()));
         }
         Ok(())
     }
@@ -409,36 +410,6 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         if self.current_buffered_size >= self.row_group_max_size {
             self.flush_row_group()?;
-        }
-        Ok(())
-    }
-
-    fn validate_batch_schema(&self, batch: &RecordBatch) -> io::Result<()> {
-        let batch_schema = batch.schema();
-        for (i, col) in self.schema.columns.iter().enumerate() {
-            let batch_field = batch_schema.field(self.batch_col_map[i]);
-            if batch_field.name() != &col.name {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "field name mismatch at column {}: schema has '{}' but batch has '{}'",
-                        i,
-                        col.name,
-                        batch_field.name()
-                    ),
-                ));
-            }
-            if !data_types_match(&col.data_type, batch_field.data_type()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "field type mismatch for column '{}': schema has {:?} but batch has {:?}",
-                        col.name,
-                        col.data_type,
-                        batch_field.data_type()
-                    ),
-                ));
-            }
         }
         Ok(())
     }
@@ -1091,57 +1062,101 @@ mod tests {
         .unwrap();
         let result = writer.write_batch(&batch2);
         assert!(result.is_ok());
-
-        let batch3 = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("name", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec![None, Some("world")])),
-            ],
-        )
-        .unwrap();
-        let result = writer.write_batch(&batch3);
-        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_write_batch_rejects_reordered_schema() {
+    fn test_write_batch_rejects_reordered_schema_without_aborting_writer() {
         let arrow_schema = Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
         ]);
         let out = MemOutputFile::new();
         let mut writer = MosaicWriter::new(out, &arrow_schema, WriterOptions::default()).unwrap();
+        assert_eq!(writer.batch_col_map, vec![1, 0]);
 
-        let batch = RecordBatch::try_new(
-            Arc::new(arrow_schema),
+        let reordered_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, false),
+            ])),
             vec![
                 Arc::new(Int32Array::from(vec![1, 2])),
                 Arc::new(Int32Array::from(vec![10, 20])),
             ],
         )
         .unwrap();
-        writer.write_batch(&batch).unwrap();
 
-        let reordered_schema = Schema::new(vec![
-            Field::new("b", DataType::Int32, false),
-            Field::new("a", DataType::Int32, false),
-        ]);
-        let reordered_batch = RecordBatch::try_new(
-            Arc::new(reordered_schema),
+        let error = writer.write_batch(&reordered_batch).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            "field name mismatch at column 0: schema has 'a' but batch has 'b'",
+            error.to_string()
+        );
+        assert!(writer.validated_batch_schema.is_none());
+
+        let valid_batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
             vec![
-                Arc::new(Int32Array::from(vec![30, 40])),
-                Arc::new(Int32Array::from(vec![3, 4])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![1, 2])),
             ],
         )
         .unwrap();
+        writer.write_batch(&valid_batch).unwrap();
+    }
 
-        let err = writer.write_batch(&reordered_batch).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("field name mismatch"));
+    #[test]
+    fn test_write_batch_caches_only_the_exact_schema_ref() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let out = MemOutputFile::new();
+        let mut writer = MosaicWriter::new(out, schema.as_ref(), WriterOptions::default()).unwrap();
+
+        let first_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("one")])),
+            ],
+        )
+        .unwrap();
+        writer.write_batch(&first_batch).unwrap();
+        assert!(Arc::ptr_eq(
+            writer.validated_batch_schema.as_ref().unwrap(),
+            first_batch.schema_ref()
+        ));
+
+        let second_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(StringArray::from(vec![Some("two")])),
+            ],
+        )
+        .unwrap();
+        writer.write_batch(&second_batch).unwrap();
+        assert!(Arc::ptr_eq(
+            writer.validated_batch_schema.as_ref().unwrap(),
+            first_batch.schema_ref()
+        ));
+
+        let equivalent_schema = Arc::new(schema.as_ref().clone());
+        assert!(!Arc::ptr_eq(&schema, &equivalent_schema));
+        let third_batch = RecordBatch::try_new(
+            Arc::clone(&equivalent_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(StringArray::from(vec![Some("three")])),
+            ],
+        )
+        .unwrap();
+        writer.write_batch(&third_batch).unwrap();
+        assert!(Arc::ptr_eq(
+            writer.validated_batch_schema.as_ref().unwrap(),
+            third_batch.schema_ref()
+        ));
     }
 
     #[test]
