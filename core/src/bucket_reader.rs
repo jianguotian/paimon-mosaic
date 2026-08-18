@@ -67,10 +67,6 @@ fn const_values_are_dense(variant: DataVariant) -> bool {
 }
 
 const CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR: usize = 8;
-// Use a stable logical chunk size to estimate how much of the final value buffer sparse writes
-// would commit, without adding a platform-specific page-size dependency.
-const CONST_VALUE_CHUNK_SIZE_BYTES: usize = 4096;
-const CONST_FILL_ALL_MAX_UNTOUCHED_CHUNK_DENOMINATOR: usize = 8;
 
 #[derive(Debug, Clone)]
 enum RawColumnData {
@@ -148,55 +144,6 @@ fn for_each_non_null(null_bitmap: &[u8], num_rows: usize, mut f: impl FnMut(usiz
             non_nulls &= non_nulls - 1;
         }
     }
-}
-
-fn const_value_rows_per_chunk(variant: DataVariant) -> usize {
-    let value_width_bits = match variant {
-        DataVariant::Boolean => 1,
-        DataVariant::Int8 => 8,
-        DataVariant::Int16 => 16,
-        DataVariant::Int32 | DataVariant::Float32 => 32,
-        DataVariant::Int64 | DataVariant::Float64 | DataVariant::TimestampNanos => 64,
-        DataVariant::Binary => unreachable!("Binary CONST values remain compact"),
-    };
-    CONST_VALUE_CHUNK_SIZE_BYTES * 8 / value_width_bits
-}
-
-fn const_touches_enough_value_chunks(
-    null_bitmap: &[u8],
-    num_rows: usize,
-    rows_per_chunk: usize,
-) -> bool {
-    debug_assert!(rows_per_chunk.is_multiple_of(8));
-
-    let total_chunks = num_rows.div_ceil(rows_per_chunk);
-    let min_touched_chunks =
-        total_chunks - total_chunks / CONST_FILL_ALL_MAX_UNTOUCHED_CHUNK_DENOMINATOR;
-    let mut touched_chunks = 0usize;
-    for chunk in 0..total_chunks {
-        let start_row = chunk * rows_per_chunk;
-        let end_row = ((chunk + 1) * rows_per_chunk).min(num_rows);
-        let start_byte = start_row / 8;
-        let full_end_byte = end_row / 8;
-        let mut touched = null_bitmap[start_byte..full_end_byte]
-            .iter()
-            .any(|&nulls| nulls != u8::MAX);
-        let remaining_rows = end_row % 8;
-        if !touched && remaining_rows != 0 {
-            let row_mask = (1u8 << remaining_rows) - 1;
-            touched = null_bitmap[full_end_byte] & row_mask != row_mask;
-        }
-        if touched {
-            touched_chunks += 1;
-            if touched_chunks >= min_touched_chunks {
-                return true;
-            }
-        } else if touched_chunks + total_chunks - chunk - 1 < min_touched_chunks {
-            return false;
-        }
-    }
-
-    touched_chunks >= min_touched_chunks
 }
 
 fn materialize_fixed_const<T: Default + Copy>(
@@ -1313,19 +1260,12 @@ fn read_all_const(
     } else {
         num_rows
     };
-    let fill_all_slots = !has_nulls
-        || (variant != DataVariant::Binary
-            && non_null_count >= num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
-            && const_touches_enough_value_chunks(
-                null_bitmap,
-                num_rows,
-                const_value_rows_per_chunk(variant),
-            ));
     // Fixed-width CONST arrays are always materialized at row cardinality, so build_array can
     // wrap them without another scatter buffer. Filling every null slot is fastest for ordinary
-    // densities, but clustered values can leave large null-only ranges even at moderate density.
-    // Fill all slots only when non-null values touch at least 7/8 of the logical 4 KiB value chunks;
-    // otherwise initialize the final buffer lazily and write only valid positions.
+    // densities, but on very sparse columns it commits large null-only value ranges. Below 1/8
+    // non-null density, initialize the final buffer lazily and write only valid positions.
+    let fill_all_slots =
+        !has_nulls || non_null_count >= num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR);
 
     match variant {
         DataVariant::Boolean => {
@@ -1848,69 +1788,5 @@ mod tests {
             panic!("expected Int64 CONST data");
         };
         assert_eq!(values, vec![42; num_rows]);
-    }
-
-    #[test]
-    fn test_clustered_const_at_density_cutoff_keeps_untouched_chunks_sparse() {
-        let rows_per_chunk = const_value_rows_per_chunk(DataVariant::Int64);
-        let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
-        let non_null_rows = (0..rows_per_chunk).collect::<Vec<_>>();
-        let bitmap = null_bitmap(num_rows, &non_null_rows);
-        let data = read_all_const(
-            &Value::BigInt(42),
-            num_rows,
-            true,
-            &bitmap,
-            DataVariant::Int64,
-        )
-        .unwrap();
-
-        let RawColumnData::Int64(values) = data else {
-            panic!("expected Int64 CONST data");
-        };
-        assert!(values[..rows_per_chunk].iter().all(|&value| value == 42));
-        assert!(values[rows_per_chunk..].iter().all(|&value| value == 0));
-    }
-
-    #[test]
-    fn test_distributed_const_at_density_cutoff_fills_all_chunks() {
-        let rows_per_chunk = const_value_rows_per_chunk(DataVariant::Int64);
-        let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
-        let non_null_rows = (0..num_rows)
-            .step_by(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
-            .collect::<Vec<_>>();
-        let bitmap = null_bitmap(num_rows, &non_null_rows);
-        let data = read_all_const(
-            &Value::BigInt(42),
-            num_rows,
-            true,
-            &bitmap,
-            DataVariant::Int64,
-        )
-        .unwrap();
-
-        let RawColumnData::Int64(values) = data else {
-            panic!("expected Int64 CONST data");
-        };
-        assert_eq!(values, vec![42; num_rows]);
-    }
-
-    #[test]
-    fn test_const_chunk_coverage_ignores_trailing_bitmap_bits() {
-        let num_rows = 9;
-        let rows_per_chunk = 8;
-        let padding_bits_non_null = [0xfe, 0x01];
-        assert!(!const_touches_enough_value_chunks(
-            &padding_bits_non_null,
-            num_rows,
-            rows_per_chunk,
-        ));
-
-        let last_row_non_null = [0xfe, 0x00];
-        assert!(const_touches_enough_value_chunks(
-            &last_row_non_null,
-            num_rows,
-            rows_per_chunk,
-        ));
     }
 }
