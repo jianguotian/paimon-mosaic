@@ -64,7 +64,17 @@ fn data_variant_for_type(dt: &DataType) -> DataVariant {
 }
 
 fn const_values_are_row_aligned(variant: DataVariant) -> bool {
-    !matches!(variant, DataVariant::Binary)
+    match variant {
+        DataVariant::Boolean
+        | DataVariant::Int8
+        | DataVariant::Int16
+        | DataVariant::Int32
+        | DataVariant::Int64
+        | DataVariant::Float32
+        | DataVariant::Float64
+        | DataVariant::TimestampNanos => true,
+        DataVariant::Binary => false,
+    }
 }
 
 const CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR: usize = 8;
@@ -225,6 +235,20 @@ fn for_each_touched_row_run(
     }
 }
 
+fn all_row_chunks_touched(null_bitmap: &[u8], num_rows: usize, rows_per_chunk: usize) -> bool {
+    debug_assert!(rows_per_chunk > 0);
+
+    let mut chunk_start = 0;
+    while chunk_start < num_rows {
+        let chunk_end = chunk_start.saturating_add(rows_per_chunk).min(num_rows);
+        if !row_range_has_non_null(null_bitmap, chunk_start, chunk_end) {
+            return false;
+        }
+        chunk_start = chunk_end;
+    }
+    true
+}
+
 fn const_fill_strategy(
     has_nulls: bool,
     non_null_count: usize,
@@ -279,11 +303,18 @@ fn materialize_fixed_const<T: ConstMaterializeValue>(
         return vec![value; num_rows];
     }
 
-    let mut out = vec![T::default(); num_rows];
     if value.has_default_bit_pattern() {
-        return out;
+        return vec![T::default(); num_rows];
     }
 
+    if strategy == ConstFillStrategy::TouchedRuns {
+        let rows_per_chunk = (CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<T>()).max(1);
+        if all_row_chunks_touched(null_bitmap, num_rows, rows_per_chunk) {
+            return vec![value; num_rows];
+        }
+    }
+
+    let mut out = vec![T::default(); num_rows];
     match strategy {
         ConstFillStrategy::All => unreachable!(),
         ConstFillStrategy::NonNullOnly => {
@@ -319,9 +350,13 @@ fn materialize_boolean_const(
         }
         ConstFillStrategy::TouchedRuns => {
             let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES * 8;
-            for_each_touched_row_run(null_bitmap, num_rows, rows_per_chunk, |start, end| {
-                out[start / 8..end.div_ceil(8)].fill(u8::MAX)
-            });
+            if all_row_chunks_touched(null_bitmap, num_rows, rows_per_chunk) {
+                out.fill(u8::MAX);
+            } else {
+                for_each_touched_row_run(null_bitmap, num_rows, rows_per_chunk, |start, end| {
+                    out[start / 8..end.div_ceil(8)].fill(u8::MAX)
+                });
+            }
         }
     }
 
@@ -403,6 +438,25 @@ fn build_array(
     num_rows: usize,
     values_are_row_aligned: bool,
 ) -> io::Result<ArrayRef> {
+    debug_assert!(
+        !values_are_row_aligned
+            || match &data {
+                RawColumnData::Boolean(values) => values.len() == num_rows.div_ceil(8),
+                RawColumnData::Int8(values) => values.len() == num_rows,
+                RawColumnData::Int16(values) => values.len() == num_rows,
+                RawColumnData::Int32(values) => values.len() == num_rows,
+                RawColumnData::Int64(values) => values.len() == num_rows,
+                RawColumnData::Float32(values) => values.len() == num_rows,
+                RawColumnData::Float64(values) => values.len() == num_rows,
+                RawColumnData::Binary { .. } => false,
+                RawColumnData::TimestampNanos {
+                    millis,
+                    nanos_of_milli,
+                } => millis.len() == num_rows && nanos_of_milli.len() == num_rows,
+            },
+        "row-aligned CONST data must match the row cardinality"
+    );
+
     let null_buf = make_null_buffer(null_bitmap.clone(), num_rows);
     let no_scatter = None;
     let scatter_bitmap = if values_are_row_aligned {
@@ -1978,6 +2032,30 @@ mod tests {
             panic!("expected Int64 CONST data");
         };
         assert_eq!(values, vec![42; num_rows]);
+    }
+
+    #[test]
+    fn test_all_row_chunks_touched_distinguishes_distributed_and_clustered_values() {
+        let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<i64>();
+        let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+
+        let distributed_rows = (0..num_rows)
+            .step_by(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
+            .collect::<Vec<_>>();
+        let distributed_bitmap = null_bitmap(num_rows, &distributed_rows);
+        assert!(all_row_chunks_touched(
+            &distributed_bitmap,
+            num_rows,
+            rows_per_chunk
+        ));
+
+        let clustered_rows = (0..rows_per_chunk).collect::<Vec<_>>();
+        let clustered_bitmap = null_bitmap(num_rows, &clustered_rows);
+        assert!(!all_row_chunks_touched(
+            &clustered_bitmap,
+            num_rows,
+            rows_per_chunk
+        ));
     }
 
     #[test]
