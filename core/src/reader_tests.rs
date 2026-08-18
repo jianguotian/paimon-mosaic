@@ -1768,6 +1768,63 @@ fn test_const_encoding_with_nulls_all_primitive_types() {
     assert_const_encoding_with_nulls_all_primitive_types(&batch, rows.len());
 }
 
+fn assert_sparse_const_encoding_with_nulls(batch: &RecordBatch, non_null_rows: &[usize]) {
+    let bools = batch_col_bool(batch, "bool");
+    let big = batch_col_i64(batch, "big");
+
+    for i in 0..batch.num_rows() {
+        if non_null_rows.contains(&i) {
+            assert!(!bools.is_null(i));
+            assert!(!big.is_null(i));
+            assert!(bools.value(i));
+            assert_eq!(big.value(i), 42);
+        } else {
+            assert!(bools.is_null(i));
+            assert!(big.is_null(i));
+            assert!(!bools.value(i));
+            assert_eq!(big.value(i), 0);
+        }
+    }
+}
+
+#[test]
+fn test_sparse_const_encoding_with_nulls() {
+    use crate::reader::Encoding;
+
+    let columns = vec![
+        ("bool".to_string(), DataType::Boolean, true),
+        ("big".to_string(), DataType::Int64, true),
+    ];
+    let non_null_rows = [0, 255];
+    let rows: Vec<Vec<Value>> = (0..256)
+        .map(|i| {
+            if non_null_rows.contains(&i) {
+                vec![Value::Boolean(true), Value::BigInt(42)]
+            } else {
+                vec![Value::Null; columns.len()]
+            }
+        })
+        .collect();
+    assert!(non_null_rows.len() < rows.len().div_ceil(8));
+
+    let (reader, _) = write_and_read(columns.clone(), &rows);
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_eq!(batch.num_rows(), rows.len());
+    assert_sparse_const_encoding_with_nulls(&batch, &non_null_rows);
+
+    let (reader, _) = write_and_read_paged(columns, &rows);
+    assert!(reader
+        .page_infos(0)
+        .unwrap()
+        .iter()
+        .all(|info| info.encoding == Encoding::Const));
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    assert_eq!(batch.num_rows(), rows.len());
+    assert_sparse_const_encoding_with_nulls(&batch, &non_null_rows);
+}
+
 #[test]
 fn test_dict_encoding_with_nulls() {
     let columns = vec![("v".to_string(), DataType::Int32, true)];
