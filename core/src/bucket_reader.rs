@@ -1592,6 +1592,15 @@ impl ColumnPageReader {
         page_data_start: usize,
         num_rows: usize,
     ) -> io::Result<Self> {
+        if !matches!(
+            encoding,
+            ENCODING_PLAIN | ENCODING_CONST | ENCODING_DICT | ENCODING_ALL_NULL
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("column page: unsupported encoding {}", encoding),
+            ));
+        }
         if page_data_start > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2800,6 +2809,22 @@ mod tests {
 #[cfg(test)]
 mod encoded_column_tests {
     use super::*;
+
+    #[test]
+    fn column_page_rejects_unknown_encoding_without_panicking() {
+        let result = std::panic::catch_unwind(|| -> io::Result<()> {
+            let page =
+                ColumnPageReader::new(DataType::Int32, 0xff, true, Value::Null, Vec::new(), 1)?;
+            page.read_all()?;
+            Ok(())
+        });
+
+        let err = result
+            .expect("unknown column page encoding must not panic")
+            .expect_err("unknown column page encoding must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unsupported encoding 255"));
+    }
 
     #[test]
     fn rejects_invalid_timestamp_nanos_for_all_encodings() {

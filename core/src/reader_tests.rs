@@ -5143,3 +5143,23 @@ fn test_slot_sizes_paged_array_column() {
     assert_eq!(projected[0].column_index, vals);
     assert_eq!(projected[0].slot_size, sizes[vals]);
 }
+
+#[test]
+fn test_unknown_paged_encoding_returns_invalid_data_without_panicking() {
+    let result = std::panic::catch_unwind(|| -> io::Result<()> {
+        let page = MosaicReader::<ByteArrayInputFile>::parse_simple_column_slot(
+            vec![0xff, 0x01],
+            &DataType::Int32,
+            1,
+        )?;
+        let column = page.encoded_column();
+        column.values().next().transpose()?;
+        Ok(())
+    });
+
+    let err = result
+        .expect("unknown paged encoding must not panic")
+        .expect_err("unknown paged encoding must be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("unsupported encoding 255"));
+}
