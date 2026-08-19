@@ -78,16 +78,42 @@ fn const_values_are_row_aligned(variant: DataVariant) -> bool {
 }
 
 const CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR: usize = 8;
-// Use a stable logical granularity only to decide whether every value range is already touched.
-// Do not use these boundaries as write ranges: Vec allocations are not page-aligned, so filling
-// a logical chunk can commit physical pages belonging to adjacent null-only chunks.
-const CONST_VALUE_CHUNK_SIZE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConstFillStrategy {
     All,
     NonNullOnly,
-    BulkFillIfAllChunksTouched,
+    BulkFillIfAllPagesTouched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstOutputLayout {
+    FixedWidth { bytes_per_row: usize },
+    BitPackedBoolean,
+}
+
+impl ConstOutputLayout {
+    fn row_range_for_bytes(
+        self,
+        start_byte: usize,
+        end_byte: usize,
+        num_rows: usize,
+    ) -> (usize, usize) {
+        debug_assert!(start_byte < end_byte);
+        match self {
+            Self::FixedWidth { bytes_per_row } => {
+                debug_assert!(bytes_per_row > 0);
+                (
+                    start_byte / bytes_per_row,
+                    end_byte.div_ceil(bytes_per_row).min(num_rows),
+                )
+            }
+            Self::BitPackedBoolean => (
+                start_byte.saturating_mul(8).min(num_rows),
+                end_byte.saturating_mul(8).min(num_rows),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -232,18 +258,55 @@ fn for_each_non_null_row_run(null_bitmap: &[u8], num_rows: usize, mut f: impl Fn
     }
 }
 
-fn all_row_chunks_touched(null_bitmap: &[u8], num_rows: usize, rows_per_chunk: usize) -> bool {
-    debug_assert!(rows_per_chunk > 0);
+fn system_page_size() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        static PAGE_SIZE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *PAGE_SIZE.get_or_init(|| {
+            // SAFETY: sysconf with _SC_PAGESIZE has no pointer arguments or caller-owned state.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            (page_size > 0).then_some(page_size as usize)
+        })
+    }
 
-    let mut chunk_start = 0;
-    while chunk_start < num_rows {
-        let chunk_end = chunk_start.saturating_add(rows_per_chunk).min(num_rows);
-        if !row_range_has_non_null(null_bitmap, chunk_start, chunk_end) {
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn all_output_pages_touched(
+    null_bitmap: &[u8],
+    num_rows: usize,
+    output_addr: usize,
+    output_len_bytes: usize,
+    page_size: usize,
+    layout: ConstOutputLayout,
+) -> bool {
+    if output_len_bytes == 0 || page_size == 0 {
+        return false;
+    }
+    let Some(output_end) = output_addr.checked_add(output_len_bytes) else {
+        return false;
+    };
+
+    let mut page_start = output_addr - output_addr % page_size;
+    loop {
+        let Some(next_page) = page_start.checked_add(page_size) else {
+            return false;
+        };
+        let start_byte = page_start.max(output_addr) - output_addr;
+        let end_byte = next_page.min(output_end) - output_addr;
+        let (start_row, end_row) = layout.row_range_for_bytes(start_byte, end_byte, num_rows);
+        if !row_range_has_non_null(null_bitmap, start_row, end_row) {
             return false;
         }
-        chunk_start = chunk_end;
+
+        if next_page >= output_end {
+            return true;
+        }
+        page_start = next_page;
     }
-    true
 }
 
 fn const_fill_strategy(
@@ -256,7 +319,7 @@ fn const_fill_strategy(
     } else if non_null_count < num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR) {
         ConstFillStrategy::NonNullOnly
     } else {
-        ConstFillStrategy::BulkFillIfAllChunksTouched
+        ConstFillStrategy::BulkFillIfAllPagesTouched
     }
 }
 
@@ -300,24 +363,36 @@ fn materialize_fixed_const<T: ConstMaterializeValue>(
         return vec![value; num_rows];
     }
 
+    let mut out = vec![T::default(); num_rows];
     if value.has_default_bit_pattern() {
-        return vec![T::default(); num_rows];
+        return out;
     }
 
-    if strategy == ConstFillStrategy::BulkFillIfAllChunksTouched {
-        let rows_per_chunk = (CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<T>()).max(1);
-        if all_row_chunks_touched(null_bitmap, num_rows, rows_per_chunk) {
-            return vec![value; num_rows];
+    if strategy == ConstFillStrategy::BulkFillIfAllPagesTouched {
+        if let Some(page_size) = system_page_size() {
+            let output_len_bytes = out.len() * size_of::<T>();
+            if all_output_pages_touched(
+                null_bitmap,
+                num_rows,
+                out.as_ptr() as usize,
+                output_len_bytes,
+                page_size,
+                ConstOutputLayout::FixedWidth {
+                    bytes_per_row: size_of::<T>(),
+                },
+            ) {
+                out.fill(value);
+                return out;
+            }
         }
     }
 
-    let mut out = vec![T::default(); num_rows];
     match strategy {
         ConstFillStrategy::All => unreachable!(),
         ConstFillStrategy::NonNullOnly => {
             for_each_non_null(null_bitmap, num_rows, |row| out[row] = value);
         }
-        ConstFillStrategy::BulkFillIfAllChunksTouched => {
+        ConstFillStrategy::BulkFillIfAllPagesTouched => {
             for_each_non_null_row_run(null_bitmap, num_rows, |start, end| {
                 out[start..end].fill(value);
             });
@@ -344,9 +419,17 @@ fn materialize_boolean_const(
                 out[row / 8] |= 1 << (row % 8);
             });
         }
-        ConstFillStrategy::BulkFillIfAllChunksTouched => {
-            let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES * 8;
-            if all_row_chunks_touched(null_bitmap, num_rows, rows_per_chunk) {
+        ConstFillStrategy::BulkFillIfAllPagesTouched => {
+            if system_page_size().is_some_and(|page_size| {
+                all_output_pages_touched(
+                    null_bitmap,
+                    num_rows,
+                    out.as_ptr() as usize,
+                    out.len(),
+                    page_size,
+                    ConstOutputLayout::BitPackedBoolean,
+                )
+            }) {
                 out.fill(u8::MAX);
             } else {
                 for_each_non_null(null_bitmap, num_rows, |row| {
@@ -1458,9 +1541,9 @@ fn read_all_const(
     };
     // Fixed-width CONST arrays are always materialized at row cardinality, so build_array can
     // wrap them without another scatter buffer. Sparse columns write only valid positions. At
-    // ordinary densities, bulk-fill the whole buffer only when every logical 4 KiB range already
-    // contains valid rows. Otherwise fill only contiguous non-null row runs, because logical chunk
-    // boundaries are not guaranteed to align with the physical pages backing the output Vec.
+    // ordinary densities, bulk-fill the whole buffer only when every physical page covered by the
+    // actual allocation already contains valid rows. Otherwise fill only contiguous non-null row
+    // runs so null-only pages remain untouched.
     let fill_strategy = const_fill_strategy(has_nulls, non_null_count, num_rows);
 
     match variant {
@@ -1944,6 +2027,10 @@ mod tests {
         bitmap
     }
 
+    fn test_page_size() -> usize {
+        system_page_size().unwrap_or(4096)
+    }
+
     #[test]
     fn test_sparse_fixed_const_writes_only_non_null_slots() {
         let num_rows = 32;
@@ -1967,7 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed_const_bulk_fills_when_all_chunks_are_touched() {
+    fn test_fixed_const_bulk_fills_when_all_pages_are_touched() {
         let num_rows = 32;
         let non_null_rows = (0..24).collect::<Vec<_>>();
         let bitmap = null_bitmap(num_rows, &non_null_rows);
@@ -1988,7 +2075,7 @@ mod tests {
 
     #[test]
     fn test_interleaved_const_chunks_write_only_non_null_runs() {
-        let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<i64>();
+        let rows_per_chunk = test_page_size() / size_of::<i64>();
         let num_rows = rows_per_chunk * 4;
         let non_null_rows = [0, 2]
             .into_iter()
@@ -2024,7 +2111,7 @@ mod tests {
 
     #[test]
     fn test_clustered_const_at_density_cutoff_fills_only_non_null_runs() {
-        let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<i64>();
+        let rows_per_chunk = test_page_size() / size_of::<i64>();
         let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
         let non_null_rows = (0..rows_per_chunk).collect::<Vec<_>>();
         let bitmap = null_bitmap(num_rows, &non_null_rows);
@@ -2045,8 +2132,8 @@ mod tests {
     }
 
     #[test]
-    fn test_distributed_const_at_density_cutoff_bulk_fills_all_chunks() {
-        let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<i64>();
+    fn test_distributed_const_at_density_cutoff_bulk_fills_all_pages() {
+        let rows_per_chunk = test_page_size() / size_of::<i64>();
         let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
         let non_null_rows = (0..num_rows)
             .step_by(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
@@ -2068,60 +2155,113 @@ mod tests {
     }
 
     #[test]
-    fn test_all_row_chunks_touched_distinguishes_distributed_and_clustered_values() {
-        let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<i64>();
-        let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+    fn test_output_page_coverage_distinguishes_distributed_and_clustered_values() {
+        let page_size = test_page_size();
+        let rows_per_page = page_size / size_of::<i64>();
+        let num_rows = rows_per_page * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+        let output = vec![0i64; num_rows];
+        let output_len_bytes = output.len() * size_of::<i64>();
+        let layout = ConstOutputLayout::FixedWidth {
+            bytes_per_row: size_of::<i64>(),
+        };
 
         let distributed_rows = (0..num_rows)
             .step_by(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
             .collect::<Vec<_>>();
         let distributed_bitmap = null_bitmap(num_rows, &distributed_rows);
-        assert!(all_row_chunks_touched(
+        assert!(all_output_pages_touched(
             &distributed_bitmap,
             num_rows,
-            rows_per_chunk
+            output.as_ptr() as usize,
+            output_len_bytes,
+            page_size,
+            layout,
         ));
 
-        let clustered_rows = (0..rows_per_chunk).collect::<Vec<_>>();
+        let clustered_rows = (0..rows_per_page).collect::<Vec<_>>();
         let clustered_bitmap = null_bitmap(num_rows, &clustered_rows);
-        assert!(!all_row_chunks_touched(
+        assert!(!all_output_pages_touched(
             &clustered_bitmap,
             num_rows,
-            rows_per_chunk
+            output.as_ptr() as usize,
+            output_len_bytes,
+            page_size,
+            layout,
         ));
     }
 
     #[test]
-    fn test_chunk_coverage_ignores_trailing_bitmap_bits() {
-        let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<i64>();
-        let num_rows = rows_per_chunk + 1;
+    fn test_page_coverage_accounts_for_allocation_offset() {
+        let page_size = 4096;
+        let rows_per_chunk = page_size / size_of::<i64>();
+        let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
+        let non_null_rows = (0..CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR / 2)
+            .flat_map(|pair| {
+                let even_chunk_start = pair * 2 * rows_per_chunk;
+                let odd_chunk_end = even_chunk_start + 2 * rows_per_chunk;
+                (even_chunk_start..even_chunk_start + 127).chain(std::iter::once(odd_chunk_end - 1))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            non_null_rows.len(),
+            num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)
+        );
+        let bitmap = null_bitmap(num_rows, &non_null_rows);
+        for chunk_start in (0..num_rows).step_by(rows_per_chunk) {
+            assert!(row_range_has_non_null(
+                &bitmap,
+                chunk_start,
+                (chunk_start + rows_per_chunk).min(num_rows)
+            ));
+        }
+
+        let layout = ConstOutputLayout::FixedWidth {
+            bytes_per_row: size_of::<i64>(),
+        };
+        let output_len_bytes = num_rows * size_of::<i64>();
+        assert!(all_output_pages_touched(
+            &bitmap,
+            num_rows,
+            0,
+            output_len_bytes,
+            page_size,
+            layout,
+        ));
+        assert!(!all_output_pages_touched(
+            &bitmap,
+            num_rows,
+            16,
+            output_len_bytes,
+            page_size,
+            layout,
+        ));
+    }
+
+    #[test]
+    fn test_page_coverage_ignores_trailing_bitmap_bits() {
+        let page_size = 4096;
+        let rows_per_page = page_size / size_of::<i64>();
+        let num_rows = rows_per_page + 1;
         let non_null_rows = (0..num_rows.div_ceil(8)).collect::<Vec<_>>();
         let mut bitmap = null_bitmap(num_rows, &non_null_rows);
         bitmap[num_rows / 8] = 0b0000_0001;
-        let data = read_all_const(
-            &Value::BigInt(42),
-            num_rows,
-            true,
-            &bitmap,
-            DataVariant::Int64,
-        )
-        .unwrap();
 
-        let RawColumnData::Int64(values) = data else {
-            panic!("expected Int64 CONST data");
-        };
-        assert!(values[..non_null_rows.len()]
-            .iter()
-            .all(|&value| value == 42));
-        assert!(values[non_null_rows.len()..]
-            .iter()
-            .all(|&value| value == 0));
+        assert!(!all_output_pages_touched(
+            &bitmap,
+            num_rows,
+            0,
+            num_rows * size_of::<i64>(),
+            page_size,
+            ConstOutputLayout::FixedWidth {
+                bytes_per_row: size_of::<i64>(),
+            },
+        ));
     }
 
     #[test]
     fn test_boolean_fallback_respects_non_null_and_bitmap_boundaries() {
-        let rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES * 8;
-        let num_rows = rows_per_chunk + 1;
+        let rows_per_chunk = test_page_size() * 8;
+        let num_rows = rows_per_chunk * 2 + 1;
         let non_null_rows = (0..num_rows.div_ceil(8)).collect::<Vec<_>>();
         let mut bitmap = null_bitmap(num_rows, &non_null_rows);
         bitmap[num_rows / 8] = 0b0000_0001;
@@ -2145,8 +2285,9 @@ mod tests {
 
     #[test]
     fn test_timestamp_nanos_uses_each_buffer_element_width() {
-        let millis_rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<i64>();
-        let nanos_rows_per_chunk = CONST_VALUE_CHUNK_SIZE_BYTES / size_of::<i32>();
+        let page_size = test_page_size();
+        let millis_rows_per_chunk = page_size / size_of::<i64>();
+        let nanos_rows_per_chunk = page_size / size_of::<i32>();
         let num_rows = millis_rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
         let non_null_rows = (millis_rows_per_chunk..nanos_rows_per_chunk).collect::<Vec<_>>();
         let bitmap = null_bitmap(num_rows, &non_null_rows);
@@ -2191,7 +2332,7 @@ mod tests {
 
     #[test]
     fn test_fixed_const_preserves_default_and_negative_zero_values() {
-        let num_rows = CONST_VALUE_CHUNK_SIZE_BYTES;
+        let num_rows = test_page_size();
         let non_null_rows =
             (0..num_rows.div_ceil(CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR)).collect::<Vec<_>>();
         let bitmap = null_bitmap(num_rows, &non_null_rows);
