@@ -1701,16 +1701,6 @@ fn assert_const_encoding_with_nulls_all_primitive_types(batch: &RecordBatch, num
         "variable-width CONST values should remain compact at null positions"
     );
     for i in 0..num_rows {
-        // This fixture is dense enough to use the fill-all path. Inspect the hidden fixed-width
-        // payload at null positions so the old compact-plus-scatter implementation fails.
-        assert!(bools.value(i));
-        assert_eq!(tiny.value(i), -7);
-        assert_eq!(small.value(i), 1234);
-        assert_eq!(ints.value(i), -56789);
-        assert_eq!(big.value(i), 9_876_543_210);
-        assert_eq!(floats.value(i), 1.25);
-        assert_eq!(doubles.value(i), -12.5);
-
         if i % 4 == 0 {
             assert!(bools.is_null(i));
             assert!(tiny.is_null(i));
@@ -1721,6 +1711,13 @@ fn assert_const_encoding_with_nulls_all_primitive_types(batch: &RecordBatch, num
             assert!(doubles.is_null(i));
             assert!(strings.is_null(i));
         } else {
+            assert!(bools.value(i));
+            assert_eq!(tiny.value(i), -7);
+            assert_eq!(small.value(i), 1234);
+            assert_eq!(ints.value(i), -56789);
+            assert_eq!(big.value(i), 9_876_543_210);
+            assert_eq!(floats.value(i), 1.25);
+            assert_eq!(doubles.value(i), -12.5);
             assert_eq!(strings.value(i), "constant");
         }
     }

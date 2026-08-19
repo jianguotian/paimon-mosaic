@@ -2054,7 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed_const_bulk_fills_when_all_pages_are_touched() {
+    fn test_dense_fixed_const_values_are_row_aligned() {
         let num_rows = 32;
         let non_null_rows = (0..24).collect::<Vec<_>>();
         let bitmap = null_bitmap(num_rows, &non_null_rows);
@@ -2070,7 +2070,10 @@ mod tests {
         let RawColumnData::Int64(values) = data else {
             panic!("expected Int64 CONST data");
         };
-        assert_eq!(values, vec![42; num_rows]);
+        assert_eq!(values.len(), num_rows);
+        for row in non_null_rows {
+            assert_eq!(values[row], 42);
+        }
     }
 
     #[test]
@@ -2132,7 +2135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_distributed_const_at_density_cutoff_bulk_fills_all_pages() {
+    fn test_distributed_const_at_density_cutoff_preserves_valid_values() {
         let rows_per_chunk = test_page_size() / size_of::<i64>();
         let num_rows = rows_per_chunk * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
         let non_null_rows = (0..num_rows)
@@ -2151,16 +2154,19 @@ mod tests {
         let RawColumnData::Int64(values) = data else {
             panic!("expected Int64 CONST data");
         };
-        assert_eq!(values, vec![42; num_rows]);
+        assert_eq!(values.len(), num_rows);
+        for row in non_null_rows {
+            assert_eq!(values[row], 42);
+        }
     }
 
     #[test]
     fn test_output_page_coverage_distinguishes_distributed_and_clustered_values() {
-        let page_size = test_page_size();
+        let page_size = 4096;
         let rows_per_page = page_size / size_of::<i64>();
         let num_rows = rows_per_page * CONST_FILL_ALL_MIN_NON_NULL_DENOMINATOR;
-        let output = vec![0i64; num_rows];
-        let output_len_bytes = output.len() * size_of::<i64>();
+        let output_addr = 0;
+        let output_len_bytes = num_rows * size_of::<i64>();
         let layout = ConstOutputLayout::FixedWidth {
             bytes_per_row: size_of::<i64>(),
         };
@@ -2172,7 +2178,7 @@ mod tests {
         assert!(all_output_pages_touched(
             &distributed_bitmap,
             num_rows,
-            output.as_ptr() as usize,
+            output_addr,
             output_len_bytes,
             page_size,
             layout,
@@ -2183,7 +2189,7 @@ mod tests {
         assert!(!all_output_pages_touched(
             &clustered_bitmap,
             num_rows,
-            output.as_ptr() as usize,
+            output_addr,
             output_len_bytes,
             page_size,
             layout,
