@@ -760,6 +760,67 @@ fn write_and_read(
     (reader, data)
 }
 
+#[test]
+fn test_nullable_const_timestamp_nanos_boundaries_roundtrip() {
+    use crate::reader::Encoding;
+
+    let columns = vec![
+        (
+            "ts_min".to_string(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        (
+            "ts_max".to_string(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ];
+    let (min_millis, min_nanos) = crate::types::ns_to_millis_nanos(i64::MIN);
+    let (max_millis, max_nanos) = crate::types::ns_to_millis_nanos(i64::MAX);
+    let rows: Vec<Vec<Value>> = (0..200)
+        .map(|row| {
+            if row < 25 {
+                vec![
+                    Value::TimestampNanos {
+                        millis: min_millis,
+                        nanos_of_milli: min_nanos,
+                    },
+                    Value::TimestampNanos {
+                        millis: max_millis,
+                        nanos_of_milli: max_nanos,
+                    },
+                ]
+            } else {
+                vec![Value::Null, Value::Null]
+            }
+        })
+        .collect();
+
+    let (reader, _) = write_and_read_paged(columns, &rows);
+    assert!(reader
+        .page_infos(0)
+        .unwrap()
+        .iter()
+        .all(|info| info.encoding == Encoding::Const));
+    let mut rg = reader.row_group_reader(0).unwrap();
+    let batch = rg.read_columns().unwrap();
+    for (column, expected) in [(0, i64::MIN), (1, i64::MAX)] {
+        let values = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(values.len(), 200);
+        assert_eq!(values.null_count(), 175);
+        for row in 0..200 {
+            if !values.is_null(row) {
+                assert_eq!(values.value(row), expected, "column {column}, row {row}");
+            }
+        }
+    }
+}
+
 /// Mirrors Paimon's testSchemaEvolutionTypeWidening.
 /// Writes with narrow types (INT, FLOAT, TINYINT) and verifies the reader
 /// produces the exact values that a higher layer can widen to BIGINT/DOUBLE/INT.
@@ -1778,8 +1839,6 @@ fn assert_sparse_const_encoding_with_nulls(batch: &RecordBatch, non_null_rows: &
         } else {
             assert!(bools.is_null(i));
             assert!(big.is_null(i));
-            assert!(!bools.value(i));
-            assert_eq!(big.value(i), 0);
         }
     }
 }

@@ -663,7 +663,14 @@ fn build_array(
                     let values = millis_scattered
                         .into_iter()
                         .zip(nanos_scattered)
-                        .map(|(millis, nanos)| types::millis_nanos_to_ns(millis, nanos))
+                        .enumerate()
+                        .map(|(row, (millis, nanos))| {
+                            if null_buf.as_ref().is_some_and(|nulls| nulls.is_null(row)) {
+                                Ok(0)
+                            } else {
+                                types::millis_nanos_to_ns(millis, nanos)
+                            }
+                        })
                         .collect::<io::Result<Vec<_>>>()?;
                     let arr = TimestampNanosecondArray::new(ScalarBuffer::from(values), null_buf);
                     Arc::new(if let Some(tz) = tz {
@@ -2334,6 +2341,33 @@ mod tests {
         assert!(nanos_of_milli[nanos_rows_per_chunk..]
             .iter()
             .all(|&value| value == 0));
+    }
+
+    #[test]
+    fn test_timestamp_nanos_conversion_ignores_null_hidden_values() {
+        let (min_millis, min_nanos) = types::ns_to_millis_nanos(i64::MIN);
+        let (max_millis, max_nanos) = types::ns_to_millis_nanos(i64::MAX);
+        let data = RawColumnData::TimestampNanos {
+            millis: vec![min_millis, min_millis, max_millis, max_millis],
+            nanos_of_milli: vec![min_nanos, 0, max_nanos, 999_999],
+        };
+        let array = build_array(
+            data,
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            Some(vec![0b0000_0101]),
+            4,
+            true,
+        )
+        .unwrap();
+        let values = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+
+        assert_eq!(values.value(0), i64::MIN);
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), i64::MAX);
+        assert!(values.is_null(3));
     }
 
     #[test]
