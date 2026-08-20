@@ -35,6 +35,7 @@ public class MosaicReader implements AutoCloseable {
 
     private long handle;
     private final Schema schema;
+    private boolean projected;
 
     private MosaicReader(long handle, BufferAllocator allocator) {
         this.handle = handle;
@@ -77,6 +78,26 @@ public class MosaicReader implements AutoCloseable {
 
     public void project(String[] columns) {
         NativeLib.nativeReaderSetProjection(handle, columns);
+        projected = true;
+    }
+
+    /**
+     * Opens one row group for reusable encoded or Arrow access.
+     *
+     * <p>The caller must close the returned reader.
+     *
+     * @throws IOException if {@link InputFile#readFully(long, byte[], int, int)} throws one while
+     *     preparing row-group data; the original exception is propagated
+     */
+    public MosaicRowGroupReader openRowGroup(int rgIndex) throws IOException {
+        if (handle == 0) {
+            throw new IllegalStateException("reader is closed");
+        }
+        long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
+        if (rgHandle == 0) {
+            throw new RuntimeException("failed to open row group " + rgIndex);
+        }
+        return new MosaicRowGroupReader(rgHandle, !projected);
     }
 
     /**
@@ -86,26 +107,8 @@ public class MosaicReader implements AutoCloseable {
      *     reading row-group data; the original exception is propagated
      */
     public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) throws IOException {
-        long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
-        if (rgHandle == 0) {
-            throw new RuntimeException("failed to open row group " + rgIndex);
-        }
-        try {
-            return readRowGroupHandle(rgHandle, allocator);
-        } finally {
-            NativeLib.nativeRowGroupReaderFree(rgHandle);
-        }
-    }
-
-    private VectorSchemaRoot readRowGroupHandle(long rgHandle, BufferAllocator allocator) {
-        try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
-             ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
-            int rc = NativeLib.nativeRowGroupReaderReadColumns(
-                    rgHandle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
-            if (rc != 0) {
-                throw new RuntimeException("readColumns failed");
-            }
-            return Data.importVectorSchemaRoot(allocator, arrowArray, arrowSchema, null);
+        try (MosaicRowGroupReader rowGroup = openRowGroup(rgIndex)) {
+            return rowGroup.readColumns(allocator);
         }
     }
 
