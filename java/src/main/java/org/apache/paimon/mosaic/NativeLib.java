@@ -131,6 +131,16 @@ final class NativeLib {
             long handle, OutputStream output) throws IOException;
     static native void nativeRowGroupReaderFree(long handle);
 
+    // Called from jni/src/lib.rs by this exact name and JNI signature. Double.toString keeps the
+    // native output byte-for-byte aligned with the Java fallback on the current JVM.
+    private static String[] formatColumnarJsonDoubles(long[] bits) {
+        String[] values = new String[bits.length];
+        for (int index = 0; index < bits.length; index++) {
+            values[index] = Double.toString(Double.longBitsToDouble(bits[index]));
+        }
+        return values;
+    }
+
     // Row group num rows
     static native int nativeReaderRowGroupNumRows(long handle, int rgIndex);
 

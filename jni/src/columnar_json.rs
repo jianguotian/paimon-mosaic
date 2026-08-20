@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use arrow_schema::DataType;
@@ -26,10 +27,78 @@ const MAX_EXACT_DOUBLE_ABS: f64 = 1.0e9;
 const MAX_COLUMNAR_JSON_ROWS: usize = 1_000_000;
 const MAX_UNCOMPRESSED_JSON_BYTES: usize = 512 * 1024 * 1024;
 const MAX_DOUBLE_VALUE_BYTES: usize = 32;
+const MAX_DISTINCT_JAVA_DOUBLE_VALUES: usize = 65_536;
 const COMMA_BLOCK: [u8; 64] = [b','; 64];
 const REPEATED_VALUE_BUFFER_BYTES: usize = 64 * 1024;
 const NULLABLE_CONST_PATTERN_COUNT: usize = 256;
 const NULLABLE_CONST_CACHE_BYTES: usize = 64 * 1024;
+
+pub(crate) struct EncodedJsonPreflight {
+    java_double_bits: Vec<u64>,
+}
+
+impl EncodedJsonPreflight {
+    pub(crate) fn java_double_bits(&self) -> &[u64] {
+        &self.java_double_bits
+    }
+
+    pub(crate) fn complete(self, values: Vec<Vec<u8>>) -> io::Result<EncodedJsonPlan> {
+        if values.len() != self.java_double_bits.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Java returned {} DOUBLE strings for {} requested values",
+                    values.len(),
+                    self.java_double_bits.len()
+                ),
+            ));
+        }
+        for (&bits, value) in self.java_double_bits.iter().zip(&values) {
+            let rendered = std::str::from_utf8(value).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Java returned non-UTF-8 DOUBLE text: {}", error),
+                )
+            })?;
+            let parsed = rendered.parse::<f64>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Java returned invalid DOUBLE text '{}': {}",
+                        rendered, error
+                    ),
+                )
+            })?;
+            if parsed.to_bits() != bits {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Java DOUBLE text '{}' does not round-trip to 0x{:016x}",
+                        rendered, bits
+                    ),
+                ));
+            }
+        }
+        Ok(EncodedJsonPlan {
+            java_double_values: self.java_double_bits.into_iter().zip(values).collect(),
+        })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct EncodedJsonPlan {
+    java_double_values: Vec<(u64, Vec<u8>)>,
+}
+
+impl EncodedJsonPlan {
+    fn java_double_value(&self, bits: u64) -> Option<&[u8]> {
+        let index = self
+            .java_double_values
+            .binary_search_by_key(&bits, |(stored_bits, _)| *stored_bits)
+            .ok()?;
+        Some(self.java_double_values[index].1.as_slice())
+    }
+}
 
 struct OutputBudget {
     estimated_bytes: usize,
@@ -106,16 +175,19 @@ fn check_row_count(row_count: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Checks whether the encoded row group can be emitted byte-for-byte like the Java fast path.
+/// Prepares an encoded row group to be emitted byte-for-byte like the Java fast path.
 ///
 /// No output object is created until this preflight succeeds. In addition to type and floating
 /// point compatibility, it validates dictionary indexes and UTF-8 payloads which Arrow
 /// materialization previously checked before touching output.
-pub(crate) fn is_encoded_supported(row_group: &RowGroupReader) -> io::Result<bool> {
+pub(crate) fn prepare_encoded(
+    row_group: &RowGroupReader,
+) -> io::Result<Option<EncodedJsonPreflight>> {
     check_row_count(row_group.num_rows())?;
 
     let mut columns = 0usize;
     let mut output_budget = OutputBudget::new();
+    let mut java_double_bits = BTreeSet::new();
     let result = row_group.visit_encoded_columns(|name, data_type, _, column| {
         let column_index = columns;
         columns += 1;
@@ -130,37 +202,52 @@ pub(crate) fn is_encoded_supported(row_group: &RowGroupReader) -> io::Result<boo
             ));
         }
         output_budget.add_column_structure(name, column_index, column.num_rows())?;
-        let supported = match data_type {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                let column_supported = validate_integer_column(column)?;
-                if column_supported {
-                    output_budget.add(estimate_integer_value_bytes(
-                        data_type,
-                        column,
-                        output_budget.remaining(),
-                    )?)?;
+        let supported = if column.encoding() == Encoding::AllNull {
+            true
+        } else {
+            match data_type {
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    let column_supported = validate_integer_column(column)?;
+                    if column_supported {
+                        output_budget.add(estimate_integer_value_bytes(
+                            data_type,
+                            column,
+                            output_budget.remaining(),
+                        )?)?;
+                    }
+                    column_supported
                 }
-                column_supported
-            }
-            DataType::Float64 => {
-                let column_supported = validate_float64_column(column)?;
-                if column_supported {
-                    output_budget.add(estimate_fixed_value_bytes(
-                        column,
-                        MAX_DOUBLE_VALUE_BYTES,
-                        output_budget.remaining(),
-                    )?)?;
+                DataType::Float64 => {
+                    let column_supported = validate_float64_column(column, &mut java_double_bits)?;
+                    if column_supported {
+                        output_budget.add(estimate_fixed_value_bytes(
+                            column,
+                            MAX_DOUBLE_VALUE_BYTES,
+                            output_budget.remaining(),
+                        )?)?;
+                    }
+                    column_supported
                 }
-                column_supported
-            }
-            DataType::Utf8 => {
-                let validation = validate_utf8_column(column, output_budget.remaining())?;
-                if validation.supported {
-                    output_budget.add(validation.estimated_value_bytes)?;
+                DataType::Decimal128(precision, scale) => {
+                    let column_supported = validate_decimal_column(column)?;
+                    if column_supported {
+                        output_budget.add(estimate_fixed_value_bytes(
+                            column,
+                            max_decimal_value_bytes(*precision, *scale),
+                            output_budget.remaining(),
+                        )?)?;
+                    }
+                    column_supported
                 }
-                validation.supported
+                DataType::Utf8 => {
+                    let validation = validate_utf8_column(column, output_budget.remaining())?;
+                    if validation.supported {
+                        output_budget.add(validation.estimated_value_bytes)?;
+                    }
+                    validation.supported
+                }
+                _ => false,
             }
-            _ => false,
         };
         if supported {
             Ok(())
@@ -172,18 +259,23 @@ pub(crate) fn is_encoded_supported(row_group: &RowGroupReader) -> io::Result<boo
         }
     });
     match result {
-        Ok(()) => Ok(columns > 0),
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(false),
+        Ok(()) if columns > 0 => Ok(Some(EncodedJsonPreflight {
+            java_double_bits: java_double_bits.into_iter().collect(),
+        })),
+        Ok(()) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(None),
         Err(error) => Err(error),
     }
 }
 
 pub(crate) fn write_encoded_supported<W: Write>(
     row_group: &RowGroupReader,
+    plan: &EncodedJsonPlan,
     output: &mut W,
 ) -> io::Result<()> {
     let mut writer = EncodedJsonWriter {
         output,
+        plan,
         value_buffer: Vec::with_capacity(64),
         repeated_buffer: Vec::with_capacity(REPEATED_VALUE_BUFFER_BYTES),
         nullable_block_cache: (0..NULLABLE_CONST_PATTERN_COUNT).map(|_| None).collect(),
@@ -257,7 +349,10 @@ fn estimate_fixed_value_bytes(
     checked_estimated_bytes(non_null_count(&column), max_value_bytes, limit)
 }
 
-fn validate_float64_column(column: EncodedColumn<'_>) -> io::Result<bool> {
+fn validate_float64_column(
+    column: EncodedColumn<'_>,
+    java_double_bits: &mut BTreeSet<u64>,
+) -> io::Result<bool> {
     match column.encoding() {
         Encoding::AllNull => Ok(true),
         Encoding::Const => {
@@ -265,7 +360,9 @@ fn validate_float64_column(column: EncodedColumn<'_>) -> io::Result<bool> {
                 return Ok(true);
             }
             match column.constant()? {
-                Some(EncodedValueRef::Float64(value)) => Ok(is_supported_double(value)),
+                Some(EncodedValueRef::Float64(value)) => {
+                    prepare_double_value(value, java_double_bits)
+                }
                 _ => Err(encoded_type_mismatch(column.data_type())),
             }
         }
@@ -273,8 +370,11 @@ fn validate_float64_column(column: EncodedColumn<'_>) -> io::Result<bool> {
             for value in column.values() {
                 match value? {
                     EncodedValueRef::Null => {}
-                    EncodedValueRef::Float64(value) if is_supported_double(value) => {}
-                    EncodedValueRef::Float64(_) => return Ok(false),
+                    EncodedValueRef::Float64(value) => {
+                        if !prepare_double_value(value, java_double_bits)? {
+                            return Ok(false);
+                        }
+                    }
                     _ => return Err(encoded_type_mismatch(column.data_type())),
                 }
             }
@@ -282,6 +382,106 @@ fn validate_float64_column(column: EncodedColumn<'_>) -> io::Result<bool> {
         }
         _ => Ok(false),
     }
+}
+
+fn prepare_double_value(value: f64, java_double_bits: &mut BTreeSet<u64>) -> io::Result<bool> {
+    if !value.is_finite() {
+        return Ok(false);
+    }
+    if !can_format_double_in_rust(value) {
+        java_double_bits.insert(value.to_bits());
+        if java_double_bits.len() > MAX_DISTINCT_JAVA_DOUBLE_VALUES {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "columnar JSON requires more than {} distinct Java-formatted DOUBLE values",
+                    MAX_DISTINCT_JAVA_DOUBLE_VALUES
+                ),
+            ));
+        }
+    }
+    Ok(true)
+}
+
+fn validate_decimal_column(column: EncodedColumn<'_>) -> io::Result<bool> {
+    match column.encoding() {
+        Encoding::AllNull => Ok(true),
+        Encoding::Const => {
+            if !has_non_null(&column) {
+                return Ok(true);
+            }
+            match column.constant()? {
+                Some(value) => {
+                    decode_decimal_value(column.data_type(), value)?;
+                    Ok(true)
+                }
+                None => Err(encoded_type_mismatch(column.data_type())),
+            }
+        }
+        Encoding::Dict | Encoding::Plain => {
+            for value in column.values() {
+                let value = value?;
+                if !matches!(value, EncodedValueRef::Null) {
+                    decode_decimal_value(column.data_type(), value)?;
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn decode_decimal_value(data_type: &DataType, value: EncodedValueRef<'_>) -> io::Result<i128> {
+    let (precision, unscaled) = match (data_type, value) {
+        (DataType::Decimal128(precision, _), EncodedValueRef::DecimalCompact(value))
+            if *precision <= 18 =>
+        {
+            (*precision, value as i128)
+        }
+        (DataType::Decimal128(precision, _), EncodedValueRef::DecimalLarge(bytes))
+            if *precision > 18 =>
+        {
+            (*precision, decode_signed_i128(bytes)?)
+        }
+        _ => return Err(encoded_type_mismatch(data_type)),
+    };
+    if decimal_digits(unscaled) > precision as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "decimal value exceeds declared precision {} for {:?}",
+                precision, data_type
+            ),
+        ));
+    }
+    Ok(unscaled)
+}
+
+fn decode_signed_i128(bytes: &[u8]) -> io::Result<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid Decimal128 byte width {}", bytes.len()),
+        ));
+    }
+    let negative = bytes[0] & 0x80 != 0;
+    let mut decoded = [if negative { 0xff } else { 0x00 }; 16];
+    decoded[16 - bytes.len()..].copy_from_slice(bytes);
+    Ok(i128::from_be_bytes(decoded))
+}
+
+fn decimal_digits(value: i128) -> usize {
+    let mut magnitude = value.unsigned_abs();
+    let mut digits = 1usize;
+    while magnitude >= 10 {
+        magnitude /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn max_decimal_value_bytes(precision: u8, scale: i8) -> usize {
+    precision as usize + scale.unsigned_abs() as usize + 3
 }
 
 struct ColumnValidation {
@@ -383,6 +583,7 @@ fn non_null_count(column: &EncodedColumn<'_>) -> usize {
 
 struct EncodedJsonWriter<'a, W> {
     output: &'a mut W,
+    plan: &'a EncodedJsonPlan,
     value_buffer: Vec<u8>,
     repeated_buffer: Vec<u8>,
     nullable_block_cache: Vec<Option<Vec<u8>>>,
@@ -414,7 +615,7 @@ impl<W: Write> EncodedJsonWriter<'_, W> {
             Encoding::Const => self.write_constant(data_type, column),
             Encoding::Dict | Encoding::Plain => {
                 for (row, value) in column.values().enumerate() {
-                    write_encoded_value(self.output, data_type, value?, row > 0)?;
+                    write_encoded_value(self.output, data_type, value?, row > 0, self.plan)?;
                 }
                 Ok(())
             }
@@ -455,7 +656,7 @@ impl<W: Write> EncodedJsonWriter<'_, W> {
             );
         }
         self.value_buffer.clear();
-        write_encoded_value(&mut self.value_buffer, data_type, value, false)?;
+        write_encoded_value(&mut self.value_buffer, data_type, value, false, self.plan)?;
         if column.has_nulls() {
             return write_nullable_repeated_value(
                 self.output,
@@ -545,6 +746,7 @@ fn write_encoded_value<W: Write>(
     data_type: &DataType,
     value: EncodedValueRef<'_>,
     separator: bool,
+    plan: &EncodedJsonPlan,
 ) -> io::Result<()> {
     if matches!(value, EncodedValueRef::Null) {
         return if separator {
@@ -568,8 +770,14 @@ fn write_encoded_value<W: Write>(
             write_i64_value(output, value, separator)
         }
         (DataType::Float64, EncodedValueRef::Float64(value)) => {
-            write_double(output, value, separator)
+            write_exact_double(output, value, separator, plan)
         }
+        (data_type @ DataType::Decimal128(_, scale), value) => write_decimal(
+            output,
+            decode_decimal_value(data_type, value)?,
+            *scale,
+            separator,
+        ),
         (DataType::Utf8, EncodedValueRef::Utf8(value)) => {
             if separator {
                 output.write_all(b",")?;
@@ -836,13 +1044,96 @@ fn write_i64_value<W: Write>(output: &mut W, value: i64, separator: bool) -> io:
     output.write_all(&buffer[position..])
 }
 
-fn is_supported_double(value: f64) -> bool {
+fn write_decimal<W: Write>(
+    output: &mut W,
+    value: i128,
+    scale: i8,
+    separator: bool,
+) -> io::Result<()> {
+    if separator {
+        output.write_all(b",")?;
+    }
+    if value < 0 {
+        output.write_all(b"-")?;
+    }
+
+    let mut buffer = [0u8; 39];
+    let mut position = buffer.len();
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        position -= 1;
+        buffer[position] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    let digits = &buffer[position..];
+
+    match scale.cmp(&0) {
+        std::cmp::Ordering::Equal => output.write_all(digits),
+        std::cmp::Ordering::Less => {
+            output.write_all(digits)?;
+            // BigDecimal.toPlainString() renders zero with a negative scale as "0".
+            if value == 0 {
+                Ok(())
+            } else {
+                write_zeroes(output, scale.unsigned_abs() as usize)
+            }
+        }
+        std::cmp::Ordering::Greater => {
+            let scale = scale as usize;
+            if digits.len() > scale {
+                let decimal_position = digits.len() - scale;
+                output.write_all(&digits[..decimal_position])?;
+                output.write_all(b".")?;
+                output.write_all(&digits[decimal_position..])
+            } else {
+                output.write_all(b"0.")?;
+                write_zeroes(output, scale - digits.len())?;
+                output.write_all(digits)
+            }
+        }
+    }
+}
+
+fn can_format_double_in_rust(value: f64) -> bool {
     let bits = value.to_bits();
     if bits == 0 || bits == (1u64 << 63) {
         return true;
     }
 
     value.is_finite() && value.abs() >= MIN_EXACT_DOUBLE_ABS && value.abs() <= MAX_EXACT_DOUBLE_ABS
+}
+
+fn write_exact_double<W: Write>(
+    output: &mut W,
+    value: f64,
+    separator: bool,
+    plan: &EncodedJsonPlan,
+) -> io::Result<()> {
+    if can_format_double_in_rust(value) {
+        return write_double(output, value, separator);
+    }
+    if !value.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-finite DOUBLE reached the columnar JSON writer",
+        ));
+    }
+    let rendered = plan.java_double_value(value.to_bits()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "missing Java DOUBLE rendering for 0x{:016x}",
+                value.to_bits()
+            ),
+        )
+    })?;
+    if separator {
+        output.write_all(b",")?;
+    }
+    output.write_all(rendered)
 }
 
 fn write_double<W: Write>(output: &mut W, value: f64, separator: bool) -> io::Result<()> {
@@ -1066,16 +1357,19 @@ fn escaped_utf8_len(value: &[u8]) -> io::Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::io::{self, Write};
 
     use arrow_schema::DataType;
     use mosaic_core::bucket_reader::EncodedValueRef;
 
     use super::{
-        append_nullable_const_block, check_row_count, checked_estimated_bytes, escaped_utf8_len,
-        integer_value_matches, is_oversized_escaped_utf8, is_supported_double, write_double,
-        write_encoded_value, write_escaped_utf8, write_nullable_repeated_rows,
-        write_repeated_value, write_utf8_constant, OutputBudget, MAX_COLUMNAR_JSON_ROWS,
+        append_nullable_const_block, can_format_double_in_rust, check_row_count,
+        checked_estimated_bytes, decode_signed_i128, escaped_utf8_len, integer_value_matches,
+        is_oversized_escaped_utf8, prepare_double_value, write_decimal, write_double,
+        write_encoded_value, write_escaped_utf8, write_exact_double, write_nullable_repeated_rows,
+        write_repeated_value, write_utf8_constant, EncodedJsonPlan, EncodedJsonPreflight,
+        OutputBudget, MAX_COLUMNAR_JSON_ROWS, MAX_DISTINCT_JAVA_DOUBLE_VALUES,
         MAX_UNCOMPRESSED_JSON_BYTES, NULLABLE_CONST_CACHE_BYTES, NULLABLE_CONST_PATTERN_COUNT,
         REPEATED_VALUE_BUFFER_BYTES,
     };
@@ -1302,6 +1596,7 @@ mod tests {
             &DataType::Utf8,
             EncodedValueRef::Utf8(&value),
             false,
+            &EncodedJsonPlan::default(),
         )
         .unwrap();
 
@@ -1341,14 +1636,80 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_finite_and_tiny_doubles() {
-        assert!(is_supported_double(0.0));
-        assert!(is_supported_double(-0.0));
-        assert!(is_supported_double(1.0e-6));
-        assert!(is_supported_double(1.0e9));
-        assert!(!is_supported_double(f64::MIN_POSITIVE));
-        assert!(!is_supported_double(f64::INFINITY));
-        assert!(!is_supported_double(f64::NAN));
+    fn identifies_doubles_formatted_in_rust() {
+        assert!(can_format_double_in_rust(0.0));
+        assert!(can_format_double_in_rust(-0.0));
+        assert!(can_format_double_in_rust(1.0e-6));
+        assert!(can_format_double_in_rust(1.0e9));
+        assert!(!can_format_double_in_rust(f64::MIN_POSITIVE));
+        assert!(!can_format_double_in_rust(f64::INFINITY));
+        assert!(!can_format_double_in_rust(f64::NAN));
+    }
+
+    #[test]
+    fn writes_java_supplied_double_text_exactly() {
+        let value = f64::from_bits(0x3d20_0000_0000_0000);
+        let plan = EncodedJsonPreflight {
+            java_double_bits: vec![value.to_bits()],
+        }
+        .complete(vec![b"2.8421709430404007E-14".to_vec()])
+        .unwrap();
+
+        let mut output = Vec::new();
+        write_exact_double(&mut output, value, true, &plan).unwrap();
+        assert_eq!(output, b",2.8421709430404007E-14");
+    }
+
+    #[test]
+    fn rejects_java_double_text_for_a_different_value() {
+        let value = f64::from_bits(0x3d20_0000_0000_0000);
+        let preflight = EncodedJsonPreflight {
+            java_double_bits: vec![value.to_bits()],
+        };
+        let error = match preflight.complete(vec![b"1.0".to_vec()]) {
+            Ok(_) => panic!("mismatched Java DOUBLE text was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not round-trip"));
+    }
+
+    #[test]
+    fn bounds_java_formatted_double_cardinality() {
+        let mut values = BTreeSet::new();
+        for bits in 1..=MAX_DISTINCT_JAVA_DOUBLE_VALUES as u64 {
+            assert!(prepare_double_value(f64::from_bits(bits), &mut values).unwrap());
+        }
+        let error = prepare_double_value(
+            f64::from_bits(MAX_DISTINCT_JAVA_DOUBLE_VALUES as u64 + 1),
+            &mut values,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("Java-formatted DOUBLE"));
+    }
+
+    #[test]
+    fn writes_decimal_plain_strings_for_all_scales() {
+        let mut output = Vec::new();
+        write_decimal(&mut output, 12_340, 3, false).unwrap();
+        write_decimal(&mut output, -5, 3, true).unwrap();
+        write_decimal(&mut output, 123, -2, true).unwrap();
+        write_decimal(&mut output, 0, -2, true).unwrap();
+        write_decimal(&mut output, 0, 3, true).unwrap();
+        assert_eq!(output, b"12.340,-0.005,12300,0,0.000");
+    }
+
+    #[test]
+    fn decodes_signed_big_endian_decimal_values() {
+        assert_eq!(decode_signed_i128(&[0xff]).unwrap(), -1);
+        assert_eq!(decode_signed_i128(&[0x00, 0x80]).unwrap(), 128);
+        assert_eq!(
+            decode_signed_i128(&i128::MIN.to_be_bytes()).unwrap(),
+            i128::MIN
+        );
+        assert!(decode_signed_i128(&[]).is_err());
+        assert!(decode_signed_i128(&[0; 17]).is_err());
     }
 
     #[test]
