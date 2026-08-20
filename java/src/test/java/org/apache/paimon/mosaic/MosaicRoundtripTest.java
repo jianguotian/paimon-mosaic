@@ -23,6 +23,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.ref.WeakReference;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -39,6 +41,7 @@ import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
@@ -67,6 +70,9 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class MosaicRoundtripTest {
+
+    private static final long TINY_DOUBLE_ROUNDING_REGRESSION_BITS = 0x3d20000000000000L;
+    private static final long LARGE_DOUBLE_ROUNDING_REGRESSION_BITS = 0x43d406c0c77e23e0L;
 
     private BufferAllocator allocator;
 
@@ -1597,18 +1603,19 @@ public class MosaicRoundtripTest {
         double[] values = new double[rowCount];
         values[0] = 0.0;
         values[1] = -0.0;
-        values[2] = 1.0e-6;
-        values[3] = -1.0e-6;
-        values[4] = 1.0e9;
-        values[5] = -1.0e9;
+        values[2] = Double.MIN_VALUE;
+        values[3] = -Double.MIN_VALUE;
+        values[4] = Double.MAX_VALUE;
+        values[5] = -Double.MAX_VALUE;
+        values[6] = Double.longBitsToDouble(TINY_DOUBLE_ROUNDING_REGRESSION_BITS);
+        values[7] = Double.longBitsToDouble(LARGE_DOUBLE_ROUNDING_REGRESSION_BITS);
         java.util.Random random = new java.util.Random(20260820L);
-        for (int row = 6; row < rowCount; row++) {
+        for (int row = 8; row < rowCount; row++) {
             double value;
             do {
-                int exponent = random.nextInt(49) - 19;
-                value = Math.scalb(1.0 + random.nextDouble(), exponent);
-            } while (value > 1.0e9);
-            values[row] = random.nextBoolean() ? value : -value;
+                value = Double.longBitsToDouble(random.nextLong());
+            } while (!Double.isFinite(value));
+            values[row] = value;
         }
 
         byte[] data;
@@ -1764,7 +1771,187 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonUnsupportedDoubleDoesNotTouchOutput() throws Exception {
+    public void testGeelyColumnarJsonWritesAllNullUnsupportedScalarType() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(Field.nullable("value", ArrowType.Bool.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            BitVector values = (BitVector) root.getVector("value");
+            values.allocateNew(3);
+            root.setRowCount(3);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\",,\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonWritesDecimal128AsPlainString() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable(
+                                        "value",
+                                        new ArrowType.Decimal(20, 0, 128))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector values = (DecimalVector) root.getVector("value");
+            values.allocateNew(3);
+            values.set(0, new BigDecimal("18446744073709551615"));
+            values.setNull(1);
+            values.set(2, new BigDecimal("-9223372036854775809"));
+            root.setRowCount(3);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"18446744073709551615,,-9223372036854775809\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonPreservesDecimal128Scale() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.Decimal(18, 3, 128))));
+        BigDecimal[] expectedValues = {
+            new BigDecimal("12.340"),
+            new BigDecimal("-0.005"),
+            new BigDecimal("0.000")
+        };
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector values = (DecimalVector) root.getVector("value");
+            values.allocateNew(expectedValues.length);
+            for (int row = 0; row < expectedValues.length; row++) {
+                values.set(row, expectedValues[row]);
+            }
+            root.setRowCount(expectedValues.length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"12.340,-0.005,0.000\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonPreservesNegativeDecimalScale() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.Decimal(18, -2, 128))));
+        BigDecimal[] expectedValues = {
+            new BigDecimal(BigInteger.ZERO, -2),
+            new BigDecimal(BigInteger.valueOf(123), -2)
+        };
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector values = (DecimalVector) root.getVector("value");
+            values.allocateNew(expectedValues.length);
+            for (int row = 0; row < expectedValues.length; row++) {
+                values.set(row, expectedValues[row]);
+            }
+            root.setRowCount(expectedValues.length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"0,12300\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonFormatsDoublesOutsideNativeRangeWithJava() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.FloatingPoint(
+                                                FloatingPointPrecision.DOUBLE))));
+
+        double[] expectedValues = {
+            Double.MIN_VALUE,
+            Double.longBitsToDouble(TINY_DOUBLE_ROUNDING_REGRESSION_BITS),
+            Double.longBitsToDouble(LARGE_DOUBLE_ROUNDING_REGRESSION_BITS)
+        };
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            Float8Vector values = (Float8Vector) root.getVector("value");
+            values.allocateNew(expectedValues.length);
+            for (int row = 0; row < expectedValues.length; row++) {
+                values.set(row, expectedValues[row]);
+            }
+            root.setRowCount(expectedValues.length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"4.9E-324,2.8421709430404007E-14,"
+                            + "5.7722107746645115E18\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonNonFiniteDoubleDoesNotTouchOutput() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -1777,7 +1964,7 @@ public class MosaicRoundtripTest {
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             Float8Vector values = (Float8Vector) root.getVector("value");
             values.allocateNew(1);
-            values.set(0, Double.MIN_VALUE);
+            values.set(0, Double.NaN);
             root.setRowCount(1);
             data = writeToBytes(schema, writer -> writer.write(root));
         }

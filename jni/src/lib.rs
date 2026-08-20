@@ -1261,10 +1261,74 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
 
 // ======================== Geely Columnar JSON ========================
 
+fn format_columnar_json_doubles(
+    env: &mut JNIEnv<'_>,
+    class: &JClass<'_>,
+    bits: &[u64],
+) -> Result<Vec<Vec<u8>>, String> {
+    if bits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bits_array = env
+        .new_long_array(bits.len() as i32)
+        .map_err(|error| format!("failed to allocate DOUBLE bits array: {}", error))?;
+    let java_bits: Vec<jlong> = bits.iter().map(|bits| *bits as jlong).collect();
+    env.set_long_array_region(&bits_array, 0, &java_bits)
+        .map_err(|error| format!("failed to populate DOUBLE bits array: {}", error))?;
+
+    let result = env
+        .call_static_method(
+            class,
+            "formatColumnarJsonDoubles",
+            "([J)[Ljava/lang/String;",
+            &[JValue::Object(bits_array.as_ref())],
+        )
+        .map_err(|error| format!("failed to format DOUBLE values in Java: {}", error))?
+        .l()
+        .map_err(|error| format!("Java DOUBLE formatter returned a non-object: {}", error))?;
+    if result.is_null() {
+        return Err("Java DOUBLE formatter returned null".to_string());
+    }
+    let values_array = JObjectArray::from(result);
+    let length = env
+        .get_array_length(&values_array)
+        .map_err(|error| format!("failed to read Java DOUBLE strings length: {}", error))?;
+    if length as usize != bits.len() {
+        return Err(format!(
+            "Java DOUBLE formatter returned {} strings for {} values",
+            length,
+            bits.len()
+        ));
+    }
+
+    let mut values = Vec::with_capacity(bits.len());
+    for index in 0..length {
+        let object = env
+            .get_object_array_element(&values_array, index)
+            .map_err(|error| format!("failed to read Java DOUBLE string: {}", error))?;
+        if object.is_null() {
+            return Err(format!(
+                "Java DOUBLE formatter returned null at index {}",
+                index
+            ));
+        }
+        let string = JString::from(object);
+        // SAFETY: formatColumnarJsonDoubles has the JNI return type String[], and the element was
+        // checked for null above. Avoid get_string's per-element class local references.
+        let value: String = unsafe { env.get_string_unchecked(&string) }
+            .map_err(|error| format!("failed to copy Java DOUBLE string: {}", error))?
+            .into();
+        env.delete_local_ref(string)
+            .map_err(|error| format!("failed to release Java DOUBLE string: {}", error))?;
+        values.push(value.into_bytes());
+    }
+    Ok(values)
+}
+
 #[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteGeelyColumnarJson(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
     handle: jlong,
     output: JObject,
 ) -> jboolean {
@@ -1278,9 +1342,9 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
         }
 
         let row_group = unsafe { &*(handle as *const RowGroupReaderHandle) };
-        match columnar_json::is_encoded_supported(&row_group.inner) {
-            Ok(false) => return 0,
-            Ok(true) => {}
+        let preflight = match columnar_json::prepare_encoded(&row_group.inner) {
+            Ok(None) => return 0,
+            Ok(Some(preflight)) => preflight,
             Err(error) => {
                 throw_io_error(
                     &mut env,
@@ -1289,7 +1353,28 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
                 );
                 return 0;
             }
-        }
+        };
+        let double_values =
+            match format_columnar_json_doubles(&mut env, &class, preflight.java_double_bits()) {
+                Ok(values) => values,
+                Err(error) => {
+                    throw(
+                        &mut env,
+                        &format!("Geely columnar JSON DOUBLE formatting failed: {}", error),
+                    );
+                    return 0;
+                }
+            };
+        let plan = match preflight.complete(double_values) {
+            Ok(plan) => plan,
+            Err(error) => {
+                throw(
+                    &mut env,
+                    &format!("Geely columnar JSON DOUBLE validation failed: {}", error),
+                );
+                return 0;
+            }
+        };
 
         let output = match new_jni_output_file(&mut env, &output) {
             Ok(output) => output,
@@ -1299,7 +1384,8 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
             }
         };
         let mut buffered = BufWriter::with_capacity(JSON_BUFFER_BYTES, output);
-        if let Err(error) = columnar_json::write_encoded_supported(&row_group.inner, &mut buffered)
+        if let Err(error) =
+            columnar_json::write_encoded_supported(&row_group.inner, &plan, &mut buffered)
         {
             let (mut output, _) = buffered.into_parts();
             let pending = output.take_pending_exception();
