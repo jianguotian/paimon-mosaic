@@ -51,6 +51,7 @@ proc-macro2@1.0.106	X					X
 quote@1.0.46	X					X		
 r-efi@5.3.0	X				X	X		
 rustversion@1.0.22	X					X		
+ryu@1.0.23	X
 same-file@1.0.6						X		X
 shlex@2.0.1	X					X		
 slab@0.4.12						X		

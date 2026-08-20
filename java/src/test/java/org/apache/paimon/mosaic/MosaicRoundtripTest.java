@@ -111,6 +111,7 @@ public class MosaicRoundtripTest {
 
         private final ByteArrayOutputStream delegate = new ByteArrayOutputStream();
         private final FailurePoint failurePoint;
+        private final int failOnWriteCall;
         private final IllegalStateException failureCause;
         private final IOException failure;
         private boolean failed;
@@ -118,7 +119,13 @@ public class MosaicRoundtripTest {
         private int flushCalls;
 
         private FailOnceOutputStream(FailurePoint failurePoint, String message) {
+            this(failurePoint, 1, message);
+        }
+
+        private FailOnceOutputStream(
+                FailurePoint failurePoint, int failOnWriteCall, String message) {
             this.failurePoint = failurePoint;
+            this.failOnWriteCall = failOnWriteCall;
             this.failureCause = new IllegalStateException(message + "-cause");
             this.failure = new IOException(message, failureCause);
         }
@@ -131,7 +138,9 @@ public class MosaicRoundtripTest {
         @Override
         public void write(byte[] bytes, int offset, int length) throws IOException {
             writeCalls++;
-            if (!failed && failurePoint == FailurePoint.WRITE) {
+            if (!failed
+                    && failurePoint == FailurePoint.WRITE
+                    && writeCalls == failOnWriteCall) {
                 failed = true;
                 throw failure;
             }
@@ -1504,6 +1513,566 @@ public class MosaicRoundtripTest {
         }
 
         awaitGarbageCollection(readRowGroupWithFailingInput(data));
+    }
+
+    @Test
+    public void testGeelyColumnarJsonWritesExactPrimitiveProtocol() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("i\"8", new ArrowType.Int(8, true)),
+                Field.nullable("i16", new ArrowType.Int(16, true)),
+                Field.nullable("i32", new ArrowType.Int(32, true)),
+                Field.nullable("i64", new ArrowType.Int(64, true)),
+                Field.nullable(
+                        "double",
+                        new ArrowType.FloatingPoint(
+                                org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE)),
+                Field.nullable("text", ArrowType.Utf8.INSTANCE)
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            TinyIntVector i8 = (TinyIntVector) root.getVector("i\"8");
+            SmallIntVector i16 = (SmallIntVector) root.getVector("i16");
+            IntVector i32 = (IntVector) root.getVector("i32");
+            BigIntVector i64 = (BigIntVector) root.getVector("i64");
+            Float8Vector doubles = (Float8Vector) root.getVector("double");
+            VarCharVector text = (VarCharVector) root.getVector("text");
+            i8.allocateNew(3);
+            i16.allocateNew(3);
+            i32.allocateNew(3);
+            i64.allocateNew(3);
+            doubles.allocateNew(3);
+            text.allocateNew();
+
+            i8.set(0, -1);
+            i8.setNull(1);
+            i8.set(2, 9);
+            i16.set(0, 0);
+            i16.set(1, -7);
+            i16.set(2, 12);
+            i32.set(0, Integer.MIN_VALUE);
+            i32.set(1, 0);
+            i32.set(2, Integer.MAX_VALUE);
+            i64.set(0, Long.MIN_VALUE);
+            i64.setNull(1);
+            i64.set(2, Long.MAX_VALUE);
+            doubles.set(0, -0.0);
+            doubles.set(1, 1.2);
+            doubles.set(2, 9_999_999.0);
+            text.setSafe(0, "a\"\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            text.setNull(1);
+            text.setSafe(2, "中\t".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(3);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"i\\\"8\":\"-1,,9\",\"i16\":\"0,-7,12\","
+                            + "\"i32\":\"-2147483648,0,2147483647\","
+                            + "\"i64\":\"-9223372036854775808,,9223372036854775807\","
+                            + "\"double\":\"-0.0,1.2,9999999.0\","
+                            + "\"text\":\"a\\\"\\n,,中\\t\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonMatchesJavaDoubleFormatting() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.FloatingPoint(
+                                                FloatingPointPrecision.DOUBLE))));
+        int rowCount = 4096;
+        double[] values = new double[rowCount];
+        values[0] = 0.0;
+        values[1] = -0.0;
+        values[2] = 1.0e-6;
+        values[3] = -1.0e-6;
+        values[4] = 1.0e9;
+        values[5] = -1.0e9;
+        java.util.Random random = new java.util.Random(20260820L);
+        for (int row = 6; row < rowCount; row++) {
+            double value;
+            do {
+                int exponent = random.nextInt(49) - 19;
+                value = Math.scalb(1.0 + random.nextDouble(), exponent);
+            } while (value > 1.0e9);
+            values[row] = random.nextBoolean() ? value : -value;
+        }
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            Float8Vector vector = (Float8Vector) root.getVector("value");
+            vector.allocateNew(rowCount);
+            for (int row = 0; row < rowCount; row++) {
+                vector.set(row, values[row]);
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        StringBuilder expected = new StringBuilder("{\"value\":\"");
+        for (int row = 0; row < rowCount; row++) {
+            if (row > 0) {
+                expected.append(',');
+            }
+            expected.append(Double.toString(values[row]));
+        }
+        expected.append("\"}");
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    expected.toString(),
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonNestedColumnFallsBackWithoutTouchingOutput()
+            throws Exception {
+        Field element =
+                new Field(
+                        "item",
+                        FieldType.nullable(new ArrowType.Int(32, true)),
+                        null);
+        Field list =
+                new Field(
+                        "items",
+                        FieldType.nullable(ArrowType.List.INSTANCE),
+                        Arrays.asList(element));
+        Schema schema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                list
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ListVector items = (ListVector) root.getVector("items");
+            ids.allocateNew(1);
+            items.allocateNew();
+            ids.set(0, 7);
+            UnionListWriter writer = items.getWriter();
+            writer.setPosition(0);
+            writer.startList();
+            writer.writeInt(11);
+            writer.endList();
+            root.setRowCount(1);
+            data = writeToBytes(schema, mosaicWriter -> mosaicWriter.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(9);
+            assertEquals(
+                    GeelyColumnarJson.Status.UNSUPPORTED,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+            try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
+                assertEquals(1, fallback.getRowCount());
+                assertEquals(7, ((IntVector) fallback.getVector("id")).get(0));
+                assertEquals(
+                        11,
+                        ((java.util.List<?>) fallback.getVector("items").getObject(0))
+                                .get(0));
+            }
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonRejectsProjectedRowGroup() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("id", new ArrowType.Int(32, true)),
+                                Field.notNullable("value", new ArrowType.Int(32, true))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            IntVector values = (IntVector) root.getVector("value");
+            ids.allocateNew(1);
+            values.allocateNew(1);
+            ids.set(0, 7);
+            values.set(0, 11);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            reader.project(new String[] {"id"});
+            try (MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                output.write(9);
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> GeelyColumnarJson.write(rowGroup, output));
+                assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+                try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
+                    assertEquals(1, fallback.getFieldVectors().size());
+                    assertEquals(7, ((IntVector) fallback.getVector("id")).get(0));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonUnsupportedBooleanDoesNotTouchOutput() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(Field.notNullable("value", ArrowType.Bool.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            BitVector values = (BitVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 1);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(9);
+            assertEquals(
+                    GeelyColumnarJson.Status.UNSUPPORTED,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertArrayEquals(new byte[] {9}, output.toByteArray());
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonUnsupportedDoubleDoesNotTouchOutput() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.FloatingPoint(
+                                                FloatingPointPrecision.DOUBLE))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            Float8Vector values = (Float8Vector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, Double.MIN_VALUE);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(9);
+            assertEquals(
+                    GeelyColumnarJson.Status.UNSUPPORTED,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertArrayEquals(new byte[] {9}, output.toByteArray());
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonWritesDictionaryAndAllNullColumns() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable("all_null", ArrowType.Utf8.INSTANCE),
+                                Field.nullable("dict", ArrowType.Utf8.INSTANCE)));
+        int rowCount = 128;
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            VarCharVector allNull = (VarCharVector) root.getVector("all_null");
+            VarCharVector dict = (VarCharVector) root.getVector("dict");
+            allNull.allocateNew();
+            dict.allocateNew();
+            for (int row = 0; row < rowCount; row++) {
+                if (row % 5 != 0) {
+                    dict.setSafe(
+                            row,
+                            (row % 2 == 0 ? "alpha" : "beta")
+                                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        StringBuilder allNull = new StringBuilder();
+        StringBuilder dict = new StringBuilder();
+        for (int row = 0; row < rowCount; row++) {
+            if (row > 0) {
+                allNull.append(',');
+                dict.append(',');
+            }
+            if (row % 5 != 0) {
+                dict.append(row % 2 == 0 ? "alpha" : "beta");
+            }
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"all_null\":\""
+                            + allNull
+                            + "\",\"dict\":\""
+                            + dict
+                            + "\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonBatchesNullableConstantsAcrossSupportedTypes()
+            throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("i16", new ArrowType.Int(16, true)),
+                Field.nullable("i64", new ArrowType.Int(64, true)),
+                Field.nullable("text", ArrowType.Utf8.INSTANCE)
+        ));
+        int rowCount = 26;
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            SmallIntVector i16 = (SmallIntVector) root.getVector("i16");
+            BigIntVector i64 = (BigIntVector) root.getVector("i64");
+            VarCharVector text = (VarCharVector) root.getVector("text");
+            i16.allocateNew(rowCount);
+            i64.allocateNew(rowCount);
+            text.allocateNew();
+            for (int row = 0; row < rowCount; row++) {
+                int bit = row & 7;
+                if (bit == 1 || bit == 3 || bit == 4 || bit == 7) {
+                    i16.set(row, 0);
+                    i64.set(row, -7);
+                    text.setSafe(
+                            row,
+                            "x".getBytes(
+                                    java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        StringBuilder zero = new StringBuilder();
+        StringBuilder minusSeven = new StringBuilder();
+        StringBuilder text = new StringBuilder();
+        for (int row = 0; row < rowCount; row++) {
+            if (row > 0) {
+                zero.append(',');
+                minusSeven.append(',');
+                text.append(',');
+            }
+            int bit = row & 7;
+            if (bit == 1 || bit == 3 || bit == 4 || bit == 7) {
+                zero.append('0');
+                minusSeven.append("-7");
+                text.append('x');
+            }
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"i16\":\""
+                            + zero
+                            + "\",\"i64\":\""
+                            + minusSeven
+                            + "\",\"text\":\""
+                            + text
+                            + "\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonPreservesOutputException() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            FailOnceOutputStream output =
+                    new FailOnceOutputStream(
+                            FailurePoint.WRITE,
+                            "sentinel-geely-columnar-json");
+            IOException error =
+                    assertThrows(
+                            IOException.class,
+                            () -> GeelyColumnarJson.write(rowGroup, output));
+            assertSame(output.failure, error);
+            assertEquals("sentinel-geely-columnar-json", error.getMessage());
+            assertEquals(1, output.writeCalls);
+            assertEquals(0, output.flushCalls);
+
+            try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
+                assertEquals(7, ((IntVector) fallback.getVector("id")).get(0));
+            }
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonPreservesMidStreamOutputException() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        int rowCount = 100_000;
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(rowCount);
+            for (int row = 0; row < rowCount; row++) {
+                values.set(row, row);
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            FailOnceOutputStream output =
+                    new FailOnceOutputStream(
+                            FailurePoint.WRITE,
+                            2,
+                            "sentinel-geely-columnar-json-mid-stream");
+            IOException error =
+                    assertThrows(
+                            IOException.class,
+                            () -> GeelyColumnarJson.write(rowGroup, output));
+            assertSame(output.failure, error);
+            assertEquals("sentinel-geely-columnar-json-mid-stream", error.getMessage());
+            assertEquals(2, output.writeCalls);
+            assertTrue(output.size() > 0);
+            assertEquals(0, output.flushCalls);
+
+            try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
+                assertEquals(rowCount, fallback.getRowCount());
+                assertEquals(0, ((IntVector) fallback.getVector("value")).get(0));
+                assertEquals(
+                        rowCount - 1,
+                        ((IntVector) fallback.getVector("value")).get(rowCount - 1));
+            }
+        }
+    }
+
+    @Test
+    public void testMosaicRowGroupReaderCloseIsIdempotentAndRejectsFurtherUse()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        MosaicReader reader = readerFromBytes(data);
+        MosaicRowGroupReader rowGroup = reader.openRowGroup(0);
+        rowGroup.close();
+        rowGroup.close();
+
+        assertThrows(IllegalStateException.class, () -> rowGroup.readColumns(allocator));
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        output.write(9);
+        assertThrows(
+                IllegalStateException.class,
+                () -> GeelyColumnarJson.write(rowGroup, output));
+        assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+        reader.close();
+        assertThrows(IllegalStateException.class, () -> reader.openRowGroup(0));
+    }
+
+    @Test
+    public void testMosaicRowGroupReaderOutlivesReaderAndFreezesProjection()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "id", new ArrowType.Int(32, true)),
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            IntVector values = (IntVector) root.getVector("value");
+            ids.allocateNew(1);
+            values.allocateNew(1);
+            ids.set(0, 7);
+            values.set(0, 11);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        MosaicReader reader = readerFromBytes(data);
+        MosaicRowGroupReader rowGroup = reader.openRowGroup(0);
+        reader.project(new String[] {"id"});
+        reader.close();
+
+        try (MosaicRowGroupReader ownedRowGroup = rowGroup) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(ownedRowGroup, output));
+            assertEquals(
+                    "{\"id\":\"7\",\"value\":\"11\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
     }
 
     @Test

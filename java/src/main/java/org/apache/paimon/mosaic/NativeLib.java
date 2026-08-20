@@ -127,6 +127,8 @@ final class NativeLib {
     // RowGroupReader
     static native int nativeRowGroupReaderNumRows(long handle);
     static native int nativeRowGroupReaderReadColumns(long handle, long arrayAddr, long schemaAddr);
+    static native boolean nativeRowGroupReaderWriteGeelyColumnarJson(
+            long handle, OutputStream output) throws IOException;
     static native void nativeRowGroupReaderFree(long handle);
 
     // Row group num rows
