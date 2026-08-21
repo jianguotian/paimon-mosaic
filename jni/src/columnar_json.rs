@@ -405,6 +405,19 @@ fn decode_signed_i128(bytes: &[u8]) -> io::Result<i128> {
 }
 
 fn validate_utf8_column(column: EncodedColumn<'_>) -> io::Result<bool> {
+    validate_utf8_column_with(column, |value| {
+        std::str::from_utf8(value).map_err(invalid_utf8)?;
+        Ok(())
+    })
+}
+
+fn validate_utf8_column_with<F>(
+    column: EncodedColumn<'_>,
+    mut validate_value: F,
+) -> io::Result<bool>
+where
+    F: FnMut(&[u8]) -> io::Result<()>,
+{
     match column.encoding() {
         Encoding::AllNull => Ok(true),
         Encoding::Const => {
@@ -413,18 +426,22 @@ fn validate_utf8_column(column: EncodedColumn<'_>) -> io::Result<bool> {
             }
             match column.constant()? {
                 Some(EncodedValueRef::Utf8(value)) => {
-                    std::str::from_utf8(value).map_err(invalid_utf8)?;
+                    validate_value(value)?;
                     Ok(true)
                 }
                 _ => Err(encoded_type_mismatch(column.data_type())),
             }
         }
-        Encoding::Dict | Encoding::Plain => {
+        Encoding::Dict => column.visit_dictionary(|value| match value {
+            EncodedValueRef::Utf8(value) => validate_value(value),
+            _ => Err(encoded_type_mismatch(column.data_type())),
+        }),
+        Encoding::Plain => {
             for value in column.values() {
                 match value? {
                     EncodedValueRef::Null => {}
                     EncodedValueRef::Utf8(value) => {
-                        std::str::from_utf8(value).map_err(invalid_utf8)?;
+                        validate_value(value)?;
                     }
                     _ => return Err(encoded_type_mismatch(column.data_type())),
                 }
@@ -1262,11 +1279,12 @@ mod tests {
     use super::{
         append_nullable_const_block, can_format_double_in_rust, decode_signed_i128,
         escaped_utf8_len, has_supported_structure, integer_value_matches,
-        is_oversized_escaped_utf8, prepare_double_value, prepare_encoded, write_decimal,
-        write_double, write_encoded_value, write_escaped_utf8, write_exact_double,
-        write_nullable_repeated_rows, write_repeated_value, write_utf8_constant, EncodedJsonPlan,
-        EncodedJsonPreflight, MAX_DISTINCT_JAVA_DOUBLE_VALUES, NULLABLE_CONST_CACHE_BYTES,
-        NULLABLE_CONST_PATTERN_COUNT, REPEATED_VALUE_BUFFER_BYTES,
+        is_oversized_escaped_utf8, prepare_double_value, prepare_encoded,
+        validate_utf8_column_with, write_decimal, write_double, write_encoded_value,
+        write_escaped_utf8, write_exact_double, write_nullable_repeated_rows, write_repeated_value,
+        write_utf8_constant, EncodedJsonPlan, EncodedJsonPreflight,
+        MAX_DISTINCT_JAVA_DOUBLE_VALUES, NULLABLE_CONST_CACHE_BYTES, NULLABLE_CONST_PATTERN_COUNT,
+        REPEATED_VALUE_BUFFER_BYTES,
     };
 
     #[derive(Default)]
@@ -1401,6 +1419,99 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("corrupt dict index"));
+    }
+
+    #[test]
+    fn validates_each_utf8_dictionary_entry_once_while_scanning_all_indexes() {
+        let schema = Schema::new(vec![Field::new("text", DataType::Utf8, true)]);
+        let row_count = 4096;
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(arrow_array::StringArray::from_iter(
+                (0..row_count).map(|row| match row % 5 {
+                    0 => None,
+                    1 | 3 => Some("alpha"),
+                    _ => Some("beta"),
+                }),
+            ))],
+        )
+        .unwrap();
+        let mut writer = MosaicWriter::new(
+            MemoryOutput::default(),
+            &schema,
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.close().unwrap();
+
+        let data = writer.output().data.clone();
+        let reader =
+            MosaicReader::new(MemoryInput { data }, writer.output().data.len() as u64).unwrap();
+        let row_group = reader.row_group_reader(0).unwrap();
+        let mut scans = 0usize;
+        let mut scanned_bytes = 0usize;
+        row_group
+            .visit_encoded_columns(|_name, _data_type, _nullable, column| {
+                assert_eq!(column.encoding(), Encoding::Dict);
+                assert!(validate_utf8_column_with(column, |value| {
+                    scans += 1;
+                    scanned_bytes += value.len();
+                    std::str::from_utf8(value)
+                        .map(|_| ())
+                        .map_err(super::invalid_utf8)
+                })?);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(scans, 2);
+        assert_eq!(scanned_bytes, "alpha".len() + "beta".len());
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_dictionary_entry() {
+        let schema = Schema::new(vec![Field::new("text", DataType::Utf8, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "alpha", "beta", "alpha", "beta",
+            ]))],
+        )
+        .unwrap();
+        let mut writer = MosaicWriter::new(
+            MemoryOutput::default(),
+            &schema,
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut data = writer.output().data.clone();
+        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        assert_eq!(data[2], 2);
+        assert_eq!(data[3], 5);
+        data[4] = 0xff;
+
+        let file_len = data.len() as u64;
+        let reader = MosaicReader::new(MemoryInput { data }, file_len).unwrap();
+        let row_group = reader.row_group_reader(0).unwrap();
+        let error = match prepare_encoded(&row_group) {
+            Ok(_) => panic!("invalid UTF-8 dictionary entry was accepted"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid UTF-8 column value"));
     }
 
     #[test]
