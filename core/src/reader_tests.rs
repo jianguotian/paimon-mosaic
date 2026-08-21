@@ -68,6 +68,14 @@ impl InputFile for ByteArrayInputFile {
     }
 }
 
+#[test]
+fn builds_constant_time_global_to_local_column_mapping() {
+    assert_eq!(
+        build_global_to_local(6, &[vec![4, 1], vec![5], vec![0, 3, 2]]),
+        vec![0, 1, 2, 1, 0, 0]
+    );
+}
+
 struct MemOutputFile {
     buf: Vec<u8>,
 }

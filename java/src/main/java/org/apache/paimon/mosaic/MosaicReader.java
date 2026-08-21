@@ -86,7 +86,12 @@ public class MosaicReader implements AutoCloseable {
         if (rgHandle == 0) {
             throw new RuntimeException("failed to open row group " + rgIndex);
         }
-        return new MosaicRowGroupReader(rgHandle, !projected);
+        try {
+            return new MosaicRowGroupReader(rgHandle, !projected);
+        } catch (RuntimeException | Error e) {
+            NativeLib.nativeRowGroupReaderFree(rgHandle);
+            throw e;
+        }
     }
 
     public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) {

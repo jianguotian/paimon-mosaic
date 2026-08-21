@@ -1436,9 +1436,25 @@ enum BucketState {
     },
 }
 
+fn build_global_to_local(num_columns: usize, bucket_to_global: &[Vec<usize>]) -> Vec<usize> {
+    let mut global_to_local = vec![usize::MAX; num_columns];
+    for global_indices in bucket_to_global {
+        for (local_index, &global_index) in global_indices.iter().enumerate() {
+            if global_index < num_columns {
+                debug_assert_eq!(global_to_local[global_index], usize::MAX);
+                global_to_local[global_index] = local_index;
+            } else {
+                debug_assert!(false, "global column index out of bounds");
+            }
+        }
+    }
+    global_to_local
+}
+
 pub struct RowGroupReader {
     bucket_states: Vec<Option<BucketState>>,
     bucket_to_global: Vec<Vec<usize>>,
+    global_to_local: Vec<usize>,
     active_buckets: Vec<usize>,
     schema: MosaicSchema,
     num_rows: usize,
@@ -1462,9 +1478,11 @@ impl RowGroupReader {
             .enumerate()
             .filter_map(|(i, s)| if s.is_some() { Some(i) } else { None })
             .collect();
+        let global_to_local = build_global_to_local(num_columns, &bucket_to_global);
         RowGroupReader {
             bucket_states,
             bucket_to_global,
+            global_to_local,
             active_buckets,
             schema,
             num_rows,
@@ -1477,9 +1495,10 @@ impl RowGroupReader {
     /// Dictionary entries for a projected column, or `None` if not dict-encoded.
     pub fn take_dictionary(&self, global_col: usize) -> Option<Vec<Value>> {
         let bucket = self.schema.columns[global_col].bucket_id;
-        let local = self.bucket_to_global[bucket]
-            .iter()
-            .position(|&g| g == global_col)?;
+        let local = *self.global_to_local.get(global_col)?;
+        if local == usize::MAX {
+            return None;
+        }
         match self.bucket_states[bucket].as_ref()? {
             BucketState::Paged { column_readers } => {
                 let d = column_readers[local].as_ref()?.dict_values();
@@ -1542,9 +1561,11 @@ impl RowGroupReader {
 
             let column = &self.schema.columns[global_index];
             let bucket_id = column.bucket_id;
-            let local_index = self.bucket_to_global[bucket_id]
-                .iter()
-                .position(|&index| index == global_index)
+            let local_index = self
+                .global_to_local
+                .get(global_index)
+                .copied()
+                .filter(|&index| index != usize::MAX)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,

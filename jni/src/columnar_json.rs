@@ -110,13 +110,14 @@ impl OutputBudget {
     }
 
     fn add(&mut self, bytes: usize) -> io::Result<()> {
-        self.estimated_bytes = self
+        let next = self
             .estimated_bytes
             .checked_add(bytes)
             .ok_or_else(output_budget_exceeded)?;
-        if self.estimated_bytes > MAX_UNCOMPRESSED_JSON_BYTES {
+        if next > MAX_UNCOMPRESSED_JSON_BYTES {
             return Err(output_budget_exceeded());
         }
+        self.estimated_bytes = next;
         Ok(())
     }
 
@@ -175,22 +176,36 @@ fn check_row_count(row_count: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Prepares an encoded row group to be emitted byte-for-byte like the Java fast path.
-///
-/// No output object is created until this preflight succeeds. In addition to type and floating
-/// point compatibility, it validates dictionary indexes and UTF-8 payloads which Arrow
-/// materialization previously checked before touching output.
-pub(crate) fn prepare_encoded(
-    row_group: &RowGroupReader,
-) -> io::Result<Option<EncodedJsonPreflight>> {
-    check_row_count(row_group.num_rows())?;
+fn has_supported_structure(data_type: &DataType, encoding: Encoding) -> bool {
+    if encoding == Encoding::AllNull {
+        return true;
+    }
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Utf8
+    ) && matches!(encoding, Encoding::Const | Encoding::Dict | Encoding::Plain)
+}
 
-    let mut columns = 0usize;
-    let mut output_budget = OutputBudget::new();
-    let mut java_double_bits = BTreeSet::new();
-    let result = row_group.visit_encoded_columns(|name, data_type, _, column| {
-        let column_index = columns;
-        columns += 1;
+struct StructurePreflight {
+    supported_columns: Vec<bool>,
+    output_budget: OutputBudget,
+    fallback_required: bool,
+}
+
+fn prepare_structure(row_group: &RowGroupReader) -> io::Result<StructurePreflight> {
+    let mut preflight = StructurePreflight {
+        supported_columns: Vec::new(),
+        output_budget: OutputBudget::new(),
+        fallback_required: false,
+    };
+    row_group.visit_encoded_columns(|name, data_type, _, column| {
+        let column_index = preflight.supported_columns.len();
         if column.num_rows() != row_group.num_rows() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -201,68 +216,151 @@ pub(crate) fn prepare_encoded(
                 ),
             ));
         }
-        output_budget.add_column_structure(name, column_index, column.num_rows())?;
-        let supported = if column.encoding() == Encoding::AllNull {
-            true
+
+        let supported = has_supported_structure(data_type, column.encoding());
+        preflight.supported_columns.push(supported);
+        if !supported {
+            preflight.fallback_required = true;
+            return Ok(());
+        }
+
+        if preflight.fallback_required {
+            return Ok(());
+        }
+        if let Err(error) =
+            preflight
+                .output_budget
+                .add_column_structure(name, column_index, column.num_rows())
+        {
+            if error.kind() == io::ErrorKind::Unsupported {
+                preflight.fallback_required = true;
+                return Ok(());
+            }
+            return Err(error);
+        }
+        Ok(())
+    })?;
+    Ok(preflight)
+}
+
+/// Prepares an encoded row group to be emitted byte-for-byte like the Java fast path.
+///
+/// No output object is created until this preflight succeeds. In addition to type and floating
+/// point compatibility, it validates dictionary indexes and UTF-8 payloads which Arrow
+/// materialization previously checked before touching output.
+pub(crate) fn prepare_encoded(
+    row_group: &RowGroupReader,
+) -> io::Result<Option<EncodedJsonPreflight>> {
+    if let Err(error) = check_row_count(row_group.num_rows()) {
+        return if error.kind() == io::ErrorKind::Unsupported {
+            Ok(None)
         } else {
+            Err(error)
+        };
+    }
+
+    let StructurePreflight {
+        supported_columns,
+        mut output_budget,
+        mut fallback_required,
+    } = match prepare_structure(row_group) {
+        Ok(preflight) => preflight,
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let columns = supported_columns.len();
+    if columns == 0 {
+        return Ok(None);
+    }
+
+    let mut validated_columns = 0usize;
+    let mut java_double_bits = BTreeSet::new();
+    let result = row_group.visit_encoded_columns(|_name, data_type, _, column| {
+        let column_index = validated_columns;
+        validated_columns += 1;
+        let structurally_supported = supported_columns.get(column_index).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "column count changed during columnar JSON preflight",
+            )
+        })?;
+        if !structurally_supported {
+            return Ok(());
+        }
+
+        let validation: io::Result<bool> = (|| {
+            if column.encoding() == Encoding::AllNull {
+                return Ok(true);
+            }
             match data_type {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
                     let column_supported = validate_integer_column(column)?;
-                    if column_supported {
+                    if column_supported && !fallback_required {
                         output_budget.add(estimate_integer_value_bytes(
                             data_type,
                             column,
                             output_budget.remaining(),
                         )?)?;
                     }
-                    column_supported
+                    Ok(column_supported)
                 }
                 DataType::Float64 => {
                     let column_supported = validate_float64_column(column, &mut java_double_bits)?;
-                    if column_supported {
+                    if column_supported && !fallback_required {
                         output_budget.add(estimate_fixed_value_bytes(
                             column,
                             MAX_DOUBLE_VALUE_BYTES,
                             output_budget.remaining(),
                         )?)?;
                     }
-                    column_supported
+                    Ok(column_supported)
                 }
                 DataType::Decimal128(precision, scale) => {
                     let column_supported = validate_decimal_column(column)?;
-                    if column_supported {
+                    if column_supported && !fallback_required {
                         output_budget.add(estimate_fixed_value_bytes(
                             column,
                             max_decimal_value_bytes(*precision, *scale),
                             output_budget.remaining(),
                         )?)?;
                     }
-                    column_supported
+                    Ok(column_supported)
                 }
                 DataType::Utf8 => {
-                    let validation = validate_utf8_column(column, output_budget.remaining())?;
-                    if validation.supported {
+                    let remaining = if fallback_required {
+                        usize::MAX
+                    } else {
+                        output_budget.remaining()
+                    };
+                    let validation = validate_utf8_column(column, remaining)?;
+                    if validation.supported && !fallback_required {
                         output_budget.add(validation.estimated_value_bytes)?;
                     }
-                    validation.supported
+                    Ok(validation.supported)
                 }
-                _ => false,
+                _ => Ok(false),
             }
-        };
-        if supported {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("unsupported column '{}': {:?}", name, data_type),
-            ))
+        })();
+
+        match validation {
+            Ok(true) => {}
+            Ok(false) => fallback_required = true,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                fallback_required = true;
+            }
+            Err(error) => return Err(error),
         }
+        Ok(())
     });
     match result {
-        Ok(()) if columns > 0 => Ok(Some(EncodedJsonPreflight {
+        Ok(()) if validated_columns == columns && fallback_required => Ok(None),
+        Ok(()) if validated_columns == columns => Ok(Some(EncodedJsonPreflight {
             java_double_bits: java_double_bits.into_iter().collect(),
         })),
-        Ok(()) => Ok(None),
+        Ok(()) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "column count changed during columnar JSON preflight",
+        )),
         Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(None),
         Err(error) => Err(error),
     }
@@ -367,18 +465,23 @@ fn validate_float64_column(
             }
         }
         Encoding::Dict | Encoding::Plain => {
+            let mut supported = true;
             for value in column.values() {
                 match value? {
                     EncodedValueRef::Null => {}
                     EncodedValueRef::Float64(value) => {
-                        if !prepare_double_value(value, java_double_bits)? {
-                            return Ok(false);
+                        match prepare_double_value(value, java_double_bits) {
+                            Ok(value_supported) => supported &= value_supported,
+                            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                                supported = false;
+                            }
+                            Err(error) => return Err(error),
                         }
                     }
                     _ => return Err(encoded_type_mismatch(column.data_type())),
                 }
             }
-            Ok(true)
+            Ok(supported)
         }
         _ => Ok(false),
     }
@@ -389,8 +492,10 @@ fn prepare_double_value(value: f64, java_double_bits: &mut BTreeSet<u64>) -> io:
         return Ok(false);
     }
     if !can_format_double_in_rust(value) {
-        java_double_bits.insert(value.to_bits());
-        if java_double_bits.len() > MAX_DISTINCT_JAVA_DOUBLE_VALUES {
+        let bits = value.to_bits();
+        if !java_double_bits.contains(&bits)
+            && java_double_bits.len() >= MAX_DISTINCT_JAVA_DOUBLE_VALUES
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
@@ -399,6 +504,7 @@ fn prepare_double_value(value: f64, java_double_bits: &mut BTreeSet<u64>) -> io:
                 ),
             ));
         }
+        java_double_bits.insert(bits);
     }
     Ok(true)
 }
@@ -505,37 +611,49 @@ fn validate_utf8_column(column: EncodedColumn<'_>, limit: usize) -> io::Result<C
             match column.constant()? {
                 Some(EncodedValueRef::Utf8(value)) => {
                     std::str::from_utf8(value).map_err(invalid_utf8)?;
-                    Ok(ColumnValidation {
-                        supported: true,
-                        estimated_value_bytes: checked_estimated_bytes(
-                            non_null_count(&column),
-                            escaped_utf8_len(value)?,
-                            limit,
-                        )?,
-                    })
+                    match checked_estimated_bytes(
+                        non_null_count(&column),
+                        escaped_utf8_len(value)?,
+                        limit,
+                    ) {
+                        Ok(estimated_value_bytes) => Ok(ColumnValidation {
+                            supported: true,
+                            estimated_value_bytes,
+                        }),
+                        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                            Ok(ColumnValidation {
+                                supported: false,
+                                estimated_value_bytes: 0,
+                            })
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 _ => Err(encoded_type_mismatch(column.data_type())),
             }
         }
         Encoding::Dict | Encoding::Plain => {
             let mut estimated_value_bytes = 0usize;
+            let mut supported = true;
             for value in column.values() {
                 match value? {
                     EncodedValueRef::Null => {}
                     EncodedValueRef::Utf8(value) => {
                         std::str::from_utf8(value).map_err(invalid_utf8)?;
-                        estimated_value_bytes = estimated_value_bytes
-                            .checked_add(escaped_utf8_len(value)?)
-                            .ok_or_else(output_budget_exceeded)?;
-                        if estimated_value_bytes > limit {
-                            return Err(output_budget_exceeded());
+                        if supported {
+                            match estimated_value_bytes.checked_add(escaped_utf8_len(value)?) {
+                                Some(next) if next <= limit => {
+                                    estimated_value_bytes = next;
+                                }
+                                _ => supported = false,
+                            }
                         }
                     }
                     _ => return Err(encoded_type_mismatch(column.data_type())),
                 }
             }
             Ok(ColumnValidation {
-                supported: true,
+                supported,
                 estimated_value_bytes,
             })
         }
@@ -1359,20 +1477,66 @@ fn escaped_utf8_len(value: &[u8]) -> io::Result<usize> {
 mod tests {
     use std::collections::BTreeSet;
     use std::io::{self, Write};
+    use std::mem::size_of;
+    use std::sync::Arc;
 
+    use arrow_array::{BooleanArray, Float64Array, Int32Array, RecordBatch};
     use arrow_schema::DataType;
+    use arrow_schema::{Field, Schema};
     use mosaic_core::bucket_reader::EncodedValueRef;
+    use mosaic_core::reader::{Encoding, InputFile, MosaicReader, ReaderAccess};
+    use mosaic_core::spec::{COMPRESSION_NONE, ENCODING_DICT};
+    use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
     use super::{
         append_nullable_const_block, can_format_double_in_rust, check_row_count,
-        checked_estimated_bytes, decode_signed_i128, escaped_utf8_len, integer_value_matches,
-        is_oversized_escaped_utf8, prepare_double_value, write_decimal, write_double,
-        write_encoded_value, write_escaped_utf8, write_exact_double, write_nullable_repeated_rows,
-        write_repeated_value, write_utf8_constant, EncodedJsonPlan, EncodedJsonPreflight,
-        OutputBudget, MAX_COLUMNAR_JSON_ROWS, MAX_DISTINCT_JAVA_DOUBLE_VALUES,
-        MAX_UNCOMPRESSED_JSON_BYTES, NULLABLE_CONST_CACHE_BYTES, NULLABLE_CONST_PATTERN_COUNT,
-        REPEATED_VALUE_BUFFER_BYTES,
+        checked_estimated_bytes, decode_signed_i128, escaped_utf8_len, has_supported_structure,
+        integer_value_matches, is_oversized_escaped_utf8, prepare_double_value, prepare_encoded,
+        write_decimal, write_double, write_encoded_value, write_escaped_utf8, write_exact_double,
+        write_nullable_repeated_rows, write_repeated_value, write_utf8_constant, EncodedJsonPlan,
+        EncodedJsonPreflight, OutputBudget, MAX_COLUMNAR_JSON_ROWS,
+        MAX_DISTINCT_JAVA_DOUBLE_VALUES, MAX_UNCOMPRESSED_JSON_BYTES, NULLABLE_CONST_CACHE_BYTES,
+        NULLABLE_CONST_PATTERN_COUNT, REPEATED_VALUE_BUFFER_BYTES,
     };
+
+    #[derive(Default)]
+    struct MemoryOutput {
+        data: Vec<u8>,
+    }
+
+    impl OutputFile for MemoryOutput {
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.data.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn pos(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    struct MemoryInput {
+        data: Vec<u8>,
+    }
+
+    impl InputFile for MemoryInput {
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+            let start = offset as usize;
+            let end = start
+                .checked_add(buffer.len())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "read range overflow"))?;
+            let source = self
+                .data
+                .get(start..end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "read past end"))?;
+            buffer.copy_from_slice(source);
+            Ok(())
+        }
+    }
 
     #[derive(Default)]
     struct TrackingWriter {
@@ -1425,6 +1589,188 @@ mod tests {
         let error = budget.add(1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("output budget"));
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn accounts_for_complete_column_structure() {
+        let mut budget = OutputBudget::new();
+        budget.add_column_structure("a\"", 0, 3).unwrap();
+        budget.add_column_structure("b", 1, 1).unwrap();
+        assert_eq!(budget.estimated_bytes, 19);
+    }
+
+    #[test]
+    fn checks_column_support_without_scanning_values() {
+        assert!(has_supported_structure(&DataType::Int32, Encoding::Plain));
+        assert!(has_supported_structure(
+            &DataType::Boolean,
+            Encoding::AllNull
+        ));
+        assert!(!has_supported_structure(&DataType::Boolean, Encoding::Dict));
+        assert!(!has_supported_structure(
+            &DataType::Utf8,
+            Encoding::Other(99)
+        ));
+    }
+
+    #[test]
+    fn reports_corrupt_supported_column_before_later_unsupported_column() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("z", DataType::Boolean, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 1, 2, 3, 1, 2])),
+                Arc::new(BooleanArray::from(vec![
+                    true, false, true, false, true, false, true, false,
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut writer = MosaicWriter::new(
+            MemoryOutput::default(),
+            &schema,
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut data = writer.output().data.clone();
+        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        assert_eq!(data[2], 3);
+        // Header bytes: encoding/null flags, both dictionaries, then the first column's indexes.
+        // A two-bit dictionary index of 3 is outside the valid 0..3 range.
+        data[18] = (data[18] & !0x03) | 0x03;
+
+        let file_len = data.len() as u64;
+        let reader = MosaicReader::new(MemoryInput { data }, file_len).unwrap();
+        let row_group = reader.row_group_reader(0).unwrap();
+        let error = match prepare_encoded(&row_group) {
+            Ok(_) => panic!("corrupt dictionary index was accepted as normal fallback"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("corrupt dict index"));
+    }
+
+    #[test]
+    fn reports_corrupt_supported_column_after_earlier_unsupported_column() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("z", DataType::Boolean, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 1, 2, 3, 1, 2])),
+                Arc::new(BooleanArray::from(vec![
+                    true, false, true, false, true, false, true, false,
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut writer = MosaicWriter::new(
+            MemoryOutput::default(),
+            &schema,
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut data = writer.output().data.clone();
+        let mut baseline =
+            MosaicReader::new(MemoryInput { data: data.clone() }, data.len() as u64).unwrap();
+        baseline.project(&["z", "a"]).unwrap();
+        let baseline_row_group = baseline.row_group_reader(0).unwrap();
+        assert!(prepare_encoded(&baseline_row_group).unwrap().is_none());
+
+        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        assert_eq!(data[2], 3);
+        data[18] = (data[18] & !0x03) | 0x03;
+
+        let file_len = data.len() as u64;
+        let mut reader = MosaicReader::new(MemoryInput { data }, file_len).unwrap();
+        reader.project(&["z", "a"]).unwrap();
+        let row_group = reader.row_group_reader(0).unwrap();
+        let error = match prepare_encoded(&row_group) {
+            Ok(_) => panic!("corrupt dictionary index was accepted as normal fallback"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("corrupt dict index"));
+    }
+
+    #[test]
+    fn reports_corrupt_column_after_double_cardinality_fallback() {
+        let row_count = MAX_DISTINCT_JAVA_DOUBLE_VALUES + 1;
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Float64, false),
+            Field::new("z", DataType::Int32, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Float64Array::from_iter_values(
+                    (1..=row_count as u64).map(f64::from_bits),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..row_count).map(|row| (row % 3 + 1) as i32),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut writer = MosaicWriter::new(
+            MemoryOutput::default(),
+            &schema,
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut data = writer.output().data.clone();
+        let reader =
+            MosaicReader::new(MemoryInput { data: data.clone() }, data.len() as u64).unwrap();
+        let buckets = reader.bucket_infos(0).unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].columns, vec![0]);
+        assert_eq!(buckets[1].columns, vec![1]);
+        let baseline_row_group = reader.row_group_reader(0).unwrap();
+        assert!(prepare_encoded(&baseline_row_group).unwrap().is_none());
+
+        let int_bucket_start = buckets[0].size;
+        assert_eq!(data[int_bucket_start] & 0x03, ENCODING_DICT);
+        assert_eq!(data[int_bucket_start + 2], 3);
+        // Single-column bucket: two header bytes, one-byte dictionary size, three i32 values.
+        let int_indexes_start = int_bucket_start + 2 + 1 + 3 * size_of::<i32>();
+        data[int_indexes_start] = (data[int_indexes_start] & !0x03) | 0x03;
+
+        let file_len = data.len() as u64;
+        let reader = MosaicReader::new(MemoryInput { data }, file_len).unwrap();
+        let row_group = reader.row_group_reader(0).unwrap();
+        let error = match prepare_encoded(&row_group) {
+            Ok(_) => panic!("corrupt dictionary index was accepted after DOUBLE fallback"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("corrupt dict index"));
     }
 
     #[test]
