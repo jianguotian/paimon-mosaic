@@ -1685,21 +1685,49 @@ public class MosaicRoundtripTest {
                                                 FloatingPointPrecision.DOUBLE))));
         int rowCount = 4096;
         double[] values = new double[rowCount];
-        values[0] = 0.0;
-        values[1] = -0.0;
-        values[2] = Double.MIN_VALUE;
-        values[3] = -Double.MIN_VALUE;
-        values[4] = Double.MAX_VALUE;
-        values[5] = -Double.MAX_VALUE;
-        values[6] = Double.longBitsToDouble(TINY_DOUBLE_ROUNDING_REGRESSION_BITS);
-        values[7] = Double.longBitsToDouble(LARGE_DOUBLE_ROUNDING_REGRESSION_BITS);
+        double[] fixedValues = {
+            0.0,
+            -0.0,
+            Math.nextDown(1.0e-6),
+            1.0e-6,
+            Math.nextUp(1.0e-6),
+            -Math.nextDown(1.0e-6),
+            -1.0e-6,
+            -Math.nextUp(1.0e-6),
+            Math.nextDown(1.0e9),
+            1.0e9,
+            Math.nextUp(1.0e9),
+            -Math.nextDown(1.0e9),
+            -1.0e9,
+            -Math.nextUp(1.0e9),
+            1_234_567.0,
+            -1_234_567.0,
+            1_234_567.8,
+            -1_234_567.8,
+            Double.MIN_VALUE,
+            -Double.MIN_VALUE,
+            Double.MAX_VALUE,
+            -Double.MAX_VALUE,
+            Double.longBitsToDouble(TINY_DOUBLE_ROUNDING_REGRESSION_BITS),
+            Double.longBitsToDouble(LARGE_DOUBLE_ROUNDING_REGRESSION_BITS)
+        };
+        System.arraycopy(fixedValues, 0, values, 0, fixedValues.length);
         java.util.Random random = new java.util.Random(20260820L);
-        for (int row = 8; row < rowCount; row++) {
+        int randomBitPatternEnd = fixedValues.length + 256;
+        for (int row = fixedValues.length; row < randomBitPatternEnd; row++) {
             double value;
             do {
                 value = Double.longBitsToDouble(random.nextLong());
             } while (!Double.isFinite(value));
             values[row] = value;
+        }
+        for (int row = randomBitPatternEnd; row < rowCount; row++) {
+            int exponent = random.nextInt(15) - 6;
+            double significand = 1.0 + random.nextDouble() * 9.0;
+            double value = significand * Math.pow(10.0, exponent);
+            values[row] = random.nextBoolean() ? value : -value;
+            assertTrue(Math.abs(values[row]) >= 1.0e-6);
+            assertTrue(Math.abs(values[row]) <= 1.0e9);
         }
 
         byte[] data;
@@ -1713,26 +1741,28 @@ public class MosaicRoundtripTest {
             data = writeToBytes(schema, writer -> writer.write(root));
         }
 
-        StringBuilder expected = new StringBuilder("{\"value\":\"");
-        for (int row = 0; row < rowCount; row++) {
-            if (row > 0) {
-                expected.append(',');
-            }
-            expected.append(Double.toString(values[row]));
-        }
-        expected.append("\"}");
-
         try (MosaicReader reader = readerFromBytes(data);
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
                     GeelyColumnarJson.Status.WRITTEN,
                     GeelyColumnarJson.write(rowGroup, output));
-            assertEquals(
-                    expected.toString(),
+            String actual =
                     new String(
                             output.toByteArray(),
-                            java.nio.charset.StandardCharsets.UTF_8));
+                            java.nio.charset.StandardCharsets.UTF_8);
+            String prefix = "{\"value\":\"";
+            assertTrue(actual.startsWith(prefix));
+            assertTrue(actual.endsWith("\"}"));
+            String[] rendered =
+                    actual.substring(prefix.length(), actual.length() - 2).split(",", -1);
+            assertEquals(rowCount, rendered.length);
+            for (int row = 0; row < rowCount; row++) {
+                assertEquals(
+                        "DOUBLE mismatch at row " + row,
+                        Double.toString(values[row]),
+                        rendered[row]);
+            }
         }
     }
 
@@ -2019,6 +2049,129 @@ public class MosaicRoundtripTest {
                 "{\"value\":\"1844674407370955161500,-922337203685477580900,0\"}");
     }
 
+    @Test
+    public void testGeelyColumnarJsonMatchesArrowDecimalPlainStringOracle() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable(
+                                        "scale_minus_1",
+                                        new ArrowType.Decimal(18, -1, 128)),
+                                Field.nullable(
+                                        "scale_minus_2",
+                                        new ArrowType.Decimal(19, -2, 128)),
+                                Field.nullable(
+                                        "scale_minus_3",
+                                        new ArrowType.Decimal(19, -3, 128)),
+                                Field.nullable(
+                                        "precision_19_scale_4",
+                                        new ArrowType.Decimal(19, 4, 128)),
+                                Field.nullable(
+                                        "precision_19_scale_0",
+                                        new ArrowType.Decimal(19, 0, 128))));
+        BigDecimal[][] values = {
+            {
+                new BigDecimal(BigInteger.ZERO, -1),
+                new BigDecimal(new BigInteger("123456789012345678"), -1),
+                new BigDecimal(new BigInteger("-123456789012345678"), -1),
+                null
+            },
+            {
+                new BigDecimal(BigInteger.ZERO, -2),
+                new BigDecimal(new BigInteger("1234567890123456789"), -2),
+                new BigDecimal(new BigInteger("-1234567890123456789"), -2),
+                null
+            },
+            {
+                new BigDecimal(BigInteger.ZERO, -3),
+                new BigDecimal(new BigInteger("9876543210123456789"), -3),
+                new BigDecimal(new BigInteger("-9876543210123456789"), -3),
+                null
+            },
+            {
+                new BigDecimal("0.0000"),
+                new BigDecimal("123456789012345.6789"),
+                new BigDecimal("-999999999999999.9999"),
+                null
+            },
+            {
+                new BigDecimal("0"),
+                new BigDecimal("9999999999999999999"),
+                new BigDecimal("-9223372036854775809"),
+                null
+            }
+        };
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            for (int column = 0; column < values.length; column++) {
+                DecimalVector vector = (DecimalVector) root.getVector(column);
+                vector.allocateNew(values[column].length);
+                for (int row = 0; row < values[column].length; row++) {
+                    if (values[column][row] == null) {
+                        vector.setNull(row);
+                    } else {
+                        vector.set(row, values[column][row]);
+                    }
+                }
+            }
+            root.setRowCount(values[0].length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            try (VectorSchemaRoot arrow = rowGroup.readColumns(allocator)) {
+                assertEquals(
+                        renderDecimalColumnarJson(arrow),
+                        new String(
+                                output.toByteArray(),
+                                java.nio.charset.StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonWritesReadableDecimalBeyondDeclaredPrecision()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.Decimal(1, 0, 128))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector value = (DecimalVector) root.getVector("value");
+            value.allocateNew(1);
+            value.set(0, 123L);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            try (VectorSchemaRoot arrow = rowGroup.readColumns(allocator)) {
+                assertEquals(new BigDecimal("123"), arrow.getVector("value").getObject(0));
+            }
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"123\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
     private void assertLargeDecimalJson(
             ArrowType.Decimal type, BigDecimal[] values, String expected) throws Exception {
         Schema schema =
@@ -2127,8 +2280,29 @@ public class MosaicRoundtripTest {
         }
     }
 
+    private static String renderDecimalColumnarJson(VectorSchemaRoot root) {
+        StringBuilder expected = new StringBuilder("{");
+        for (int column = 0; column < root.getFieldVectors().size(); column++) {
+            if (column > 0) {
+                expected.append(',');
+            }
+            DecimalVector vector = (DecimalVector) root.getVector(column);
+            expected.append('"').append(vector.getName()).append("\":\"");
+            for (int row = 0; row < root.getRowCount(); row++) {
+                if (row > 0) {
+                    expected.append(',');
+                }
+                if (!vector.isNull(row)) {
+                    expected.append(vector.getObject(row).toPlainString());
+                }
+            }
+            expected.append('"');
+        }
+        return expected.append('}').toString();
+    }
+
     @Test
-    public void testGeelyColumnarJsonOversizedRowGroupFallsBackWithoutTouchingOutput()
+    public void testGeelyColumnarJsonStreamsRowGroupAboveFormerRowBudget()
             throws Exception {
         Schema schema =
                 new Schema(
@@ -2152,11 +2326,54 @@ public class MosaicRoundtripTest {
         try (MosaicReader reader = readerFromBytes(data);
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
-            output.write(9);
             assertEquals(
-                    GeelyColumnarJson.Status.UNSUPPORTED,
+                    GeelyColumnarJson.Status.WRITTEN,
                     GeelyColumnarJson.write(rowGroup, output));
-            assertArrayEquals(new byte[] {9}, output.toByteArray());
+            byte[] bytes = output.toByteArray();
+            assertEquals(rowCount + 11, bytes.length);
+            assertEquals('{', bytes[0]);
+            assertEquals('}', bytes[bytes.length - 1]);
+        }
+    }
+
+    @Test
+    public void testGeelyColumnarJsonStreamsWhenWorstCaseEstimateExceedsFormerBudget()
+            throws Exception {
+        int rowCount = 1_000_000;
+        List<Field> fields = new ArrayList<>();
+        for (int column = 0; column < 4; column++) {
+            fields.add(
+                    Field.notNullable(
+                            "value_" + column,
+                            new ArrowType.Decimal(38, -128, 128)));
+        }
+        Schema schema = new Schema(fields);
+        BigDecimal zero = new BigDecimal(BigInteger.ZERO, -128);
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            for (FieldVector fieldVector : root.getFieldVectors()) {
+                DecimalVector vector = (DecimalVector) fieldVector;
+                vector.allocateNew(rowCount);
+                for (int row = 0; row < rowCount; row++) {
+                    vector.set(row, zero);
+                }
+            }
+            root.setRowCount(rowCount);
+            data =
+                    writeToBytes(
+                            schema,
+                            new WriterOptions().rowGroupMaxSize(512L * 1024 * 1024),
+                            writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.write(rowGroup, output));
+            assertEquals(8_000_049, output.size());
         }
     }
 

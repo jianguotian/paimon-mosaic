@@ -24,9 +24,6 @@ use mosaic_core::reader::{Encoding, RowGroupReader};
 
 const MIN_EXACT_DOUBLE_ABS: f64 = 1.0e-6;
 const MAX_EXACT_DOUBLE_ABS: f64 = 1.0e9;
-const MAX_COLUMNAR_JSON_ROWS: usize = 1_000_000;
-const MAX_UNCOMPRESSED_JSON_BYTES: usize = 512 * 1024 * 1024;
-const MAX_DOUBLE_VALUE_BYTES: usize = 32;
 const MAX_DISTINCT_JAVA_DOUBLE_VALUES: usize = 65_536;
 const COMMA_BLOCK: [u8; 64] = [b','; 64];
 const REPEATED_VALUE_BUFFER_BYTES: usize = 64 * 1024;
@@ -100,80 +97,11 @@ impl EncodedJsonPlan {
     }
 }
 
-struct OutputBudget {
-    estimated_bytes: usize,
-}
-
-impl OutputBudget {
-    fn new() -> Self {
-        Self { estimated_bytes: 2 }
-    }
-
-    fn add(&mut self, bytes: usize) -> io::Result<()> {
-        let next = self
-            .estimated_bytes
-            .checked_add(bytes)
-            .ok_or_else(output_budget_exceeded)?;
-        if next > MAX_UNCOMPRESSED_JSON_BYTES {
-            return Err(output_budget_exceeded());
-        }
-        self.estimated_bytes = next;
-        Ok(())
-    }
-
-    fn remaining(&self) -> usize {
-        MAX_UNCOMPRESSED_JSON_BYTES - self.estimated_bytes
-    }
-
-    fn add_column_structure(
-        &mut self,
-        name: &str,
-        column_index: usize,
-        row_count: usize,
-    ) -> io::Result<()> {
-        self.add(usize::from(column_index > 0))?;
-        self.add(escaped_utf8_len(name.as_bytes())?)?;
-        // Quotes around the name and value, plus the colon.
-        self.add(5)?;
-        self.add(row_count.saturating_sub(1))
-    }
-}
-
-fn output_budget_exceeded() -> io::Error {
+fn columnar_json_size_overflow() -> io::Error {
     io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "columnar JSON exceeds the {} byte uncompressed output budget",
-            MAX_UNCOMPRESSED_JSON_BYTES
-        ),
+        io::ErrorKind::InvalidData,
+        "columnar JSON size calculation overflowed",
     )
-}
-
-fn checked_estimated_bytes(
-    count: usize,
-    bytes_per_value: usize,
-    limit: usize,
-) -> io::Result<usize> {
-    let estimated = count
-        .checked_mul(bytes_per_value)
-        .ok_or_else(output_budget_exceeded)?;
-    if estimated > limit {
-        return Err(output_budget_exceeded());
-    }
-    Ok(estimated)
-}
-
-fn check_row_count(row_count: usize) -> io::Result<()> {
-    if row_count > MAX_COLUMNAR_JSON_ROWS {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "columnar JSON row count {} exceeds the {} row budget",
-                row_count, MAX_COLUMNAR_JSON_ROWS
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn has_supported_structure(data_type: &DataType, encoding: Encoding) -> bool {
@@ -194,18 +122,15 @@ fn has_supported_structure(data_type: &DataType, encoding: Encoding) -> bool {
 
 struct StructurePreflight {
     supported_columns: Vec<bool>,
-    output_budget: OutputBudget,
     fallback_required: bool,
 }
 
 fn prepare_structure(row_group: &RowGroupReader) -> io::Result<StructurePreflight> {
     let mut preflight = StructurePreflight {
         supported_columns: Vec::new(),
-        output_budget: OutputBudget::new(),
         fallback_required: false,
     };
-    row_group.visit_encoded_columns(|name, data_type, _, column| {
-        let column_index = preflight.supported_columns.len();
+    row_group.visit_encoded_columns(|_name, data_type, _, column| {
         if column.num_rows() != row_group.num_rows() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -221,22 +146,6 @@ fn prepare_structure(row_group: &RowGroupReader) -> io::Result<StructurePrefligh
         preflight.supported_columns.push(supported);
         if !supported {
             preflight.fallback_required = true;
-            return Ok(());
-        }
-
-        if preflight.fallback_required {
-            return Ok(());
-        }
-        if let Err(error) =
-            preflight
-                .output_budget
-                .add_column_structure(name, column_index, column.num_rows())
-        {
-            if error.kind() == io::ErrorKind::Unsupported {
-                preflight.fallback_required = true;
-                return Ok(());
-            }
-            return Err(error);
         }
         Ok(())
     })?;
@@ -251,17 +160,8 @@ fn prepare_structure(row_group: &RowGroupReader) -> io::Result<StructurePrefligh
 pub(crate) fn prepare_encoded(
     row_group: &RowGroupReader,
 ) -> io::Result<Option<EncodedJsonPreflight>> {
-    if let Err(error) = check_row_count(row_group.num_rows()) {
-        return if error.kind() == io::ErrorKind::Unsupported {
-            Ok(None)
-        } else {
-            Err(error)
-        };
-    }
-
     let StructurePreflight {
         supported_columns,
-        mut output_budget,
         mut fallback_required,
     } = match prepare_structure(row_group) {
         Ok(preflight) => preflight,
@@ -294,50 +194,11 @@ pub(crate) fn prepare_encoded(
             }
             match data_type {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    let column_supported = validate_integer_column(column)?;
-                    if column_supported && !fallback_required {
-                        output_budget.add(estimate_integer_value_bytes(
-                            data_type,
-                            column,
-                            output_budget.remaining(),
-                        )?)?;
-                    }
-                    Ok(column_supported)
+                    validate_integer_column(column)
                 }
-                DataType::Float64 => {
-                    let column_supported = validate_float64_column(column, &mut java_double_bits)?;
-                    if column_supported && !fallback_required {
-                        output_budget.add(estimate_fixed_value_bytes(
-                            column,
-                            MAX_DOUBLE_VALUE_BYTES,
-                            output_budget.remaining(),
-                        )?)?;
-                    }
-                    Ok(column_supported)
-                }
-                DataType::Decimal128(precision, scale) => {
-                    let column_supported = validate_decimal_column(column)?;
-                    if column_supported && !fallback_required {
-                        output_budget.add(estimate_fixed_value_bytes(
-                            column,
-                            max_decimal_value_bytes(*precision, *scale),
-                            output_budget.remaining(),
-                        )?)?;
-                    }
-                    Ok(column_supported)
-                }
-                DataType::Utf8 => {
-                    let remaining = if fallback_required {
-                        usize::MAX
-                    } else {
-                        output_budget.remaining()
-                    };
-                    let validation = validate_utf8_column(column, remaining)?;
-                    if validation.supported && !fallback_required {
-                        output_budget.add(validation.estimated_value_bytes)?;
-                    }
-                    Ok(validation.supported)
-                }
+                DataType::Float64 => validate_float64_column(column, &mut java_double_bits),
+                DataType::Decimal128(_, _) => validate_decimal_column(column),
+                DataType::Utf8 => validate_utf8_column(column),
                 _ => Ok(false),
             }
         })();
@@ -422,29 +283,6 @@ fn integer_value_matches(data_type: &DataType, value: EncodedValueRef<'_>) -> bo
             | (DataType::Int32, EncodedValueRef::Int32(_))
             | (DataType::Int64, EncodedValueRef::Int64(_))
     )
-}
-
-fn estimate_integer_value_bytes(
-    data_type: &DataType,
-    column: EncodedColumn<'_>,
-    limit: usize,
-) -> io::Result<usize> {
-    let max_value_bytes = match data_type {
-        DataType::Int8 => 4,
-        DataType::Int16 => 6,
-        DataType::Int32 => 11,
-        DataType::Int64 => 20,
-        _ => return Err(encoded_type_mismatch(data_type)),
-    };
-    estimate_fixed_value_bytes(column, max_value_bytes, limit)
-}
-
-fn estimate_fixed_value_bytes(
-    column: EncodedColumn<'_>,
-    max_value_bytes: usize,
-    limit: usize,
-) -> io::Result<usize> {
-    checked_estimated_bytes(non_null_count(&column), max_value_bytes, limit)
 }
 
 fn validate_float64_column(
@@ -538,29 +376,19 @@ fn validate_decimal_column(column: EncodedColumn<'_>) -> io::Result<bool> {
 }
 
 fn decode_decimal_value(data_type: &DataType, value: EncodedValueRef<'_>) -> io::Result<i128> {
-    let (precision, unscaled) = match (data_type, value) {
+    match (data_type, value) {
         (DataType::Decimal128(precision, _), EncodedValueRef::DecimalCompact(value))
             if *precision <= 18 =>
         {
-            (*precision, value as i128)
+            Ok(value as i128)
         }
         (DataType::Decimal128(precision, _), EncodedValueRef::DecimalLarge(bytes))
             if *precision > 18 =>
         {
-            (*precision, decode_signed_i128(bytes)?)
+            decode_signed_i128(bytes)
         }
-        _ => return Err(encoded_type_mismatch(data_type)),
-    };
-    if decimal_digits(unscaled) > precision as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "decimal value exceeds declared precision {} for {:?}",
-                precision, data_type
-            ),
-        ));
+        _ => Err(encoded_type_mismatch(data_type)),
     }
-    Ok(unscaled)
 }
 
 fn decode_signed_i128(bytes: &[u8]) -> io::Result<i128> {
@@ -576,91 +404,34 @@ fn decode_signed_i128(bytes: &[u8]) -> io::Result<i128> {
     Ok(i128::from_be_bytes(decoded))
 }
 
-fn decimal_digits(value: i128) -> usize {
-    let mut magnitude = value.unsigned_abs();
-    let mut digits = 1usize;
-    while magnitude >= 10 {
-        magnitude /= 10;
-        digits += 1;
-    }
-    digits
-}
-
-fn max_decimal_value_bytes(precision: u8, scale: i8) -> usize {
-    precision as usize + scale.unsigned_abs() as usize + 3
-}
-
-struct ColumnValidation {
-    supported: bool,
-    estimated_value_bytes: usize,
-}
-
-fn validate_utf8_column(column: EncodedColumn<'_>, limit: usize) -> io::Result<ColumnValidation> {
+fn validate_utf8_column(column: EncodedColumn<'_>) -> io::Result<bool> {
     match column.encoding() {
-        Encoding::AllNull => Ok(ColumnValidation {
-            supported: true,
-            estimated_value_bytes: 0,
-        }),
+        Encoding::AllNull => Ok(true),
         Encoding::Const => {
             if !has_non_null(&column) {
-                return Ok(ColumnValidation {
-                    supported: true,
-                    estimated_value_bytes: 0,
-                });
+                return Ok(true);
             }
             match column.constant()? {
                 Some(EncodedValueRef::Utf8(value)) => {
                     std::str::from_utf8(value).map_err(invalid_utf8)?;
-                    match checked_estimated_bytes(
-                        non_null_count(&column),
-                        escaped_utf8_len(value)?,
-                        limit,
-                    ) {
-                        Ok(estimated_value_bytes) => Ok(ColumnValidation {
-                            supported: true,
-                            estimated_value_bytes,
-                        }),
-                        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                            Ok(ColumnValidation {
-                                supported: false,
-                                estimated_value_bytes: 0,
-                            })
-                        }
-                        Err(error) => Err(error),
-                    }
+                    Ok(true)
                 }
                 _ => Err(encoded_type_mismatch(column.data_type())),
             }
         }
         Encoding::Dict | Encoding::Plain => {
-            let mut estimated_value_bytes = 0usize;
-            let mut supported = true;
             for value in column.values() {
                 match value? {
                     EncodedValueRef::Null => {}
                     EncodedValueRef::Utf8(value) => {
                         std::str::from_utf8(value).map_err(invalid_utf8)?;
-                        if supported {
-                            match estimated_value_bytes.checked_add(escaped_utf8_len(value)?) {
-                                Some(next) if next <= limit => {
-                                    estimated_value_bytes = next;
-                                }
-                                _ => supported = false,
-                            }
-                        }
                     }
                     _ => return Err(encoded_type_mismatch(column.data_type())),
                 }
             }
-            Ok(ColumnValidation {
-                supported,
-                estimated_value_bytes,
-            })
+            Ok(true)
         }
-        _ => Ok(ColumnValidation {
-            supported: false,
-            estimated_value_bytes: 0,
-        }),
+        _ => Ok(false),
     }
 }
 
@@ -1072,7 +843,7 @@ fn write_nullable_rows_bounded<W: Write>(
         let is_null = null_bitmap[row / 8] & (1 << (row % 8)) != 0;
         let row_size = usize::from(row > 0)
             .checked_add(if is_null { 0 } else { value.len() })
-            .ok_or_else(output_budget_exceeded)?;
+            .ok_or_else(columnar_json_size_overflow)?;
         if !scratch.is_empty()
             && scratch.len().saturating_add(row_size) > REPEATED_VALUE_BUFFER_BYTES
         {
@@ -1468,7 +1239,7 @@ fn escaped_utf8_len(value: &[u8]) -> io::Result<usize> {
         };
         length = length
             .checked_add(bytes)
-            .ok_or_else(output_budget_exceeded)?;
+            .ok_or_else(columnar_json_size_overflow)?;
     }
     Ok(length)
 }
@@ -1489,13 +1260,12 @@ mod tests {
     use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
     use super::{
-        append_nullable_const_block, can_format_double_in_rust, check_row_count,
-        checked_estimated_bytes, decode_signed_i128, escaped_utf8_len, has_supported_structure,
-        integer_value_matches, is_oversized_escaped_utf8, prepare_double_value, prepare_encoded,
-        write_decimal, write_double, write_encoded_value, write_escaped_utf8, write_exact_double,
+        append_nullable_const_block, can_format_double_in_rust, decode_signed_i128,
+        escaped_utf8_len, has_supported_structure, integer_value_matches,
+        is_oversized_escaped_utf8, prepare_double_value, prepare_encoded, write_decimal,
+        write_double, write_encoded_value, write_escaped_utf8, write_exact_double,
         write_nullable_repeated_rows, write_repeated_value, write_utf8_constant, EncodedJsonPlan,
-        EncodedJsonPreflight, OutputBudget, MAX_COLUMNAR_JSON_ROWS,
-        MAX_DISTINCT_JAVA_DOUBLE_VALUES, MAX_UNCOMPRESSED_JSON_BYTES, NULLABLE_CONST_CACHE_BYTES,
+        EncodedJsonPreflight, MAX_DISTINCT_JAVA_DOUBLE_VALUES, NULLABLE_CONST_CACHE_BYTES,
         NULLABLE_CONST_PATTERN_COUNT, REPEATED_VALUE_BUFFER_BYTES,
     };
 
@@ -1570,34 +1340,6 @@ mod tests {
             &DataType::Int32,
             EncodedValueRef::Int16(0)
         ));
-    }
-
-    #[test]
-    fn rejects_row_count_above_budget() {
-        assert!(check_row_count(MAX_COLUMNAR_JSON_ROWS).is_ok());
-        let error = check_row_count(MAX_COLUMNAR_JSON_ROWS + 1).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("row budget"));
-    }
-
-    #[test]
-    fn rejects_output_above_byte_budget() {
-        let mut budget = OutputBudget::new();
-        budget.add(MAX_UNCOMPRESSED_JSON_BYTES - 2).unwrap();
-        assert_eq!(budget.remaining(), 0);
-
-        let error = budget.add(1).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("output budget"));
-        assert_eq!(budget.remaining(), 0);
-    }
-
-    #[test]
-    fn accounts_for_complete_column_structure() {
-        let mut budget = OutputBudget::new();
-        budget.add_column_structure("a\"", 0, 3).unwrap();
-        budget.add_column_structure("b", 1, 1).unwrap();
-        assert_eq!(budget.estimated_bytes, 19);
     }
 
     #[test]
@@ -1771,13 +1513,6 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("corrupt dict index"));
-    }
-
-    #[test]
-    fn rejects_value_estimate_overflow() {
-        let error = checked_estimated_bytes(usize::MAX, 2, usize::MAX).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("output budget"));
     }
 
     #[test]
@@ -1982,14 +1717,103 @@ mod tests {
     }
 
     #[test]
+    fn writes_integer_and_one_decimal_double_fast_paths() {
+        let values = [
+            1.0,
+            -1.0,
+            1_234_567.0,
+            -1_234_567.0,
+            9_999_999.0,
+            -9_999_999.0,
+            1.2,
+            -1.2,
+            1_234_567.8,
+            -1_234_567.8,
+        ];
+        let mut output = Vec::new();
+        for (index, value) in values.into_iter().enumerate() {
+            write_double(&mut output, value, index > 0).unwrap();
+        }
+        assert_eq!(
+            output,
+            b"1.0,-1.0,1234567.0,-1234567.0,9999999.0,-9999999.0,\
+1.2,-1.2,1234567.8,-1234567.8"
+        );
+    }
+
+    #[test]
     fn identifies_doubles_formatted_in_rust() {
-        assert!(can_format_double_in_rust(0.0));
-        assert!(can_format_double_in_rust(-0.0));
-        assert!(can_format_double_in_rust(1.0e-6));
-        assert!(can_format_double_in_rust(1.0e9));
+        let minimum = 1.0e-6_f64;
+        let below_minimum = f64::from_bits(minimum.to_bits() - 1);
+        let above_minimum = f64::from_bits(minimum.to_bits() + 1);
+        let maximum = 1.0e9_f64;
+        let below_maximum = f64::from_bits(maximum.to_bits() - 1);
+        let above_maximum = f64::from_bits(maximum.to_bits() + 1);
+
+        for value in [
+            0.0,
+            -0.0,
+            minimum,
+            above_minimum,
+            -minimum,
+            -above_minimum,
+            below_maximum,
+            maximum,
+            -below_maximum,
+            -maximum,
+            1_234_567.0,
+            -1_234_567.0,
+            1_234_567.8,
+            -1_234_567.8,
+        ] {
+            assert!(can_format_double_in_rust(value), "{value}");
+        }
+        for value in [below_minimum, -below_minimum, above_maximum, -above_maximum] {
+            assert!(!can_format_double_in_rust(value), "{value}");
+        }
         assert!(!can_format_double_in_rust(f64::MIN_POSITIVE));
         assert!(!can_format_double_in_rust(f64::INFINITY));
         assert!(!can_format_double_in_rust(f64::NAN));
+    }
+
+    #[test]
+    fn routes_double_boundary_neighbors_to_rust_or_java() {
+        let minimum = 1.0e-6_f64;
+        let below_minimum = f64::from_bits(minimum.to_bits() - 1);
+        let above_minimum = f64::from_bits(minimum.to_bits() + 1);
+        let maximum = 1.0e9_f64;
+        let below_maximum = f64::from_bits(maximum.to_bits() - 1);
+        let above_maximum = f64::from_bits(maximum.to_bits() + 1);
+        let mut java_double_bits = BTreeSet::new();
+
+        for value in [
+            minimum,
+            above_minimum,
+            -minimum,
+            -above_minimum,
+            below_maximum,
+            maximum,
+            -below_maximum,
+            -maximum,
+        ] {
+            assert!(prepare_double_value(value, &mut java_double_bits).unwrap());
+        }
+        assert!(java_double_bits.is_empty());
+
+        for value in [below_minimum, -below_minimum, above_maximum, -above_maximum] {
+            assert!(prepare_double_value(value, &mut java_double_bits).unwrap());
+        }
+        assert_eq!(
+            java_double_bits,
+            [
+                below_minimum.to_bits(),
+                (-below_minimum).to_bits(),
+                above_maximum.to_bits(),
+                (-above_maximum).to_bits(),
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
