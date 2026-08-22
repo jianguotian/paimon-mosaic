@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import posixpath
+import re
 import stat
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -60,6 +61,11 @@ MACHO_MAGICS = {
 NESTED_LICENSE_MARKERS = (
     "For Zstandard software",
     "Apache Arrow",
+)
+PUBLIC_JAVA_TYPE = re.compile(
+    r"(?m)^public\s+"
+    r"(?:(?:abstract|final|sealed|non-sealed|strictfp)\s+)*"
+    r"(?:class|interface|enum|record|@interface)\s+"
 )
 
 
@@ -363,6 +369,77 @@ def verify_classifier(path: Path, root: Path | None = None) -> None:
     print(f"verified classifier JAR: {path}")
 
 
+def java_source_files(root: Path) -> dict[str, Path]:
+    source_root = root / "java/src/main/java"
+    return {
+        path.relative_to(source_root).as_posix(): path
+        for path in source_root.rglob("*.java")
+        if path.is_file()
+    }
+
+
+def verify_sources_jar(path: Path, root: Path | None = None) -> None:
+    if root is None:
+        root = repository_root()
+    verify_classifier(path, root)
+    expected = java_source_files(root)
+    if not expected:
+        raise ValueError("repository contains no Java sources")
+    with ZipFile(path) as archive:
+        entries = validated_entries(archive)
+        packaged = {name for name in entries if name.endswith(".java")}
+        if packaged != set(expected):
+            missing = sorted(set(expected) - packaged)
+            unexpected = sorted(packaged - set(expected))
+            raise ValueError(
+                "sources JAR Java files differ from the repository sources: "
+                f"missing {missing}, unexpected {unexpected}"
+            )
+        for archive_path, source_path in expected.items():
+            if archive.read(entries[archive_path]) != source_path.read_bytes():
+                raise ValueError(
+                    f"sources JAR entry {archive_path} differs from "
+                    f"{source_path.as_posix()}"
+                )
+    print(f"verified sources JAR payload: {path}")
+
+
+def verify_javadoc_jar(path: Path, root: Path | None = None) -> None:
+    if root is None:
+        root = repository_root()
+    verify_classifier(path, root)
+    sources = java_source_files(root)
+    if not sources:
+        raise ValueError("repository contains no Java sources")
+    documented_sources = {
+        source_path
+        for source_path, path in sources.items()
+        if PUBLIC_JAVA_TYPE.search(path.read_text(encoding="utf-8"))
+    }
+    if not documented_sources:
+        raise ValueError("repository contains no public Java API")
+    required = {
+        "index.html",
+        *(
+            f"{source_path.removesuffix('.java')}.html"
+            for source_path in documented_sources
+        ),
+    }
+    with ZipFile(path) as archive:
+        entries = validated_entries(archive)
+        missing = sorted(required - entries.keys())
+        if missing:
+            raise ValueError(f"javadoc JAR is missing documentation pages: {missing}")
+        empty = sorted(
+            name
+            for name in required
+            if entries[name].is_dir() or entries[name].file_size == 0
+        )
+        if empty:
+            raise ValueError(f"javadoc JAR contains empty documentation pages: {empty}")
+    print(f"verified javadoc JAR payload: {path}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--main", required=True, type=Path)
@@ -374,8 +451,8 @@ def main() -> int:
 
     try:
         verify_main_jar(args.main, root, args.require_all_natives)
-        verify_classifier(args.sources, root)
-        verify_classifier(args.javadoc, root)
+        verify_sources_jar(args.sources, root)
+        verify_javadoc_jar(args.javadoc, root)
     except (BadZipFile, KeyError, OSError, ValueError) as error:
         print(f"Java artifact verification failed: {error}", file=sys.stderr)
         return 1

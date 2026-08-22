@@ -230,12 +230,28 @@ def encode_uleb128(value):
             return bytes(encoded)
 
 
-def build_macho_export_trie(symbols):
+def build_macho_export_trie(
+    symbols,
+    *,
+    flags=0,
+    address=0x1000,
+    resolver=None,
+    reexport_name=b"",
+):
     names = [b"_" + symbol.encode() for symbol in sorted(symbols)]
     if len(names) > 255:
         raise ValueError("test export trie has too many root children")
 
-    leaf = b"\x02\x00\x01\x00"
+    payload = encode_uleb128(flags)
+    if flags & 0x08:
+        payload += encode_uleb128(1) + reexport_name + b"\0"
+    else:
+        payload += encode_uleb128(address)
+        if flags & 0x10:
+            payload += encode_uleb128(
+                address if resolver is None else resolver
+            )
+    leaf = encode_uleb128(len(payload)) + payload + b"\0"
     root_size = 2
     for _ in range(10):
         child_offsets = [
@@ -302,6 +318,13 @@ def build_macho(
     dyld_info_export_trie_symbols=None,
     dyld_info_export_trie_data=None,
     symbol_type=0x0F,
+    symbol_value=0x1000,
+    section_flags=0x80000400,
+    segment_initial_protection=5,
+    export_trie_flags=0,
+    export_trie_address=0x1000,
+    export_trie_resolver=None,
+    export_trie_reexport_name=b"",
 ):
     symbol_list = sorted(symbols)
     segment_size = 72 + 80
@@ -322,7 +345,13 @@ def build_macho(
     if export_trie_data is not None:
         export_trie = bytes(export_trie_data)
     elif export_trie_symbols is not None:
-        export_trie = build_macho_export_trie(export_trie_symbols)
+        export_trie = build_macho_export_trie(
+            export_trie_symbols,
+            flags=export_trie_flags,
+            address=export_trie_address,
+            resolver=export_trie_resolver,
+            reexport_name=export_trie_reexport_name,
+        )
     else:
         export_trie = None
     if (
@@ -423,7 +452,7 @@ def build_macho(
         0,
         file_size,
         7,
-        5,
+        segment_initial_protection,
         1,
         0,
     )
@@ -439,7 +468,7 @@ def build_macho(
         0,
         0,
         0,
-        0x80000400,
+        section_flags,
         0,
         0,
         0,
@@ -528,7 +557,7 @@ def build_macho(
             symbol_type,
             1,
             0,
-            0x1000,
+            symbol_value,
         )
     data[strings_offset : strings_offset + len(strings)] = strings
     if export_trie:
@@ -752,8 +781,7 @@ def test_elf_rejects_dynsym_entries_beyond_dt_hash_symbol_count():
 
 
 def test_elf_rejects_an_unbounded_dynamic_symbol_table(monkeypatch):
-    # Hash membership is checked once per symbol and a single-bucket table makes
-    # each check linear, so the entry count must be bounded before that loop.
+    # Keep a hard cap as defense in depth even though hash membership is O(1).
     monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 2)
     data = build_elf()
 
@@ -910,6 +938,61 @@ def test_elf_sysv_hash_rejects_buckets_that_alias_a_chain():
 
     with pytest.raises(ValueError, match="bucket chains alias"):
         verifier.parse_elf_sysv_hash(table, section)
+
+
+@pytest.mark.parametrize("hash_style", ("sysv", "gnu"))
+def test_elf_hash_membership_accepts_each_reachable_symbol(hash_style):
+    parsed = verifier.native_binary(build_elf(hash_style=hash_style))
+
+    assert parsed.exported_symbols == JNI_SYMBOLS
+
+
+def test_elf_sysv_hash_membership_does_not_walk_the_chain():
+    class UnreadableChains:
+        def __getitem__(self, _index):
+            raise AssertionError("SysV membership walked the hash chain")
+
+    table = verifier.ElfSysvHash(
+        buckets=(1,),
+        chains=UnreadableChains(),
+        owners=(-1, 0),
+    )
+
+    assert table.contains(1, b"mosaic_writer_open")
+
+
+def test_elf_gnu_hash_membership_reads_only_the_requested_chain_entry():
+    name = b"mosaic_writer_open"
+    name_hash = verifier.elf_gnu_hash(name)
+
+    class CountingChains:
+        def __init__(self):
+            self.reads = 0
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            self.reads += 1
+            return name_hash | 1
+
+    chains = CountingChains()
+    table = verifier.ElfGnuHash(
+        symbol_offset=1,
+        bloom_shift=5,
+        bloom=(
+            (1 << (name_hash % 64))
+            | (1 << ((name_hash >> 5) % 64)),
+        ),
+        buckets=(1,),
+        chains=chains,
+        owners=(0,),
+        symbol_count=2,
+    )
+
+    assert table.contains(1, name)
+    assert chains.reads == 1
 
 
 def test_elf_does_not_accept_exports_unreachable_from_dt_gnu_hash():
@@ -1075,6 +1158,28 @@ def test_pe_rejects_duplicate_export_name_pointer():
 
 
 @pytest.mark.parametrize(
+    "target,path,data",
+    (
+        (
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+            build_elf(symbols={f"_{symbol}" for symbol in JNI_SYMBOLS}),
+        ),
+        (
+            "x86_64-pc-windows-msvc",
+            "paimon_mosaic_jni.dll",
+            build_pe(symbols={f"_{symbol}" for symbol in JNI_SYMBOLS}),
+        ),
+    ),
+)
+def test_non_macho_targets_do_not_strip_leading_underscores(
+    target, path, data
+):
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verify_jni_target(data, target, path)
+
+
+@pytest.mark.parametrize(
     "data,error",
     (
         (b"\xcf\xfa\xed\xfe", "truncated Mach-O header"),
@@ -1150,13 +1255,14 @@ def test_macho_reads_exports_from_loader_export_trie(
 def test_macho_export_trie_accumulates_multilevel_prefixes():
     # root -> "_mosaic_" -> {"open", "free"}
     root = b"\x00\x01_mosaic_\x00\x0c"
-    shared_prefix = b"\x00\x02open\x00\x1afree\x00\x1e"
-    export_leaf = b"\x02\x00\x01\x00"
+    shared_prefix = b"\x00\x02open\x00\x1afree\x00\x1f"
+    export_leaf = b"\x03\x00\x80\x20\x00"
     trie = root + shared_prefix + export_leaf + export_leaf
 
-    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == frozenset(
-        {"_mosaic_open", "_mosaic_free"}
-    )
+    assert {
+        export.name
+        for export in verifier.parse_macho_export_trie(trie, 0, len(trie))
+    } == {"_mosaic_open", "_mosaic_free"}
 
 
 def test_macho_empty_export_trie_is_authoritative():
@@ -1231,6 +1337,41 @@ def test_macho_does_not_fill_export_trie_gaps_from_symtab():
 
 
 @pytest.mark.parametrize(
+    "options",
+    (
+        {
+            "export_trie_flags": 0x08,
+            "export_trie_reexport_name": b"",
+        },
+        {"export_trie_flags": 0x02},
+        {"export_trie_flags": 0x01},
+        {"export_trie_address": 0x2000},
+        {"section_flags": 0},
+        {"section_flags": 0x80000401},
+        {"segment_initial_protection": 3},
+    ),
+    ids=(
+        "re-export",
+        "absolute",
+        "thread-local",
+        "non-executable-address",
+        "non-instruction-section",
+        "zero-fill-instruction-section",
+        "non-executable-segment",
+    ),
+)
+def test_macho_export_trie_only_accepts_direct_executable_functions(options):
+    data = build_macho(export_trie_symbols=JNI_SYMBOLS, **options)
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verify_jni_target(
+            data,
+            "aarch64-apple-darwin",
+            "libpaimon_mosaic_jni.dylib",
+        )
+
+
+@pytest.mark.parametrize(
     "export_trie,error",
     (
         (b"\x7f", "terminal.*out of bounds"),
@@ -1271,14 +1412,32 @@ def test_macho_rejects_out_of_bounds_export_trie_metadata(
 
 
 @pytest.mark.parametrize(
-    "symbol_type",
-    (0x0E, 0x1F, 0x0B, 0x0D),
-    ids=("local", "private-extern", "indirect", "prebound-undefined"),
+    "options",
+    (
+        {"symbol_type": 0x0E},
+        {"symbol_type": 0x1F},
+        {"symbol_type": 0x0B},
+        {"symbol_type": 0x0D},
+        {"symbol_type": 0x03},
+        {"section_flags": 0},
+        {"section_flags": 0x80000401},
+        {"segment_initial_protection": 3},
+        {"symbol_value": 0x2000},
+    ),
+    ids=(
+        "local",
+        "private-extern",
+        "indirect",
+        "prebound-undefined",
+        "absolute",
+        "non-instruction-section",
+        "zero-fill-instruction-section",
+        "non-executable-segment",
+        "outside-section",
+    ),
 )
-def test_macho_symtab_only_accepts_symbols_the_dylib_defines(
-    symbol_type,
-):
-    data = build_macho(symbol_type=symbol_type)
+def test_macho_symtab_only_accepts_symbols_the_dylib_defines(options):
+    data = build_macho(**options)
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
         verify_jni_target(

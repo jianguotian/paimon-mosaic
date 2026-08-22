@@ -223,6 +223,23 @@ def test_archive_verification_rejects_oversized_compressed_input_before_read(
     assert not archive.read_called
 
 
+def test_archive_verification_rejects_too_many_members_while_iterating(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "many-members.tar"
+    write_tar(
+        archive,
+        [
+            regular_file(f"{PREFIX}file-{index}.txt", str(index).encode())
+            for index in range(4)
+        ],
+    )
+    monkeypatch.setattr(verifier, "MAX_SOURCE_TAR_ENTRIES", 3)
+
+    with pytest.raises(ValueError, match="more than 3 entries"):
+        verifier.read_archive(archive, PREFIX)
+
+
 def test_archive_verification_rejects_post_flush_size_overflow(monkeypatch):
     class Archive:
         class Stat:

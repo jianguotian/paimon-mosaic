@@ -69,6 +69,11 @@ SUPPORTED_WHEELS = (
 EXPECTED_NATIVE_LIBRARY = {
     target: native_path for target, _platform_tag, native_path in SUPPORTED_WHEELS
 }
+PYTHON_MODULES = {
+    "mosaic/__init__.py": b'"""Mosaic package fixture."""\n',
+    "mosaic/_ffi.py": b"def open_native():\n    return None\n",
+    "mosaic/mosaic.py": b"class MosaicReader:\n    pass\n",
+}
 
 
 def write_zip(path, entries):
@@ -113,6 +118,7 @@ def build_wheel(
     directory_entries=None,
     native_bytes=b"native-library",
     native_path=None,
+    package_entries=None,
 ):
     dist_info_distribution = dist_info_distribution or filename_distribution
     dist_info_version = dist_info_version or filename_version
@@ -149,6 +155,7 @@ def build_wheel(
 
     native_path = native_path or EXPECTED_NATIVE_LIBRARY[target]
     contents = {
+        **(PYTHON_MODULES if package_entries is None else package_entries),
         "mosaic/LICENSE": license_text,
         "mosaic/NOTICE": notice_text,
         "mosaic/THIRD-PARTY-LICENSES.html": report_text,
@@ -178,6 +185,11 @@ def build_wheel(
     legal_root.mkdir(parents=True, exist_ok=True)
     for name, content in legal_files.items():
         (legal_root / name).write_bytes(content)
+    package_root = root / "python"
+    for name, content in PYTHON_MODULES.items():
+        source = package_root / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(content)
     return wheel, root
 
 
@@ -666,6 +678,26 @@ def test_verify_wheel_requires_artifact_exact_legal_files(
     )
 
     with pytest.raises(ValueError, match="does not match"):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_requires_python_modules(tmp_path, monkeypatch):
+    wheel, root = build_wheel(tmp_path, package_entries={})
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match="Python modules differ"):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_requires_artifact_exact_python_modules(
+    tmp_path, monkeypatch
+):
+    changed = dict(PYTHON_MODULES)
+    changed["mosaic/mosaic.py"] = b"class DifferentImplementation:\n    pass\n"
+    wheel, root = build_wheel(tmp_path, package_entries=changed)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match=r"mosaic/mosaic\.py does not match"):
         verifier.verify_wheel(wheel, root)
 
 

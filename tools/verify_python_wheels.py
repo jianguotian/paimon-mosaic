@@ -343,6 +343,34 @@ def require_equal(actual: bytes, expected_path: Path, archive_path: str) -> None
         )
 
 
+def verify_python_modules(
+    archive: ZipFile, file_names: set[str], root: Path
+) -> None:
+    package_root = root / "python/mosaic"
+    expected = {
+        path.relative_to(root / "python").as_posix(): path
+        for path in package_root.rglob("*.py")
+        if path.is_file()
+    }
+    if not expected:
+        raise ValueError("repository Python package contains no modules")
+
+    packaged = {
+        name
+        for name in file_names
+        if name.startswith("mosaic/") and name.endswith(".py")
+    }
+    if packaged != set(expected):
+        missing = sorted(set(expected) - packaged)
+        unexpected = sorted(packaged - set(expected))
+        raise ValueError(
+            "wheel Python modules differ from the repository package: "
+            f"missing {missing}, unexpected {unexpected}"
+        )
+    for archive_path, source_path in expected.items():
+        require_equal(archive.read(archive_path), source_path, archive_path)
+
+
 def verify_wheel(wheel: Path, root: Path) -> str:
     filename_distribution, filename_version, filename_tags = parse_wheel_filename(
         wheel.name
@@ -412,6 +440,7 @@ def verify_wheel(wheel: Path, root: Path) -> str:
 
         for archive_path, expected_path in {**package_legal, **standard_legal}.items():
             require_equal(archive.read(archive_path), expected_path, archive_path)
+        verify_python_modules(archive, file_names, root)
 
         native_entries = []
         for info in archive.infolist():

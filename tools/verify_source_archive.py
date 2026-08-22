@@ -50,6 +50,7 @@ SOURCE_PATHSPECS = (
 
 WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 MAX_SOURCE_TAR_SIZE = 512 * 1024 * 1024
+MAX_SOURCE_TAR_ENTRIES = 65536
 
 
 @dataclass(frozen=True)
@@ -207,7 +208,12 @@ def archive_entries(archive: tarfile.TarFile, prefix: str) -> dict[str, ArchiveE
     prefix_root = validated_prefix(prefix)
     entries: dict[str, ArchiveEntry] = {}
     normalized_names: dict[str, str] = {}
-    for member in archive.getmembers():
+    for member_count, member in enumerate(archive, 1):
+        if member_count > MAX_SOURCE_TAR_ENTRIES:
+            raise ValueError(
+                "source archive declares more than "
+                f"{MAX_SOURCE_TAR_ENTRIES} entries"
+            )
         if member.isfile():
             kind = "file"
         elif member.isdir():

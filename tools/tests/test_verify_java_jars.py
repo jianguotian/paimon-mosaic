@@ -98,6 +98,29 @@ class VerifyJavaJarsTest(unittest.TestCase):
             *extra_entries,
         ]
 
+    def prepare_classifier_payloads(
+        self,
+    ) -> tuple[list[tuple[str | ZipInfo, bytes]], list[tuple[str | ZipInfo, bytes]]]:
+        source_root = self.root / "java/src/main/java"
+        source = source_root / "org/apache/paimon/mosaic/Example.java"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source_contents = (
+            b"package org.apache.paimon.mosaic;\n"
+            b"public class Example {}\n"
+        )
+        source.write_bytes(source_contents)
+        sources = self.classifier_entries(
+            ("org/apache/paimon/mosaic/Example.java", source_contents)
+        )
+        javadoc = self.classifier_entries(
+            ("index.html", b"<html>index</html>\n"),
+            (
+                "org/apache/paimon/mosaic/Example.html",
+                b"<html>Example</html>\n",
+            ),
+        )
+        return sources, javadoc
+
     def prepare_main_jar_fixture(
         self, native_entries: Iterable[str]
     ) -> list[tuple[str, bytes]]:
@@ -520,8 +543,9 @@ class VerifyJavaJarsTest(unittest.TestCase):
             "main.jar",
             self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES),
         )
-        sources = self.write_jar("sources.jar", self.classifier_entries())
-        javadoc = self.write_jar("javadoc.jar", self.classifier_entries())
+        source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        sources = self.write_jar("sources.jar", source_entries)
+        javadoc = self.write_jar("javadoc.jar", javadoc_entries)
         arguments = [
             "verify_java_jars.py",
             "--main",
@@ -556,6 +580,46 @@ class VerifyJavaJarsTest(unittest.TestCase):
                 with mock.patch.object(sys, "argv", broken_arguments):
                     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                         self.assertEqual(verify_java_jars.main(), 1)
+
+    def test_sources_and_javadoc_classifiers_require_real_payloads(self) -> None:
+        self.prepare_classifier_payloads()
+        empty = self.write_jar("empty-classifier.jar", self.classifier_entries())
+
+        with self.assertRaisesRegex(ValueError, "sources JAR Java files differ"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_sources_jar(empty, self.root)
+        with self.assertRaisesRegex(ValueError, "missing documentation pages"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_javadoc_jar(empty, self.root)
+
+    def test_sources_jar_must_match_repository_sources(self) -> None:
+        source_entries, _javadoc_entries = self.prepare_classifier_payloads()
+        changed = [
+            (
+                name,
+                b"package org.apache.paimon.mosaic; public class Changed {}\n"
+                if name == "org/apache/paimon/mosaic/Example.java"
+                else contents,
+            )
+            for name, contents in source_entries
+        ]
+        path = self.write_jar("changed-sources.jar", changed)
+
+        with self.assertRaisesRegex(ValueError, "differs from"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_sources_jar(path, self.root)
+
+    def test_javadoc_pages_must_not_be_empty(self) -> None:
+        _source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        empty_index = [
+            (name, b"" if name == "index.html" else contents)
+            for name, contents in javadoc_entries
+        ]
+        path = self.write_jar("empty-javadoc-page.jar", empty_index)
+
+        with self.assertRaisesRegex(ValueError, "empty documentation pages"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_javadoc_jar(path, self.root)
 
     def test_main_fails_closed_on_non_zip_artifact(self) -> None:
         # A truncated / non-zip JAR raises zipfile.BadZipFile. It must be caught
