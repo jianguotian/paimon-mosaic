@@ -392,6 +392,7 @@ def test_main_fails_closed_on_non_zip_wheel(tmp_path, monkeypatch, capsys):
     (
         "/mosaic/file.py",
         "C:/mosaic/file.py",
+        "C:../site-packages_evil/payload.py",
         "mosaic\\file.py",
         "mosaic/../file.py",
     ),

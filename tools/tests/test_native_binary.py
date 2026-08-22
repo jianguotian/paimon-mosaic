@@ -793,6 +793,48 @@ def test_elf_rejects_an_unbounded_dynamic_symbol_table(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    ("format_name", "data"),
+    (
+        ("PE", build_pe()),
+        ("Mach-O", build_macho()),
+    ),
+    ids=("pe", "macho"),
+)
+def test_pe_and_macho_reject_unbounded_symbol_tables(
+    monkeypatch, format_name, data
+):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 2)
+
+    with pytest.raises(
+        ValueError, match=rf"{format_name}.*more than 2 symbols"
+    ):
+        verifier.native_binary(data)
+
+
+@pytest.mark.parametrize(
+    ("format_name", "data"),
+    (
+        ("ELF", build_elf()),
+        ("PE", build_pe()),
+        ("Mach-O", build_macho()),
+    ),
+    ids=("elf", "pe", "macho"),
+)
+def test_native_symbol_name_scans_obey_a_common_budget(
+    monkeypatch, format_name, data
+):
+    # Every fixture name fits individually, but their cumulative scan does not.
+    # This kills implementations that cap one name without charging the loop.
+    monkeypatch.setattr(verifier, "MAX_SYMBOL_STRING_BYTES", 100)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{format_name}.*symbol names.*string scan budget",
+    ):
+        verifier.native_binary(data)
+
+
 def test_elf_does_not_accept_exports_unreachable_from_dt_hash():
     data = build_elf(hash_reachable=False)
 

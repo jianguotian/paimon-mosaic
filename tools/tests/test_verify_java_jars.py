@@ -29,7 +29,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 from unittest import mock
-from zipfile import ZipFile, ZipInfo
+from zipfile import BadZipFile, ZipFile, ZipInfo
 
 
 TOOLS_DIRECTORY = Path(__file__).resolve().parent.parent
@@ -298,6 +298,29 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "binary-only"):
             self.verify_classifier(malformed)
+
+    def test_classifier_reads_every_member_to_verify_its_crc(self) -> None:
+        path = self.write_jar(
+            "corrupt-resource.jar",
+            self.classifier_entries(("resource.bin", b"A" * (512 * 1024))),
+        )
+        with ZipFile(path) as archive:
+            info = archive.getinfo("resource.bin")
+        with path.open("r+b") as file:
+            file.seek(info.header_offset + 26)
+            name_length = int.from_bytes(file.read(2), "little")
+            extra_length = int.from_bytes(file.read(2), "little")
+            file.seek(
+                info.header_offset
+                + 30
+                + name_length
+                + extra_length
+                + 256 * 1024
+            )
+            file.write(b"B")
+
+        with self.assertRaisesRegex(BadZipFile, "Bad CRC-32"):
+            self.verify_classifier(path)
 
     def test_oversized_java_class_is_not_fully_read(self) -> None:
         class RecordingSource(BytesIO):

@@ -58,7 +58,7 @@ NESTED_LICENSE_MARKERS = (
     "Apache Arrow",
 )
 
-WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:/")
+WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 MACHO_MAGICS = {
     b"\xfe\xed\xfa\xce",
     b"\xce\xfa\xed\xfe",
@@ -197,8 +197,10 @@ def validate_archive_paths(archive: ZipFile) -> set[str]:
             raise ValueError(f"invalid wheel entry path: {raw_name!r}")
         if "\\" in raw_name:
             raise ValueError(f"wheel entry uses a backslash: {raw_name!r}")
-        if raw_name.startswith("/") or WINDOWS_ABSOLUTE_PATH.match(raw_name):
-            raise ValueError(f"wheel entry uses an absolute path: {raw_name!r}")
+        if raw_name.startswith("/") or WINDOWS_DRIVE_PATH.match(raw_name):
+            raise ValueError(
+                f"wheel entry uses an absolute or drive-qualified path: {raw_name!r}"
+            )
         if ".." in raw_name.split("/"):
             raise ValueError(f"wheel entry uses '..': {raw_name!r}")
         if stat.S_ISLNK(info.external_attr >> 16):

@@ -34,6 +34,7 @@ MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
 MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 65536
 MAX_JAVA_CLASS_SIZE = 16 * 1024 * 1024
+ARCHIVE_READ_CHUNK_SIZE = 1024 * 1024
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -132,6 +133,16 @@ def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
 
         entries[name] = info
         normalized_names[normalized_name] = name
+
+    # ZipExtFile validates a member's CRC only when it is read through EOF.
+    # Header-only format detection below is therefore insufficient for ordinary
+    # resources, so stream every bounded member once before accepting the JAR.
+    for info in infos:
+        if info.is_dir():
+            continue
+        with archive.open(info) as source:
+            while source.read(ARCHIVE_READ_CHUNK_SIZE):
+                pass
     return entries
 
 

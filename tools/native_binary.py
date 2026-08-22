@@ -43,9 +43,12 @@ MACHO_CPU_ARCHITECTURE = {
     0x0100000C: "aarch64",
 }
 
-# A Mosaic native library exports on the order of a hundred symbols; the bound
-# exists to keep hostile input from driving quadratic hash-membership work.
+# A Mosaic native library exports on the order of a hundred symbols; keep all
+# format-specific symbol loops within one shared defensive work bound.
 MAX_DYNAMIC_SYMBOLS = 100_000
+# Bound the cumulative bytes searched while resolving symbol names so many
+# overlapping offsets cannot turn a bounded symbol table into quadratic work.
+MAX_SYMBOL_STRING_BYTES = 16 * 1024 * 1024
 
 MOSAIC_SYMBOL_FAMILIES = {
     "JNI": {
@@ -139,6 +142,28 @@ class MachoExport:
     flags: int
     address: int | None
     resolver: int | None
+
+
+@dataclass
+class CStringScanBudget:
+    description: str
+    remaining: int
+
+    def read(
+        self, data: bytes, offset: int, limit: int, description: str
+    ) -> bytes:
+        if offset < 0 or offset >= limit or limit > len(data):
+            raise ValueError(f"{description} is out of bounds")
+        scan_limit = min(limit, offset + self.remaining)
+        terminator = data.find(b"\0", offset, scan_limit)
+        if terminator < 0:
+            if scan_limit < limit:
+                raise ValueError(
+                    f"{self.description} exceed the string scan budget"
+                )
+            raise ValueError(f"{description} is not null-terminated")
+        self.remaining -= terminator - offset + 1
+        return data[offset:terminator]
 
 
 def require_range(data: bytes, offset: int, size: int, description: str) -> None:
@@ -779,6 +804,9 @@ def parse_elf(data: bytes) -> NativeBinary | None:
     string_limit = string_offset + string_size
 
     exported_symbols = set()
+    symbol_names = CStringScanBudget(
+        "ELF dynamic symbol names", MAX_SYMBOL_STRING_BYTES
+    )
     for symbol_index in range(symbol_section.size // symbol_entry_size):
         entry_offset = symbol_section.offset + symbol_index * symbol_entry_size
         (
@@ -812,7 +840,7 @@ def parse_elf(data: bytes) -> NativeBinary | None:
             executable_load_segments,
             f"ELF dynamic symbol {symbol_index} function",
         )
-        raw_name = c_string_bytes(
+        raw_name = symbol_names.read(
             data,
             string_offset + name_offset,
             string_limit,
@@ -1037,6 +1065,11 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                 names_rva,
                 ordinals_rva,
             ) = struct.unpack_from("<IIHHIIIIIII", data, export_offset)
+            if name_count > MAX_DYNAMIC_SYMBOLS:
+                raise ValueError(
+                    "PE export directory declares more than "
+                    f"{MAX_DYNAMIC_SYMBOLS} symbols"
+                )
             if name_count > function_count:
                 raise ValueError(
                     "PE export directory has more names than functions"
@@ -1089,6 +1122,9 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                 )
 
             previous_name = None
+            symbol_names = CStringScanBudget(
+                "PE export symbol names", MAX_SYMBOL_STRING_BYTES
+            )
             for index in range(name_count):
                 ordinal = struct.unpack_from(
                     "<H", data, ordinals_offset + index * 2
@@ -1114,7 +1150,7 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                     len(data),
                     f"PE export name {index}",
                 )
-                raw_name = c_string_bytes(
+                raw_name = symbol_names.read(
                     data,
                     name_offset,
                     name_offset + name_available,
@@ -1131,7 +1167,7 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                 if export_rva <= function_rva < export_rva + export_size:
                     forwarder_offset = export_offset + function_rva - export_rva
                     forwarder = ascii_symbol(
-                        c_string_bytes(
+                        symbol_names.read(
                             data,
                             forwarder_offset,
                             export_offset + export_size,
@@ -1473,6 +1509,11 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 strings_offset,
                 strings_size,
             ) = struct.unpack_from("<IIIIII", data, command_offset)
+            if symbol_count > MAX_DYNAMIC_SYMBOLS:
+                raise ValueError(
+                    "Mach-O symbol table declares more than "
+                    f"{MAX_DYNAMIC_SYMBOLS} symbols"
+                )
             require_range(
                 data,
                 symbols_offset,
@@ -1604,6 +1645,9 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
             strings_size,
         ) = symbol_table
         strings_end = strings_offset + strings_size
+        symbol_names = CStringScanBudget(
+            "Mach-O symbol names", MAX_SYMBOL_STRING_BYTES
+        )
         for index in range(symbol_count):
             offset = symbols_offset + index * 16
             name_offset, symbol_type, symbol_section, _description, value = (
@@ -1630,7 +1674,7 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
             ):
                 continue
             name = ascii_symbol(
-                c_string_bytes(
+                symbol_names.read(
                     data,
                     strings_offset + name_offset,
                     strings_end,

@@ -343,26 +343,36 @@ def revoke_key(home: Path, fingerprint: str) -> None:
 
 
 def test_tag_signed_by_a_revoked_key_is_rejected(tmp_path):
-    root = Path(tmp_path).resolve()
-    home, fingerprint, keys = generate_key(root, "Compromised Release")
     repo = repository(tmp_path)
-    sign_tag(repo, "v5.0.0-rc1", home, fingerprint)
+    with tempfile.TemporaryDirectory(
+        prefix="pm-revoked-", dir=short_temporary_root()
+    ) as directory:
+        root = Path(directory).resolve()
+        home, fingerprint, keys = generate_key(root, "Compromised Release")
+        assert home.parent.parent == short_temporary_root()
+        assert len(str(home / "S.gpg-agent")) < GPG_AGENT_SOCKET_LIMIT
+        sign_tag(repo, "v5.0.0-rc1", home, fingerprint)
 
-    # The key is revoked only after it signed the tag, and the revocation reaches
-    # the verifier the way ASF distributes it: inside the published KEYS file.
-    revoke_key(home, fingerprint)
-    env = os.environ.copy()
-    env["GNUPGHOME"] = str(home)
-    keys.write_text(
-        run(["gpg", "--batch", "--armor", "--export", fingerprint], cwd=root, env=env)
-        + "\n",
-        encoding="utf-8",
-    )
+        # The key is revoked only after it signed the tag, and the revocation reaches
+        # the verifier the way ASF distributes it: inside the published KEYS file.
+        revoke_key(home, fingerprint)
+        env = os.environ.copy()
+        env["GNUPGHOME"] = str(home)
+        keys.write_text(
+            run(
+                ["gpg", "--batch", "--armor", "--export", fingerprint],
+                cwd=root,
+                env=env,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
-    with pytest.raises(
-        validator.TagValidationError, match="is not trusted: GnuPG reported REVKEYSIG"
-    ):
-        validator.validate_release_tag(repo, "v5.0.0-rc1", keys)
+        with pytest.raises(
+            validator.TagValidationError,
+            match="is not trusted: GnuPG reported REVKEYSIG",
+        ):
+            validator.validate_release_tag(repo, "v5.0.0-rc1", keys)
 
 
 @pytest.mark.parametrize("status", ["EXPKEYSIG", "EXPSIG"])

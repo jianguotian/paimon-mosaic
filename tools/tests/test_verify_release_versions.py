@@ -45,7 +45,7 @@ PACKAGE_NAMES = {
 class VerifyReleaseVersionsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary_directory.name)
+        self.root = Path(self.temporary_directory.name).resolve()
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
