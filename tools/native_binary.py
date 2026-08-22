@@ -49,6 +49,10 @@ MAX_DYNAMIC_SYMBOLS = 100_000
 # Bound the cumulative bytes searched while resolving symbol names so many
 # overlapping offsets cannot turn a bounded symbol table into quadratic work.
 MAX_SYMBOL_STRING_BYTES = 16 * 1024 * 1024
+# Bound each independent source of work while traversing a Mach-O export trie.
+MAX_MACHO_EXPORT_TRIE_NODES = MAX_DYNAMIC_SYMBOLS
+MAX_MACHO_EXPORT_TRIE_STRING_BYTES = MAX_SYMBOL_STRING_BYTES
+MAX_MACHO_EXPORT_TRIE_PREFIX_BYTES = MAX_SYMBOL_STRING_BYTES
 
 MOSAIC_SYMBOL_FAMILIES = {
     "JNI": {
@@ -1222,6 +1226,11 @@ def parse_macho_export_trie(
     exports = []
     active_nodes = set()
     visited_nodes = set()
+    string_bytes = CStringScanBudget(
+        "Mach-O export trie edge and re-export names",
+        MAX_MACHO_EXPORT_TRIE_STRING_BYTES,
+    )
+    prefix_bytes_remaining = MAX_MACHO_EXPORT_TRIE_PREFIX_BYTES
     stack = [(False, 0, b"")]
     while stack:
         leaving, node_offset, prefix = stack.pop()
@@ -1233,6 +1242,10 @@ def parse_macho_export_trie(
         if node_offset in visited_nodes:
             raise ValueError(
                 "Mach-O export trie references a node more than once"
+            )
+        if len(visited_nodes) >= MAX_MACHO_EXPORT_TRIE_NODES:
+            raise ValueError(
+                "Mach-O export trie node visits exceed the budget"
             )
         if node_offset >= trie_size:
             raise ValueError(
@@ -1275,7 +1288,7 @@ def parse_macho_export_trie(
                     terminal_end,
                     "Mach-O export trie re-export ordinal",
                 )
-                import_name = c_string_bytes(
+                import_name = string_bytes.read(
                     data,
                     cursor,
                     terminal_end,
@@ -1317,7 +1330,7 @@ def parse_macho_export_trie(
         child_edges = set()
         children = []
         for child_index in range(child_count):
-            edge = c_string_bytes(
+            edge = string_bytes.read(
                 data,
                 cursor,
                 trie_end,
@@ -1343,11 +1356,18 @@ def parse_macho_export_trie(
                 raise ValueError(
                     "Mach-O export trie child offset is out of bounds"
                 )
-            child_prefix = prefix + edge
-            if len(child_prefix) > trie_size:
+            child_prefix_size = len(prefix) + len(edge)
+            if child_prefix_size > trie_size:
                 raise ValueError(
                     "Mach-O export trie symbol path is unreasonably long"
                 )
+            if child_prefix_size > prefix_bytes_remaining:
+                raise ValueError(
+                    "Mach-O export trie prefix construction exceeds "
+                    "the work budget"
+                )
+            prefix_bytes_remaining -= child_prefix_size
+            child_prefix = prefix + edge
             children.append((child_offset, child_prefix))
 
         for child_offset, child_prefix in reversed(children):

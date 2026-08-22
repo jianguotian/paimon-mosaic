@@ -1181,6 +1181,41 @@ def test_pe_accepts_required_functions_with_unrelated_forwarder():
     assert verifier.native_binary(data).exported_symbols == frozenset(JNI_SYMBOLS)
 
 
+def test_pe_forwarder_shares_export_name_string_scan_budget(monkeypatch):
+    unrelated = "zz_unrelated_forwarder"
+    forwarder = "KERNEL32.Sleep"
+    symbols = JNI_SYMBOLS | {unrelated}
+    ordinary_name_bytes = sum(len(symbol.encode()) + 1 for symbol in symbols)
+    forwarder_bytes = len(forwarder.encode()) + 1
+    monkeypatch.setattr(
+        verifier,
+        "MAX_SYMBOL_STRING_BYTES",
+        ordinary_name_bytes + forwarder_bytes - 1,
+    )
+    data = build_pe(
+        symbols=symbols,
+        symbol_forwarders={unrelated: forwarder},
+    )
+
+    with pytest.raises(ValueError, match="PE export symbol names.*budget"):
+        verifier.native_binary(data)
+
+
+def test_pe_forwarder_accepts_exact_string_scan_budget(monkeypatch):
+    unrelated = "zz_unrelated_forwarder"
+    forwarder = "KERNEL32.Sleep"
+    symbols = JNI_SYMBOLS | {unrelated}
+    exact_budget = sum(len(symbol.encode()) + 1 for symbol in symbols)
+    exact_budget += len(forwarder.encode()) + 1
+    monkeypatch.setattr(verifier, "MAX_SYMBOL_STRING_BYTES", exact_budget)
+    data = build_pe(
+        symbols=symbols,
+        symbol_forwarders={unrelated: forwarder},
+    )
+
+    assert verifier.native_binary(data).exported_symbols == frozenset(JNI_SYMBOLS)
+
+
 def test_pe_rejects_unsorted_export_name_pointer_table():
     data = build_pe(
         export_name_order=list(reversed(sorted(JNI_SYMBOLS)))
@@ -1305,6 +1340,77 @@ def test_macho_export_trie_accumulates_multilevel_prefixes():
         export.name
         for export in verifier.parse_macho_export_trie(trie, 0, len(trie))
     } == {"_mosaic_open", "_mosaic_free"}
+
+
+def test_macho_export_trie_rejects_node_visits_over_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_NODES", 1, raising=False
+    )
+    trie = b"\x00\x01a\x00\x05\x00\x00"
+
+    with pytest.raises(ValueError, match="node visits.*budget"):
+        verifier.parse_macho_export_trie(trie, 0, len(trie))
+
+
+def test_macho_export_trie_accepts_node_visits_at_exact_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_NODES", 2, raising=False
+    )
+    trie = b"\x00\x01a\x00\x05\x00\x00"
+
+    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == ()
+
+
+def test_macho_export_trie_shares_edge_and_reexport_byte_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_STRING_BYTES", 3, raising=False
+    )
+    trie = b"\x00\x01a\x00\x05\x04\x08\x01b\x00\x00"
+
+    with pytest.raises(ValueError, match="edge and re-export names.*budget"):
+        verifier.parse_macho_export_trie(trie, 0, len(trie))
+
+
+def test_macho_export_trie_accepts_strings_at_exact_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_STRING_BYTES", 4, raising=False
+    )
+    trie = b"\x00\x01a\x00\x05\x04\x08\x01b\x00\x00"
+
+    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == (
+        verifier.MachoExport("a", 0x08, None, None),
+    )
+
+
+def test_macho_export_trie_rejects_prefix_work_over_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_PREFIX_BYTES", 9, raising=False
+    )
+    trie = (
+        b"\x00\x01a\x00\x05"
+        b"\x00\x01b\x00\x0a"
+        b"\x00\x01c\x00\x0f"
+        b"\x00\x01d\x00\x14"
+        b"\x00\x00"
+    )
+
+    with pytest.raises(ValueError, match="prefix construction.*budget"):
+        verifier.parse_macho_export_trie(trie, 0, len(trie))
+
+
+def test_macho_export_trie_accepts_prefix_work_at_exact_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_PREFIX_BYTES", 10, raising=False
+    )
+    trie = (
+        b"\x00\x01a\x00\x05"
+        b"\x00\x01b\x00\x0a"
+        b"\x00\x01c\x00\x0f"
+        b"\x00\x01d\x00\x14"
+        b"\x00\x00"
+    )
+
+    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == ()
 
 
 def test_macho_empty_export_trie_is_authoritative():

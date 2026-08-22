@@ -348,34 +348,40 @@ def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
     print(f"verified main JAR: {path}")
 
 
+def _verify_classifier_entries(
+    archive: ZipFile, entries: dict[str, ZipInfo], root: Path
+) -> None:
+    for required in ("META-INF/LICENSE", "META-INF/NOTICE"):
+        if required not in entries:
+            raise ValueError(f"missing {required}")
+
+    expected_license = (root / "LICENSE").read_bytes()
+    if archive.read(entries["META-INF/LICENSE"]) != expected_license:
+        raise ValueError("classifier LICENSE differs from repository root LICENSE")
+    expected_notice = (root / "NOTICE").read_bytes()
+    if archive.read(entries["META-INF/NOTICE"]) != expected_notice:
+        raise ValueError("classifier NOTICE differs from repository root NOTICE")
+
+    forbidden = sorted(
+        name
+        for name in entries
+        if name.startswith("native/")
+        or name == "META-INF/DEPENDENCIES.rust.tsv"
+        or posixpath.basename(name) == "THIRD-PARTY-LICENSES.html"
+    )
+    forbidden.extend(
+        sorted(native_archive_entries(archive, entries) - set(forbidden))
+    )
+    if forbidden:
+        raise ValueError(f"classifier contains binary-only files: {forbidden}")
+
+
 def verify_classifier(path: Path, root: Path | None = None) -> None:
     if root is None:
         root = repository_root()
     with ZipFile(path) as archive:
         entries = validated_entries(archive)
-        for required in ("META-INF/LICENSE", "META-INF/NOTICE"):
-            if required not in entries:
-                raise ValueError(f"missing {required}")
-
-        expected_license = (root / "LICENSE").read_bytes()
-        if archive.read(entries["META-INF/LICENSE"]) != expected_license:
-            raise ValueError("classifier LICENSE differs from repository root LICENSE")
-        expected_notice = (root / "NOTICE").read_bytes()
-        if archive.read(entries["META-INF/NOTICE"]) != expected_notice:
-            raise ValueError("classifier NOTICE differs from repository root NOTICE")
-
-        forbidden = sorted(
-            name
-            for name in entries
-            if name.startswith("native/")
-            or name == "META-INF/DEPENDENCIES.rust.tsv"
-            or posixpath.basename(name) == "THIRD-PARTY-LICENSES.html"
-        )
-        forbidden.extend(
-            sorted(native_archive_entries(archive, entries) - set(forbidden))
-        )
-        if forbidden:
-            raise ValueError(f"classifier contains binary-only files: {forbidden}")
+        _verify_classifier_entries(archive, entries, root)
 
     print(f"verified classifier JAR: {path}")
 
@@ -392,12 +398,13 @@ def java_source_files(root: Path) -> dict[str, Path]:
 def verify_sources_jar(path: Path, root: Path | None = None) -> None:
     if root is None:
         root = repository_root()
-    verify_classifier(path, root)
-    expected = java_source_files(root)
-    if not expected:
-        raise ValueError("repository contains no Java sources")
     with ZipFile(path) as archive:
         entries = validated_entries(archive)
+        _verify_classifier_entries(archive, entries, root)
+        print(f"verified classifier JAR: {path}")
+        expected = java_source_files(root)
+        if not expected:
+            raise ValueError("repository contains no Java sources")
         packaged = {name for name in entries if name.endswith(".java")}
         if packaged != set(expected):
             missing = sorted(set(expected) - packaged)
@@ -418,26 +425,27 @@ def verify_sources_jar(path: Path, root: Path | None = None) -> None:
 def verify_javadoc_jar(path: Path, root: Path | None = None) -> None:
     if root is None:
         root = repository_root()
-    verify_classifier(path, root)
-    sources = java_source_files(root)
-    if not sources:
-        raise ValueError("repository contains no Java sources")
-    documented_sources = {
-        source_path
-        for source_path, path in sources.items()
-        if PUBLIC_JAVA_TYPE.search(path.read_text(encoding="utf-8"))
-    }
-    if not documented_sources:
-        raise ValueError("repository contains no public Java API")
-    required = {
-        "index.html",
-        *(
-            f"{source_path.removesuffix('.java')}.html"
-            for source_path in documented_sources
-        ),
-    }
     with ZipFile(path) as archive:
         entries = validated_entries(archive)
+        _verify_classifier_entries(archive, entries, root)
+        print(f"verified classifier JAR: {path}")
+        sources = java_source_files(root)
+        if not sources:
+            raise ValueError("repository contains no Java sources")
+        documented_sources = {
+            source_path
+            for source_path, source in sources.items()
+            if PUBLIC_JAVA_TYPE.search(source.read_text(encoding="utf-8"))
+        }
+        if not documented_sources:
+            raise ValueError("repository contains no public Java API")
+        required = {
+            "index.html",
+            *(
+                f"{source_path.removesuffix('.java')}.html"
+                for source_path in documented_sources
+            ),
+        }
         missing = sorted(required - entries.keys())
         if missing:
             raise ValueError(f"javadoc JAR is missing documentation pages: {missing}")

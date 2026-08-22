@@ -300,9 +300,10 @@ class VerifyJavaJarsTest(unittest.TestCase):
             self.verify_classifier(malformed)
 
     def test_classifier_reads_every_member_to_verify_its_crc(self) -> None:
+        payload_size = verify_java_jars.ARCHIVE_READ_CHUNK_SIZE + 64 * 1024
         path = self.write_jar(
             "corrupt-resource.jar",
-            self.classifier_entries(("resource.bin", b"A" * (512 * 1024))),
+            self.classifier_entries(("resource.bin", b"A" * payload_size)),
         )
         with ZipFile(path) as archive:
             info = archive.getinfo("resource.bin")
@@ -315,7 +316,8 @@ class VerifyJavaJarsTest(unittest.TestCase):
                 + 30
                 + name_length
                 + extra_length
-                + 256 * 1024
+                + verify_java_jars.ARCHIVE_READ_CHUNK_SIZE
+                + 32 * 1024
             )
             file.write(b"B")
 
@@ -603,6 +605,32 @@ class VerifyJavaJarsTest(unittest.TestCase):
                 with mock.patch.object(sys, "argv", broken_arguments):
                     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                         self.assertEqual(verify_java_jars.main(), 1)
+
+    def test_sources_and_javadoc_validate_each_archive_once(self) -> None:
+        source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        cases = (
+            (
+                "sources",
+                self.write_jar("sources-single-pass.jar", source_entries),
+                verify_java_jars.verify_sources_jar,
+            ),
+            (
+                "javadoc",
+                self.write_jar("javadoc-single-pass.jar", javadoc_entries),
+                verify_java_jars.verify_javadoc_jar,
+            ),
+        )
+
+        for case, path, verifier in cases:
+            with self.subTest(case=case):
+                with mock.patch.object(
+                    verify_java_jars,
+                    "validated_entries",
+                    wraps=verify_java_jars.validated_entries,
+                ) as validate:
+                    with redirect_stdout(StringIO()):
+                        verifier(path, self.root)
+                self.assertEqual(validate.call_count, 1)
 
     def test_sources_and_javadoc_classifiers_require_real_payloads(self) -> None:
         self.prepare_classifier_payloads()
