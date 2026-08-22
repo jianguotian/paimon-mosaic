@@ -79,14 +79,8 @@ python3 tools/verify_release_versions.py \
   --update-cargo "$OLD_VERSION_CLEAN" "$NEW_VERSION_CLEAN"
 
 # Change version in pyproject.toml.
-export NEW_VERSION_CLEAN
-perl -pi -e '
-  BEGIN {
-    $old = quotemeta($ENV{"OLD_VERSION_CLEAN"});
-    $new = $ENV{"NEW_VERSION_CLEAN"};
-  }
-  s{^version = "${old}"$}{version = "${new}"};
-' python/pyproject.toml
+python3 tools/verify_release_versions.py \
+  --update-python "$OLD_VERSION_CLEAN" "$NEW_VERSION_CLEAN"
 
 # Refresh the lockfile without upgrading registry dependencies, then regenerate
 # every checked-in report containing workspace package versions.

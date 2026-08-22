@@ -283,6 +283,49 @@ class VerifyReleaseVersionsTest(unittest.TestCase):
         self.assertIn("requires 0.3.0", failures[0])
         self.assertIn("does not accept 0.4.0", failures[0])
 
+    def test_updates_python_project_version_structurally_and_idempotently(
+        self,
+    ) -> None:
+        (self.root / "python").mkdir()
+        pyproject = self.root / "python/pyproject.toml"
+        pyproject.write_text(
+            '[build-system]\nrequires = ["setuptools==0.3.0"]\n'
+            "\n[project]\n"
+            'name = "paimon-mosaic"\n'
+            'version = "0.3.0" # keep formatting\n'
+            '\n[tool.example]\nversion = "0.3.0"\n',
+            encoding="utf-8",
+        )
+
+        updated = verify_release_versions.update_python_version(
+            self.root, "0.3.0", "0.4.0"
+        )
+        first = pyproject.read_text(encoding="utf-8")
+        verify_release_versions.update_python_version(
+            self.root, "0.3.0", "0.4.0"
+        )
+
+        self.assertEqual(updated, pyproject)
+        self.assertEqual(pyproject.read_text(encoding="utf-8"), first)
+        self.assertIn('version = "0.4.0" # keep formatting', first)
+        self.assertIn('version = "0.3.0"\n', first)
+        self.assertIn('setuptools==0.3.0', first)
+
+    def test_python_update_rejects_version_outside_retry_window(self) -> None:
+        (self.root / "python").mkdir()
+        pyproject = self.root / "python/pyproject.toml"
+        pyproject.write_text(
+            '[project]\nversion = "9.9.9"\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "expected project version"):
+            verify_release_versions.update_python_version(
+                self.root, "0.3.0", "0.4.0"
+            )
+
+        self.assertIn("9.9.9", pyproject.read_text(encoding="utf-8"))
+
     def test_path_dependency_failures_accepts_a_symlinked_root(self) -> None:
         canonical_root = self.root / "canonical"
         canonical_root.mkdir()
@@ -464,6 +507,38 @@ class VerifyReleaseVersionsTest(unittest.TestCase):
             verify_release_versions,
             "update_cargo_versions",
             side_effect=ValueError("stale manifest"),
+        ) as update:
+            with mock.patch.object(sys, "argv", arguments):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self.assertEqual(verify_release_versions.main(), 1)
+            update.assert_called_once_with(
+                verify_release_versions.ROOT, "0.3.0", "0.4.0"
+            )
+
+    def test_main_routes_python_updates(self) -> None:
+        arguments = [
+            "verify_release_versions.py",
+            "--update-python",
+            "0.3.0",
+            "0.4.0",
+        ]
+        pyproject = verify_release_versions.ROOT / "python/pyproject.toml"
+        with mock.patch.object(
+            verify_release_versions,
+            "update_python_version",
+            return_value=pyproject,
+        ) as update:
+            with mock.patch.object(sys, "argv", arguments):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    self.assertEqual(verify_release_versions.main(), 0)
+            update.assert_called_once_with(
+                verify_release_versions.ROOT, "0.3.0", "0.4.0"
+            )
+
+        with mock.patch.object(
+            verify_release_versions,
+            "update_python_version",
+            side_effect=ValueError("stale pyproject"),
         ) as update:
             with mock.patch.object(sys, "argv", arguments):
                 with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
