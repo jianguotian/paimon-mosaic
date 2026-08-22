@@ -51,6 +51,15 @@ SOURCE_PATHSPECS = (
 WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 MAX_SOURCE_TAR_SIZE = 512 * 1024 * 1024
 MAX_SOURCE_TAR_ENTRIES = 65536
+GIT_REPOSITORY_ENVIRONMENT = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
 
 
 @dataclass(frozen=True)
@@ -84,6 +93,8 @@ def resolve_commit(repository: Path, commit: str) -> str:
 
 def git_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    for variable in GIT_REPOSITORY_ENVIRONMENT:
+        environment.pop(variable, None)
     environment["GIT_ATTR_NOSYSTEM"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     return environment

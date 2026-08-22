@@ -52,6 +52,35 @@ EXPECTED_NATIVE_ENTRIES = {
     "native/macos/aarch64/libpaimon_mosaic_jni.dylib": "aarch64-apple-darwin",
     "native/windows/x86_64/paimon_mosaic_jni.dll": "x86_64-pc-windows-msvc",
 }
+EXAMPLE_SOURCE_PATH = "org/apache/paimon/mosaic/Example.java"
+EXAMPLE_SOURCE_CONTENTS = (
+    b"package org.apache.paimon.mosaic;\n"
+    b"public class Example {}\n"
+)
+
+
+def minimal_valid_class_bytes(internal_name: str) -> bytes:
+    """Build a minimal classfile fixture without requiring a local JDK."""
+    encoded_name = internal_name.encode()
+    return (
+        b"\xca\xfe\xba\xbe"
+        b"\x00\x00"
+        b"\x00\x34"
+        b"\x00\x05"
+        b"\x01"
+        + len(encoded_name).to_bytes(2, "big")
+        + encoded_name
+        + b"\x07\x00\x01"
+        b"\x01\x00\x10java/lang/Object"
+        b"\x07\x00\x03"
+        b"\x00\x21"
+        b"\x00\x02"
+        b"\x00\x04"
+        b"\x00\x00"
+        b"\x00\x00"
+        b"\x00\x00"
+        b"\x00\x00"
+    )
 
 
 class VerifyJavaJarsTest(unittest.TestCase):
@@ -102,15 +131,11 @@ class VerifyJavaJarsTest(unittest.TestCase):
         self,
     ) -> tuple[list[tuple[str | ZipInfo, bytes]], list[tuple[str | ZipInfo, bytes]]]:
         source_root = self.root / "java/src/main/java"
-        source = source_root / "org/apache/paimon/mosaic/Example.java"
+        source = source_root / EXAMPLE_SOURCE_PATH
         source.parent.mkdir(parents=True, exist_ok=True)
-        source_contents = (
-            b"package org.apache.paimon.mosaic;\n"
-            b"public class Example {}\n"
-        )
-        source.write_bytes(source_contents)
+        source.write_bytes(EXAMPLE_SOURCE_CONTENTS)
         sources = self.classifier_entries(
-            ("org/apache/paimon/mosaic/Example.java", source_contents)
+            (EXAMPLE_SOURCE_PATH, EXAMPLE_SOURCE_CONTENTS)
         )
         javadoc = self.classifier_entries(
             ("index.html", b"<html>index</html>\n"),
@@ -124,6 +149,9 @@ class VerifyJavaJarsTest(unittest.TestCase):
     def prepare_main_jar_fixture(
         self, native_entries: Iterable[str]
     ) -> list[tuple[str, bytes]]:
+        source = self.root / "java/src/main/java" / EXAMPLE_SOURCE_PATH
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(EXAMPLE_SOURCE_CONTENTS)
         binary_resources = self.root / "java/src/main/binary-resources/META-INF"
         report_paths = [
             f"META-INF/licenses/{target}/THIRD-PARTY-LICENSES.html"
@@ -137,6 +165,12 @@ class VerifyJavaJarsTest(unittest.TestCase):
         entries = [
             ("META-INF/LICENSE", license_contents),
             ("META-INF/NOTICE", b"Apache Arrow\n"),
+            (
+                "org/apache/paimon/mosaic/Example.class",
+                minimal_valid_class_bytes(
+                    "org/apache/paimon/mosaic/Example"
+                ),
+            ),
         ]
         for target, report_path in zip(EXPECTED_TARGETS, report_paths):
             report_contents = (
@@ -261,27 +295,15 @@ class VerifyJavaJarsTest(unittest.TestCase):
             self.verify_classifier(wrong_notice)
 
     def test_classifier_does_not_treat_java_class_magic_as_macho(self) -> None:
-        java_class = (
-            b"\xca\xfe\xba\xbe"
-            b"\x00\x00"
-            b"\x00\x34"
-            b"\x00\x05"
-            b"\x01\x00\x07Example"
-            b"\x07\x00\x01"
-            b"\x01\x00\x10java/lang/Object"
-            b"\x07\x00\x03"
-            b"\x00\x21"
-            b"\x00\x02"
-            b"\x00\x04"
-            b"\x00\x00"
-            b"\x00\x00"
-            b"\x00\x00"
-            b"\x00\x00"
-        )
         path = self.write_jar(
             "java-class.jar",
             self.classifier_entries(
-                ("org/apache/paimon/mosaic/Example.class", java_class)
+                (
+                    "org/apache/paimon/mosaic/Example.class",
+                    minimal_valid_class_bytes(
+                        "org/apache/paimon/mosaic/Example"
+                    ),
+                )
             ),
         )
 
@@ -418,6 +440,79 @@ class VerifyJavaJarsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected native"):
                 with redirect_stdout(StringIO()):
                     verify_java_jars.verify_main_jar(injected, self.root, True)
+
+    def test_main_jar_requires_compiled_java_classes(self) -> None:
+        additional_source = (
+            self.root
+            / "java/src/main/java/org/apache/paimon/mosaic/Additional.java"
+        )
+        additional_source.parent.mkdir(parents=True, exist_ok=True)
+        additional_source.write_text(
+            "package org.apache.paimon.mosaic;\n"
+            "public class Additional {}\n",
+            encoding="utf-8",
+        )
+        entries = [
+            (name, contents)
+            for name, contents in self.prepare_main_jar_fixture(
+                EXPECTED_NATIVE_ENTRIES
+            )
+        ]
+        path = self.write_jar(
+            "main-with-one-source-class-missing.jar",
+            entries,
+        )
+
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with self.assertRaisesRegex(ValueError, "compiled Java classes"):
+                with redirect_stdout(StringIO()):
+                    verify_java_jars.verify_main_jar(path, self.root, True)
+
+    def test_main_jar_rejects_invalid_required_java_class(self) -> None:
+        entries = [
+            (
+                name,
+                b"not a Java class" if name.endswith("Example.class") else contents,
+            )
+            for name, contents in self.prepare_main_jar_fixture(
+                EXPECTED_NATIVE_ENTRIES
+            )
+        ]
+        path = self.write_jar("main-with-invalid-class.jar", entries)
+
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"invalid compiled Java class.*Example\.class",
+            ):
+                with redirect_stdout(StringIO()):
+                    verify_java_jars.verify_main_jar(path, self.root, True)
+
+    def test_main_jar_rejects_java_class_declared_at_wrong_path(self) -> None:
+        entries = [
+            (
+                name,
+                (
+                    minimal_valid_class_bytes(
+                        "org/apache/paimon/mosaic/Different"
+                    )
+                    if name.endswith("Example.class")
+                    else contents
+                ),
+            )
+            for name, contents in self.prepare_main_jar_fixture(
+                EXPECTED_NATIVE_ENTRIES
+            )
+        ]
+        path = self.write_jar("main-with-misnamed-class.jar", entries)
+
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"Example\.class.*declares.*Different",
+            ):
+                with redirect_stdout(StringIO()):
+                    verify_java_jars.verify_main_jar(path, self.root, True)
 
     def test_main_jar_propagates_native_verification_failure(self) -> None:
         path = self.write_jar(

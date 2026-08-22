@@ -330,6 +330,38 @@ def test_verify_wheel_accepts_unrecorded_directory_entries(tmp_path, monkeypatch
     assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
 
 
+def test_verify_wheel_rejects_unexpected_directory_entries(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        directory_entries=("payload.pth/",),
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        ValueError,
+        match=r"unexpected wheel directories.*payload\.pth/",
+    ):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_rejects_nonempty_directory_entries(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        unrecorded_entries={"mosaic/": b"hidden payload"},
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        ValueError,
+        match=r"wheel directory entries contain payload.*mosaic/",
+    ):
+        verifier.verify_wheel(wheel, root)
+
+
 def test_main_requires_exactly_one_wheel_per_release_target(
     tmp_path, monkeypatch
 ):
@@ -714,6 +746,58 @@ def test_verify_wheel_rejects_unrecorded_archive_entry(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "entry,error_pattern",
+    (
+        ("payload.pth", r"payload\.pth"),
+        ("mosaic/extra.dat", r"mosaic/extra\.dat"),
+    ),
+)
+def test_verify_wheel_rejects_recorded_unexpected_payload(
+    tmp_path, monkeypatch, entry, error_pattern
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={entry: b"unexpected payload\n"},
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"unexpected wheel payload.*{error_pattern}",
+    ):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_accepts_standard_top_level_metadata(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={
+            "paimon_mosaic-0.3.0.dist-info/top_level.txt": b"mosaic\n",
+        },
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
+
+
+def test_verify_wheel_rejects_invalid_top_level_metadata(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={
+            "paimon_mosaic-0.3.0.dist-info/top_level.txt": b"payload\n",
+        },
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match=r"must contain exactly 'mosaic\\n'"):
+        verifier.verify_wheel(wheel, root)
+
+
+@pytest.mark.parametrize(
     "entry,magic",
     (
         ("paimon_mosaic.libs/libzstd.so.1", b"\x7fELF"),
@@ -734,16 +818,9 @@ def test_verify_wheel_rejects_sidecar_native_by_magic(
         verifier.verify_wheel(wheel, root)
 
 
-def test_verify_wheel_does_not_treat_plain_mz_resource_as_pe(
-    tmp_path, monkeypatch
-):
+def test_native_binary_magic_does_not_treat_plain_mz_resource_as_pe():
     not_pe = bytearray(132)
     not_pe[:2] = b"MZ"
     not_pe[0x3C:0x40] = (0x80).to_bytes(4, "little")
-    wheel, root = build_wheel(
-        tmp_path,
-        extra_entries={"mosaic/data/resource.bin": bytes(not_pe)},
-    )
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
-    assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
+    assert verifier.native_binary_magic(io.BytesIO(not_pe), len(not_pe)) is None

@@ -201,6 +201,41 @@ def test_skip_worktree_hidden_mutation_is_rejected(tmp_path: Path) -> None:
     )
 
 
+def test_source_release_ignores_inherited_git_dir_and_work_tree(
+    tmp_path: Path,
+) -> None:
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    inherited_repo = tmp_path / "inherited-repo"
+    inherited_repo.mkdir()
+    write(inherited_repo / "README.md", "different repository\n")
+    run(["git", "init", "-q"], cwd=inherited_repo)
+    run(["git", "config", "user.name", "Release Test"], cwd=inherited_repo)
+    run(
+        ["git", "config", "user.email", "release-test@example.invalid"],
+        cwd=inherited_repo,
+    )
+    run(["git", "add", "."], cwd=inherited_repo)
+    run(["git", "commit", "-q", "-m", "inherited fixture"], cwd=inherited_repo)
+
+    write(repo / "UNTRACKED", "must make the declared worktree dirty\n")
+    env["GIT_DIR"] = str(inherited_repo / ".git")
+    env["GIT_WORK_TREE"] = str(inherited_repo)
+    result = subprocess.run(
+        ["bash", script.name],
+        cwd=script.parent,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    output = (result.stdout + result.stderr).decode("utf-8")
+    assert result.returncode != 0
+    assert "clean Git worktree" in output
+    assert "UNTRACKED" in output
+
+
 def test_semantic_checks_run_against_the_archived_head_tree(
     tmp_path: Path,
 ) -> None:

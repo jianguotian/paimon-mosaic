@@ -181,65 +181,92 @@ def skip_java_members(data: bytes, offset: int) -> int | None:
     return offset
 
 
-def is_java_class(data: bytes) -> bool:
-    """Distinguish a complete Java class from Mach-O's shared CAFEBABE magic."""
+def java_class_internal_name(data: bytes) -> str | None:
+    """Return a complete class file's declared internal name."""
     if len(data) < 10 or not data.startswith(JAVA_CLASS_MAGIC):
-        return False
+        return None
     major_version = int.from_bytes(data[6:8], "big")
     constant_pool_count = int.from_bytes(data[8:10], "big")
     if not 45 <= major_version <= 100 or constant_pool_count == 0:
-        return False
+        return None
 
+    utf8_entries: dict[int, bytes] = {}
+    class_entries: dict[int, int] = {}
     offset = 10
     index = 1
     while index < constant_pool_count:
         if offset >= len(data):
-            return False
+            return None
         tag = data[offset]
         offset += 1
         if tag == 1:
             result = read_java_u2(data, offset)
             if result is None:
-                return False
+                return None
             length, offset = result
             if length > len(data) - offset:
-                return False
+                return None
+            utf8_entries[index] = data[offset : offset + length]
             offset += length
         elif tag in (3, 4, 9, 10, 11, 12, 17, 18):
             offset += 4
         elif tag in (5, 6):
             offset += 8
             index += 1
-        elif tag in (7, 8, 16, 19, 20):
+        elif tag == 7:
+            result = read_java_u2(data, offset)
+            if result is None:
+                return None
+            class_entries[index], offset = result
+        elif tag in (8, 16, 19, 20):
             offset += 2
         elif tag == 15:
             offset += 3
         else:
-            return False
+            return None
         if offset > len(data):
-            return False
+            return None
         index += 1
 
     if offset > len(data) - 8:
-        return False
+        return None
+    this_class = int.from_bytes(data[offset + 2 : offset + 4], "big")
+    name_index = class_entries.get(this_class)
+    name_bytes = utf8_entries.get(name_index) if name_index is not None else None
+    if name_bytes is None:
+        return None
+    try:
+        internal_name = name_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not internal_name:
+        return None
+
     interfaces_count = int.from_bytes(data[offset + 6 : offset + 8], "big")
     offset += 8
     if interfaces_count > (len(data) - offset) // 2:
-        return False
+        return None
     offset += interfaces_count * 2
 
     offset = skip_java_members(data, offset)
     if offset is None:
-        return False
+        return None
     offset = skip_java_members(data, offset)
     if offset is None:
-        return False
+        return None
     result = read_java_u2(data, offset)
     if result is None:
-        return False
+        return None
     attributes_count, offset = result
     offset = skip_java_attributes(data, offset, attributes_count)
-    return offset == len(data)
+    if offset != len(data):
+        return None
+    return internal_name
+
+
+def is_java_class(data: bytes) -> bool:
+    """Distinguish a complete Java class from Mach-O's shared CAFEBABE magic."""
+    return java_class_internal_name(data) is not None
 
 
 def native_binary_magic(source, size: int, name: str) -> str | None:
@@ -278,6 +305,51 @@ def native_archive_entries(
         if name.lower().endswith(NATIVE_SUFFIXES) or magic is not None:
             native_entries.add(name)
     return native_entries
+
+
+def java_source_files(root: Path) -> dict[str, Path]:
+    source_root = root / "java/src/main/java"
+    return {
+        path.relative_to(source_root).as_posix(): path
+        for path in source_root.rglob("*.java")
+        if path.is_file()
+    }
+
+
+def verify_compiled_java_classes(
+    archive: ZipFile, entries: dict[str, ZipInfo], root: Path
+) -> None:
+    sources = java_source_files(root)
+    if not sources:
+        raise ValueError("repository contains no Java sources")
+
+    required_classes = {
+        str(PurePosixPath(source_path).with_suffix(".class"))
+        for source_path in sources
+    }
+    missing = sorted(required_classes - entries.keys())
+    if missing:
+        raise ValueError(f"main JAR is missing compiled Java classes: {missing}")
+
+    for name in sorted(required_classes):
+        class_file = entries[name]
+        if class_file.is_dir():
+            raise ValueError(f"compiled Java class is a directory: {name}")
+        if class_file.file_size > MAX_JAVA_CLASS_SIZE:
+            raise ValueError(
+                f"compiled Java class {name!r} exceeds the size limit of "
+                f"{MAX_JAVA_CLASS_SIZE} bytes: {class_file.file_size} bytes"
+            )
+        with archive.open(class_file) as class_stream:
+            class_bytes = class_stream.read(MAX_JAVA_CLASS_SIZE + 1)
+        internal_name = java_class_internal_name(class_bytes)
+        if internal_name is None:
+            raise ValueError(f"invalid compiled Java class: {name}")
+        expected_name = name.removesuffix(".class")
+        if internal_name != expected_name:
+            raise ValueError(
+                f"compiled Java class {name!r} declares {internal_name!r}"
+            )
 
 
 def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
@@ -327,6 +399,8 @@ def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
             for marker in NESTED_LICENSE_MARKERS:
                 if marker not in report_text:
                     raise ValueError(f"{report_path} is missing {marker!r}")
+
+        verify_compiled_java_classes(archive, entries, root)
 
         packaged_natives = native_archive_entries(archive, entries)
         unexpected_natives = packaged_natives - set(NATIVE_ENTRIES)
@@ -384,15 +458,6 @@ def verify_classifier(path: Path, root: Path | None = None) -> None:
         _verify_classifier_entries(archive, entries, root)
 
     print(f"verified classifier JAR: {path}")
-
-
-def java_source_files(root: Path) -> dict[str, Path]:
-    source_root = root / "java/src/main/java"
-    return {
-        path.relative_to(source_root).as_posix(): path
-        for path in source_root.rglob("*.java")
-        if path.is_file()
-    }
 
 
 def verify_sources_jar(path: Path, root: Path | None = None) -> None:

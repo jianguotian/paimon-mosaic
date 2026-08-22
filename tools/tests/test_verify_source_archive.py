@@ -47,8 +47,8 @@ def run(command, cwd, env=None):
     )
 
 
-def initialize_repo(tmp_path):
-    repo = tmp_path / "repo"
+def initialize_repo(tmp_path, name="repo"):
+    repo = tmp_path / name
     repo.mkdir()
     (repo / "README.md").write_text("source contents\n", encoding="utf-8")
     (repo / "script.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -134,6 +134,25 @@ def test_create_and_verify_exact_git_tree(tmp_path):
     assert f"{PREFIX}script.sh" in names
     assert f"{PREFIX}.gitignore" not in names
     assert not any(name.startswith(f"{PREFIX}.github") for name in names)
+
+
+def test_archive_creation_ignores_inherited_git_dir(tmp_path, monkeypatch):
+    repo, commit = initialize_repo(tmp_path, "declared")
+    other_repo, _ = initialize_repo(tmp_path, "inherited")
+    (other_repo / "README.md").write_text(
+        "different repository\n", encoding="utf-8"
+    )
+    run(["git", "add", "README.md"], cwd=other_repo)
+    run(["git", "commit", "-q", "-m", "different tree"], cwd=other_repo)
+
+    monkeypatch.setenv("GIT_DIR", str(other_repo / ".git"))
+    archive = tmp_path / "source.tgz"
+
+    assert verifier.create_archive(archive, repo, "HEAD", PREFIX) == commit
+    with tarfile.open(archive, "r:gz") as source:
+        readme = source.extractfile(f"{PREFIX}README.md")
+        assert readme is not None
+        assert readme.read() == b"source contents\n"
 
 
 def test_archive_verification_rejects_same_tree_from_different_commit(tmp_path):

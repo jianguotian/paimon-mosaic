@@ -347,7 +347,7 @@ def require_equal(actual: bytes, expected_path: Path, archive_path: str) -> None
 
 def verify_python_modules(
     archive: ZipFile, file_names: set[str], root: Path
-) -> None:
+) -> set[str]:
     package_root = root / "python/mosaic"
     expected = {
         path.relative_to(root / "python").as_posix(): path
@@ -371,6 +371,18 @@ def verify_python_modules(
         )
     for archive_path, source_path in expected.items():
         require_equal(archive.read(archive_path), source_path, archive_path)
+    return set(expected)
+
+
+def parent_directories(paths: set[str]) -> set[str]:
+    directories = set()
+    for path in paths:
+        parts = path.split("/")
+        directories.update(
+            "/".join(parts[:index]) + "/"
+            for index in range(1, len(parts))
+        )
+    return directories
 
 
 def verify_wheel(wheel: Path, root: Path) -> str:
@@ -442,7 +454,7 @@ def verify_wheel(wheel: Path, root: Path) -> str:
 
         for archive_path, expected_path in {**package_legal, **standard_legal}.items():
             require_equal(archive.read(archive_path), expected_path, archive_path)
-        verify_python_modules(archive, file_names, root)
+        python_modules = verify_python_modules(archive, file_names, root)
 
         native_entries = []
         for info in archive.infolist():
@@ -465,6 +477,54 @@ def verify_wheel(wheel: Path, root: Path) -> str:
             native_entries[0],
             symbol_family="FFI",
         )
+
+        top_level_path = f"{dist_info}/top_level.txt"
+        allowed_payload = (
+            python_modules
+            | set(package_legal)
+            | set(standard_legal)
+            | {
+                NATIVE_LIBRARY[target],
+                metadata_path,
+                wheel_metadata_path,
+                record_path,
+            }
+        )
+        unexpected_payload = sorted(
+            file_names - allowed_payload - {top_level_path}
+        )
+        if unexpected_payload:
+            raise ValueError(
+                f"unexpected wheel payload: {unexpected_payload}"
+            )
+        directory_entries = [
+            info for info in archive.infolist() if info.is_dir()
+        ]
+        nonempty_directories = sorted(
+            info.filename for info in directory_entries if info.file_size != 0
+        )
+        if nonempty_directories:
+            raise ValueError(
+                f"wheel directory entries contain payload: {nonempty_directories}"
+            )
+        allowed_directories = parent_directories(
+            allowed_payload | {top_level_path}
+        )
+        unexpected_directories = sorted(
+            {info.filename for info in directory_entries}
+            - allowed_directories
+        )
+        if unexpected_directories:
+            raise ValueError(
+                f"unexpected wheel directories: {unexpected_directories}"
+            )
+        if (
+            top_level_path in file_names
+            and archive.read(top_level_path) != b"mosaic\n"
+        ):
+            raise ValueError(
+                f"{top_level_path} must contain exactly 'mosaic\\n'"
+            )
 
         legal_target_prefix = f"{dist_info}/licenses/licenses/"
         packaged_targets = {
