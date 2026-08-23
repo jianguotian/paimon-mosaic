@@ -24,7 +24,7 @@ import posixpath
 import re
 import stat
 import sys
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from native_binary import TARGET_ARCHITECTURE, verify_native_target
@@ -35,6 +35,7 @@ MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 65536
 MAX_JAVA_CLASS_SIZE = 16 * 1024 * 1024
 ARCHIVE_READ_CHUNK_SIZE = 1024 * 1024
+WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -103,8 +104,10 @@ def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
             raise ValueError(f"invalid archive entry path: {name!r}")
         if "\\" in name:
             raise ValueError(f"archive entry uses a backslash: {name!r}")
-        if PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute():
-            raise ValueError(f"archive entry uses an absolute path: {name!r}")
+        if name.startswith("/") or WINDOWS_DRIVE_PATH.match(name):
+            raise ValueError(
+                f"archive entry uses an absolute or drive-qualified path: {name!r}"
+            )
         if ".." in name.split("/"):
             raise ValueError(f"archive entry uses a '..' path component: {name!r}")
         if stat.S_ISLNK(info.external_attr >> 16):
@@ -124,6 +127,8 @@ def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
             raise ValueError(f"archive contains duplicate raw entry name: {name!r}")
 
         normalized_name = posixpath.normpath(name)
+        if normalized_name in ("", ".", "/"):
+            raise ValueError(f"invalid archive entry path: {name!r}")
         previous_name = normalized_names.get(normalized_name)
         if previous_name is not None:
             raise ValueError(

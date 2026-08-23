@@ -192,6 +192,9 @@ class VerifyJavaJarsTest(unittest.TestCase):
         cases = {
             "absolute": "/escape",
             "windows_absolute": "C:/escape",
+            "windows_drive_relative": "C:../site-packages_evil/payload.py",
+            "windows_drive_bare": "C:evil",
+            "normalizes_to_dot": "./",
             "backslash": "dir\\file",
             "dot_dot": "dir/../escape",
             "symlink": symlink,
@@ -249,6 +252,49 @@ class VerifyJavaJarsTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     ValueError, r"oversized\.bin.*size limit"
+                ):
+                    self.verify_classifier(path)
+
+    def test_rejects_too_many_entries_before_archive_read(self) -> None:
+        path = self.write_jar(
+            "too-many-entries.jar",
+            self.classifier_entries(
+                *((f"payload/{index}.bin", b"x") for index in range(4))
+            ),
+        )
+
+        with mock.patch.object(
+            verify_java_jars, "MAX_ARCHIVE_ENTRIES", 5, create=True
+        ):
+            with mock.patch.object(
+                ZipFile,
+                "read",
+                side_effect=AssertionError("archive.read must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, r"declares more than 5 entries: 6"
+                ):
+                    self.verify_classifier(path)
+
+    def test_rejects_oversized_total_before_archive_read(self) -> None:
+        path = self.write_jar(
+            "oversized-total.jar",
+            self.classifier_entries(
+                ("payload/first.bin", b"x" * 3000),
+                ("payload/second.bin", b"y" * 3000),
+            ),
+        )
+
+        with mock.patch.object(
+            verify_java_jars, "MAX_ARCHIVE_TOTAL_SIZE", 4096, create=True
+        ):
+            with mock.patch.object(
+                ZipFile,
+                "read",
+                side_effect=AssertionError("archive.read must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, r"exceeds the total size limit of 4096 bytes"
                 ):
                     self.verify_classifier(path)
 
