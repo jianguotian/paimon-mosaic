@@ -92,27 +92,30 @@ def initialize_release_repo(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
         fake_bin / "gpg",
         """#!/usr/bin/env bash
 set -euo pipefail
+if command -v sha256sum > /dev/null; then
+  digest_of() { sha256sum "$1" | cut -d' ' -f1; }
+else
+  digest_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+fi
 if [[ " $* " == *" --detach-sig "* ]]; then
   archive="${@: -1}"
   if [[ -n "${MOSAIC_TEST_GPG_BAD_SIG:-}" ]]; then
-    printf 'corrupt signature\\n' > "${archive}.asc"
+    printf 'signed %s\\n' "deadbeef" > "${archive}.asc"
   else
-    printf 'test signature\\n' > "${archive}.asc"
+    printf 'signed %s\\n' "$(digest_of "${archive}")" > "${archive}.asc"
   fi
   exit 0
 fi
 if [[ "${1:-}" == "--verify" ]]; then
   signature="${2:-}"
   archive="${3:-}"
-  if [[ ! -f "${signature}" ]]; then
-    echo "gpg: cannot open signature ${signature}" >&2
+  if [[ ! -f "${signature}" || ! -f "${archive}" ]]; then
+    echo "gpg: cannot open ${signature} or ${archive}" >&2
     exit 1
   fi
-  if [[ ! -f "${archive}" ]]; then
-    echo "gpg: cannot open archive ${archive}" >&2
-    exit 1
-  fi
-  if [[ "$(cat "${signature}")" != "test signature" ]]; then
+  # Bind the signature to the archive it was made over, so verifying against a
+  # decoy, against the checksum file, or against the signature itself fails.
+  if [[ "$(cat "${signature}")" != "signed $(digest_of "${archive}")" ]]; then
     echo "gpg: BAD signature" >&2
     exit 1
   fi

@@ -326,10 +326,14 @@ def build_macho(
     export_trie_resolver=None,
     export_trie_reexport_name=b"",
     extra_sections=0,
+    extra_segments=(),
 ):
     symbol_list = sorted(symbols)
     section_count = 1 + extra_sections
     segment_size = 72 + 80 * section_count
+    # Additional __LINKEDIT-style segments, each declaring its own section
+    # count, so a test can exceed the cap only in aggregate.
+    extra_segment_sizes = [72 + 80 * count for count in extra_segments]
     if id_dylib == "missing":
         id_dylib_commands = []
     elif id_dylib == "duplicate":
@@ -385,6 +389,7 @@ def build_macho(
 
     commands_size = (
         segment_size
+        + sum(extra_segment_sizes)
         + sum(len(command) for command in id_dylib_commands)
         + 24
         + export_command_size
@@ -424,7 +429,7 @@ def build_macho(
         command_export_size = export_trie_size_override
     data = bytearray(file_size)
 
-    command_count = 2 + len(id_dylib_commands)
+    command_count = 2 + len(extra_segments) + len(id_dylib_commands)
     if export_trie is not None:
         command_count += 1
     if dyld_info_export_trie is not None:
@@ -476,6 +481,26 @@ def build_macho(
         0,
     )
     command_offset = 32 + segment_size
+    for extra_index, (extra_count, extra_size) in enumerate(
+        zip(extra_segments, extra_segment_sizes)
+    ):
+        struct.pack_into(
+            "<II16sQQQQiiII",
+            data,
+            command_offset,
+            0x19,
+            extra_size,
+            f"__EXTRA{extra_index}\0".encode().ljust(16, b"\0"),
+            0,
+            0,
+            0,
+            0,
+            7,
+            segment_initial_protection,
+            extra_count,
+            0,
+        )
+        command_offset += extra_size
     for command in id_dylib_commands:
         data[command_offset : command_offset + len(command)] = command
         command_offset += len(command)
@@ -1722,7 +1747,8 @@ def test_rejects_elf_declaring_too_many_program_headers():
     data = bytearray(build_elf())
     struct.pack_into("<H", data, 56, verifier.MAX_NATIVE_SECTIONS + 1)
 
-    with pytest.raises(ValueError, match="more than 512 program headers: 513"):
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} program headers: "
+        rf"{verifier.MAX_NATIVE_SECTIONS + 1}"):
         verify_jni_target(
             bytes(data), "x86_64-unknown-linux-gnu", "libpaimon_mosaic_jni.so"
         )
@@ -1744,7 +1770,8 @@ def test_rejects_elf_declaring_too_many_sections():
     data = bytearray(build_elf())
     struct.pack_into("<H", data, 60, verifier.MAX_NATIVE_SECTIONS + 1)
 
-    with pytest.raises(ValueError, match="more than 512 sections: 513"):
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} sections: "
+        rf"{verifier.MAX_NATIVE_SECTIONS + 1}"):
         verify_jni_target(
             bytes(data), "x86_64-unknown-linux-gnu", "libpaimon_mosaic_jni.so"
         )
@@ -1754,7 +1781,8 @@ def test_rejects_pe_declaring_too_many_sections():
     data = bytearray(build_pe())
     struct.pack_into("<H", data, 0x80 + 6, verifier.MAX_NATIVE_SECTIONS + 1)
 
-    with pytest.raises(ValueError, match="more than 512 sections: 513"):
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} sections: "
+        rf"{verifier.MAX_NATIVE_SECTIONS + 1}"):
         verify_jni_target(
             bytes(data), "x86_64-pc-windows-msvc", "paimon_mosaic_jni.dll"
         )
@@ -1764,17 +1792,17 @@ def test_rejects_macho_declaring_too_many_load_commands():
     data = bytearray(build_macho())
     struct.pack_into("<I", data, 16, verifier.MAX_NATIVE_SECTIONS + 1)
 
-    with pytest.raises(ValueError, match="more than 512 load commands: 513"):
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} load commands: "
+        rf"{verifier.MAX_NATIVE_SECTIONS + 1}"):
         verify_jni_target(
             bytes(data), "aarch64-apple-darwin", "libpaimon_mosaic_jni.dylib"
         )
 
 
-def test_rejects_macho_whose_segments_exceed_the_cumulative_section_cap():
+def test_rejects_macho_whose_single_segment_exceeds_the_section_cap():
     # Zero-filled section headers are legal (size 0 skips the range check), so
-    # one segment can inflate the list the per-export scan walks. Only the
-    # running total catches that; the per-command size check cannot see it.
-    with pytest.raises(ValueError, match="more than 512 sections"):
+    # one segment can inflate the list the per-export scan walks.
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} sections"):
         verify_jni_target(
             build_macho(extra_sections=verifier.MAX_NATIVE_SECTIONS),
             "aarch64-apple-darwin",
@@ -1782,9 +1810,22 @@ def test_rejects_macho_whose_segments_exceed_the_cumulative_section_cap():
         )
 
 
+def test_rejects_macho_whose_segments_exceed_the_cap_only_in_aggregate():
+    # Each segment stays under the cap on its own, so only the running total can
+    # reject this; a per-command check cannot see the aggregate.
+    half = verifier.MAX_NATIVE_SECTIONS // 2
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} sections"):
+        verify_jni_target(
+            build_macho(extra_sections=half, extra_segments=(half, half)),
+            "aarch64-apple-darwin",
+            "libpaimon_mosaic_jni.dylib",
+        )
+
+
 def test_accepts_macho_section_count_at_the_cumulative_cap():
+    half = verifier.MAX_NATIVE_SECTIONS // 2
     verify_jni_target(
-        build_macho(extra_sections=verifier.MAX_NATIVE_SECTIONS - 1),
+        build_macho(extra_sections=half - 1, extra_segments=(half,)),
         "aarch64-apple-darwin",
         "libpaimon_mosaic_jni.dylib",
     )

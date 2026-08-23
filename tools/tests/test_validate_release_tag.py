@@ -393,17 +393,31 @@ def test_untrusted_gnupg_statuses_are_rejected(monkeypatch, status):
         validator.verify_signature(Path("."), "v6.0.0-rc1", {})
 
 
+# Naming these explicitly rather than iterating the production tuple: deriving
+# both the input and the assertion from GIT_REPOSITORY_ENVIRONMENT made the test
+# pass even when that tuple was shrunk to a single name.
+GIT_REPOSITORY_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
+
+
 def test_git_environment_strips_the_repository_selecting_variables():
     # An inherited GIT_DIR overrides both cwd= and `git -C`, so this module has
     # to remove the variables rather than work around them. It previously only
     # set GIT_NO_REPLACE_OBJECTS and stripped nothing.
-    inherited = {name: "/hostile" for name in validator.GIT_REPOSITORY_ENVIRONMENT}
+    inherited = {name: "/hostile" for name in GIT_REPOSITORY_VARIABLES}
     inherited["PATH"] = os.environ.get("PATH", "")
 
     result = validator.git_environment(inherited)
 
     assert result["GIT_NO_REPLACE_OBJECTS"] == "1"
-    for name in validator.GIT_REPOSITORY_ENVIRONMENT:
+    for name in GIT_REPOSITORY_VARIABLES:
         assert name not in result, f"{name} survived git_environment()"
     assert result["PATH"] == inherited["PATH"]
 
@@ -413,4 +427,4 @@ def test_git_environment_shares_the_source_archive_variable_list():
     from verify_source_archive import GIT_REPOSITORY_ENVIRONMENT as shared
 
     assert validator.GIT_REPOSITORY_ENVIRONMENT is shared
-    assert "GIT_DIR" in shared
+    assert set(shared) == set(GIT_REPOSITORY_VARIABLES)
