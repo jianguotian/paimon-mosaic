@@ -24,6 +24,7 @@ import posixpath
 import re
 import stat
 import sys
+import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile, ZipInfo
@@ -322,9 +323,39 @@ def java_source_files(root: Path) -> dict[str, Path]:
     }
 
 
+MAVEN_POM_NAMESPACE = "{http://maven.apache.org/POM/4.0.0}"
+# Written into every JAR by the ASF parent build rather than declared by the
+# project, so they are expected payload.
+BUILD_METADATA_ENTRIES = frozenset(
+    {"META-INF/MANIFEST.MF", "META-INF/DEPENDENCIES"}
+)
+
+
+def maven_descriptor_entries(root: Path) -> set[str]:
+    """Return the archived Maven descriptor paths implied by the POM coordinates.
+
+    Reads the repository's own version-controlled POM, not a downloaded
+    artifact, so this is inside the trust boundary the verifiers police.
+    """
+    document = ET.parse(root / "java/pom.xml").getroot()
+
+    def coordinate(name: str) -> str:
+        for path in (
+            f"{MAVEN_POM_NAMESPACE}{name}",
+            f"{MAVEN_POM_NAMESPACE}parent/{MAVEN_POM_NAMESPACE}{name}",
+        ):
+            element = document.find(path)
+            if element is not None and element.text:
+                return element.text.strip()
+        raise ValueError(f"java/pom.xml declares no {name}")
+
+    prefix = f"META-INF/maven/{coordinate('groupId')}/{coordinate('artifactId')}"
+    return {f"{prefix}/pom.xml", f"{prefix}/pom.properties"}
+
+
 def verify_compiled_java_classes(
     archive: ZipFile, entries: dict[str, ZipInfo], root: Path
-) -> None:
+) -> set[str]:
     sources = java_source_files(root)
     if not sources:
         raise ValueError("repository contains no Java sources")
@@ -337,10 +368,21 @@ def verify_compiled_java_classes(
     if missing:
         raise ValueError(f"main JAR is missing compiled Java classes: {missing}")
 
-    for name in sorted(required_classes):
+    # javac also emits nested and anonymous classes as Outer$Inner.class, which
+    # have no source file of their own. Map each one back to its outermost name
+    # rather than trusting the package prefix.
+    class_entries = {
+        name
+        for name, info in entries.items()
+        if name.endswith(".class") and not info.is_dir()
+    }
+    for name in sorted(class_entries):
+        outer = name.removesuffix(".class").split("$", 1)[0] + ".class"
+        if outer not in required_classes:
+            raise ValueError(
+                f"main JAR class {name!r} has no matching repository source"
+            )
         class_file = entries[name]
-        if class_file.is_dir():
-            raise ValueError(f"compiled Java class is a directory: {name}")
         if class_file.file_size > MAX_JAVA_CLASS_SIZE:
             raise ValueError(
                 f"compiled Java class {name!r} exceeds the size limit of "
@@ -356,6 +398,7 @@ def verify_compiled_java_classes(
             raise ValueError(
                 f"compiled Java class {name!r} declares {internal_name!r}"
             )
+    return class_entries
 
 
 def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
@@ -406,12 +449,32 @@ def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
                 if marker not in report_text:
                     raise ValueError(f"{report_path} is missing {marker!r}")
 
-        verify_compiled_java_classes(archive, entries, root)
+        class_entries = verify_compiled_java_classes(archive, entries, root)
 
         packaged_natives = native_archive_entries(archive, entries)
         unexpected_natives = packaged_natives - set(NATIVE_ENTRIES)
         if unexpected_natives:
             raise ValueError(f"unexpected native entries: {sorted(unexpected_natives)}")
+
+        # Presence checks alone let anything else ride along, so state the whole
+        # expected payload and reject the difference. Directory entries carry no
+        # payload and their names are already validated.
+        expected_payload = (
+            required
+            | BUILD_METADATA_ENTRIES
+            | maven_descriptor_entries(root)
+            | class_entries
+            | packaged_natives
+        )
+        unexpected_payload = sorted(
+            name
+            for name, info in entries.items()
+            if not info.is_dir() and name not in expected_payload
+        )
+        if unexpected_payload:
+            raise ValueError(
+                f"main JAR contains unexpected entries: {unexpected_payload}"
+            )
         if require_all_natives and packaged_natives != set(NATIVE_ENTRIES):
             raise ValueError(
                 "release JAR native entries differ from the four declared targets: "

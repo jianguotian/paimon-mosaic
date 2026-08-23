@@ -153,9 +153,24 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
         return sources, javadoc
 
+    def write_java_pom(self) -> None:
+        pom = self.root / "java/pom.xml"
+        pom.parent.mkdir(parents=True, exist_ok=True)
+        pom.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<project xmlns="http://maven.apache.org/POM/4.0.0">\n'
+            "  <modelVersion>4.0.0</modelVersion>\n"
+            "  <groupId>org.apache.paimon</groupId>\n"
+            "  <artifactId>mosaic</artifactId>\n"
+            "  <version>0.3.0-SNAPSHOT</version>\n"
+            "</project>\n",
+            encoding="utf-8",
+        )
+
     def prepare_main_jar_fixture(
         self, native_entries: Iterable[str]
     ) -> list[tuple[str, bytes]]:
+        self.write_java_pom()
         source = self.root / "java/src/main/java" / EXAMPLE_SOURCE_PATH
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_bytes(EXAMPLE_SOURCE_CONTENTS)
@@ -971,3 +986,77 @@ class VerifyJavaJarsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MainJarPayloadTest(VerifyJavaJarsTest):
+    # Presence checks alone let anything else ride along. These pin the reverse
+    # set difference, and the build-metadata cases pin that it does not reject a
+    # real Maven artifact: mvn package emits MANIFEST.MF, META-INF/DEPENDENCIES,
+    # META-INF/maven/<groupId>/<artifactId>/pom.{xml,properties} and nested
+    # classes such as MosaicWriter$1.class, none of which a source listing names.
+
+    def verify_main(self, entries: list[tuple[str, bytes]]) -> None:
+        path = self.write_jar("main.jar", entries)
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_main_jar(path, self.root, False)
+
+    def test_accepts_the_entries_a_real_maven_build_adds(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        entries.extend(
+            [
+                ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+                ("META-INF/DEPENDENCIES", b"// generated\n"),
+                (
+                    "META-INF/maven/org.apache.paimon/mosaic/pom.xml",
+                    b"<project/>\n",
+                ),
+                (
+                    "META-INF/maven/org.apache.paimon/mosaic/pom.properties",
+                    b"artifactId=mosaic\n",
+                ),
+            ]
+        )
+
+        self.verify_main(entries)
+
+    def test_accepts_nested_and_anonymous_classes(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        outer = EXAMPLE_SOURCE_PATH.removesuffix(".java")
+        for suffix in ("$1", "$Inner"):
+            nested = f"{outer}{suffix}"
+            entries.append((f"{nested}.class", minimal_valid_class_bytes(nested)))
+
+        self.verify_main(entries)
+
+    def test_rejects_payload_no_source_or_build_step_accounts_for(self) -> None:
+        for entry, contents in (
+            ("META-INF/services/java.sql.Driver", b"com.evil.Driver\n"),
+            ("lib/extra.jar", b"PK\x03\x04nested"),
+            ("payload.sh", b"#!/bin/sh\n"),
+            ("META-INF/maven/org.other/mosaic/pom.xml", b"<project/>\n"),
+        ):
+            with self.subTest(entry=entry):
+                entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+                entries.append((entry, contents))
+
+                with self.assertRaisesRegex(ValueError, "unexpected entries"):
+                    self.verify_main(entries)
+
+    def test_rejects_a_class_with_no_repository_source(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        smuggled = "org/apache/paimon/mosaic/Smuggled"
+        entries.append((f"{smuggled}.class", minimal_valid_class_bytes(smuggled)))
+
+        with self.assertRaisesRegex(ValueError, "no matching repository source"):
+            self.verify_main(entries)
+
+    def test_rejects_a_nested_class_that_declares_another_name(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        outer = EXAMPLE_SOURCE_PATH.removesuffix(".java")
+        entries.append(
+            (f"{outer}$Fake.class", minimal_valid_class_bytes(f"{outer}$Other"))
+        )
+
+        with self.assertRaisesRegex(ValueError, "declares"):
+            self.verify_main(entries)
