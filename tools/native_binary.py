@@ -43,9 +43,25 @@ MACHO_CPU_ARCHITECTURE = {
     0x0100000C: "aarch64",
 }
 
-# A Mosaic native library exports on the order of a hundred symbols; the bound
-# exists to keep hostile input from driving quadratic hash-membership work.
+# A Mosaic native library exports on the order of a hundred symbols; keep all
+# format-specific symbol loops within one shared defensive work bound.
 MAX_DYNAMIC_SYMBOLS = 100_000
+# Each accepted symbol is range-checked against the section or load-segment
+# list, so an unbounded structural count multiplies bounded symbol work. Real
+# libraries stay far below this: glibc declares 69 ELF sections and 10 program
+# headers, libarrow 32 and 10. Measured worst case with both this and
+# MAX_DYNAMIC_SYMBOLS at their caps: ~3 s of ELF segment scanning and ~8 s of PE
+# section scanning, which is why the value is not lowered further -- a smaller
+# cap saves seconds on an artifact that fails anyway and cuts the headroom over
+# glibc from 7x to under 2x.
+MAX_NATIVE_SECTIONS = 512
+# Bound the cumulative bytes searched while resolving symbol names so many
+# overlapping offsets cannot turn a bounded symbol table into quadratic work.
+MAX_SYMBOL_STRING_BYTES = 16 * 1024 * 1024
+# Bound each independent source of work while traversing a Mach-O export trie.
+MAX_MACHO_EXPORT_TRIE_NODES = MAX_DYNAMIC_SYMBOLS
+MAX_MACHO_EXPORT_TRIE_STRING_BYTES = MAX_SYMBOL_STRING_BYTES
+MAX_MACHO_EXPORT_TRIE_PREFIX_BYTES = MAX_SYMBOL_STRING_BYTES
 
 MOSAIC_SYMBOL_FAMILIES = {
     "JNI": {
@@ -121,6 +137,46 @@ class ElfSection:
     size: int
     link: int
     entry_size: int
+
+
+@dataclass(frozen=True)
+class MachoSection:
+    address: int
+    size: int
+    executable: bool
+
+    def contains(self, address: int) -> bool:
+        return self.size > 0 and self.address <= address < self.address + self.size
+
+
+@dataclass(frozen=True)
+class MachoExport:
+    name: str
+    flags: int
+    address: int | None
+    resolver: int | None
+
+
+@dataclass
+class CStringScanBudget:
+    description: str
+    remaining: int
+
+    def read(
+        self, data: bytes, offset: int, limit: int, description: str
+    ) -> bytes:
+        if offset < 0 or offset >= limit or limit > len(data):
+            raise ValueError(f"{description} is out of bounds")
+        scan_limit = min(limit, offset + self.remaining)
+        terminator = data.find(b"\0", offset, scan_limit)
+        if terminator < 0:
+            if scan_limit < limit:
+                raise ValueError(
+                    f"{self.description} exceed the string scan budget"
+                )
+            raise ValueError(f"{description} is not null-terminated")
+        self.remaining -= terminator - offset + 1
+        return data[offset:terminator]
 
 
 def require_range(data: bytes, offset: int, size: int, description: str) -> None:
@@ -253,18 +309,18 @@ def elf_gnu_hash(name: bytes) -> int:
 class ElfSysvHash:
     buckets: tuple[int, ...]
     chains: tuple[int, ...]
+    owners: tuple[int, ...]
 
     @property
     def symbol_count(self) -> int:
         return len(self.chains)
 
     def contains(self, symbol_index: int, name: bytes) -> bool:
-        index = self.buckets[elf_sysv_hash(name) % len(self.buckets)]
-        while index:
-            if index == symbol_index:
-                return True
-            index = self.chains[index]
-        return False
+        return (
+            0 <= symbol_index < len(self.owners)
+            and self.owners[symbol_index]
+            == elf_sysv_hash(name) % len(self.buckets)
+        )
 
 
 @dataclass(frozen=True)
@@ -274,6 +330,7 @@ class ElfGnuHash:
     bloom: tuple[int, ...]
     buckets: tuple[int, ...]
     chains: tuple[int, ...]
+    owners: tuple[int, ...]
     symbol_count: int
 
     def contains(self, symbol_index: int, name: bytes) -> bool:
@@ -288,20 +345,15 @@ class ElfGnuHash:
         index = self.buckets[name_hash % len(self.buckets)]
         if (
             index == 0
-            or symbol_index < index
             or symbol_index < self.symbol_offset
         ):
             return False
-        while True:
-            chain_index = index - self.symbol_offset
-            if chain_index >= len(self.chains):
-                return False
-            chain_hash = self.chains[chain_index]
-            if index == symbol_index:
-                return (chain_hash | 1) == (name_hash | 1)
-            if chain_hash & 1:
-                return False
-            index += 1
+        chain_index = symbol_index - self.symbol_offset
+        return (
+            chain_index < len(self.chains)
+            and self.owners[chain_index] == name_hash % len(self.buckets)
+            and (self.chains[chain_index] | 1) == (name_hash | 1)
+        )
 
 
 def parse_elf_sysv_hash(data: bytes, section: ElfSection) -> ElfSysvHash:
@@ -325,18 +377,18 @@ def parse_elf_sysv_hash(data: bytes, section: ElfSection) -> ElfSysvHash:
     # owning bucket keeps this linear and distinguishes a cycle within one chain
     # from two buckets aliasing the same node, which would let contains() resolve
     # a symbol through the wrong bucket.
-    owner: dict[int, int] = {}
+    owner = [-1] * symbol_count
     for bucket_index, bucket in enumerate(buckets):
         index = bucket
         while index:
-            previous = owner.get(index)
+            previous = owner[index]
             if previous == bucket_index:
                 raise ValueError("ELF DT_HASH contains a chain cycle")
-            if previous is not None:
+            if previous != -1:
                 raise ValueError("ELF DT_HASH bucket chains alias")
             owner[index] = bucket_index
             index = chains[index]
-    return ElfSysvHash(buckets, chains)
+    return ElfSysvHash(buckets, chains, tuple(owner))
 
 
 def parse_elf_gnu_hash(data: bytes, section: ElfSection) -> ElfGnuHash:
@@ -361,17 +413,19 @@ def parse_elf_gnu_hash(data: bytes, section: ElfSection) -> ElfGnuHash:
     chain_count = (section_end - chains_offset) // 4
     chains = struct.unpack_from(f"<{chain_count}I", data, chains_offset)
     symbol_count = symbol_offset
-    verified = set()
-    for bucket in buckets:
+    owners = [-1] * chain_count
+    for bucket_index, bucket in enumerate(buckets):
         if bucket == 0:
             continue
         if bucket < symbol_offset:
             raise ValueError("ELF DT_GNU_HASH bucket precedes the symbol offset")
         chain_index = bucket - symbol_offset
-        while chain_index not in verified:
+        while True:
             if chain_index >= chain_count:
                 raise ValueError("ELF DT_GNU_HASH chain is not terminated")
-            verified.add(chain_index)
+            if owners[chain_index] != -1:
+                raise ValueError("ELF DT_GNU_HASH bucket chains alias")
+            owners[chain_index] = bucket_index
             symbol_count = max(symbol_count, symbol_offset + chain_index + 1)
             if chains[chain_index] & 1:
                 break
@@ -382,6 +436,7 @@ def parse_elf_gnu_hash(data: bytes, section: ElfSection) -> ElfGnuHash:
         bloom,
         buckets,
         chains,
+        tuple(owners),
         symbol_count,
     )
 
@@ -425,6 +480,11 @@ def parse_elf(data: bytes) -> NativeBinary | None:
         raise ValueError(f"invalid ELF header size {header_size}")
     if program_count in (0, 0xFFFF):
         raise ValueError(f"invalid ELF program header count {program_count}")
+    if program_count > MAX_NATIVE_SECTIONS:
+        raise ValueError(
+            f"ELF image declares more than {MAX_NATIVE_SECTIONS} "
+            f"program headers: {program_count}"
+        )
     if program_entry_size != 56:
         raise ValueError(
             f"invalid ELF program header entry size {program_entry_size}"
@@ -589,6 +649,11 @@ def parse_elf(data: bytes) -> NativeBinary | None:
         return NativeBinary("ELF", frozenset({architecture}), frozenset())
     if section_count in (0, 0xFFFF):
         raise ValueError(f"invalid ELF section header count {section_count}")
+    if section_count > MAX_NATIVE_SECTIONS:
+        raise ValueError(
+            f"ELF image declares more than {MAX_NATIVE_SECTIONS} "
+            f"sections: {section_count}"
+        )
     if section_names_index == 0xFFFF:
         raise ValueError("extended ELF section-name indexes are unsupported")
     if section_entry_size != 64:
@@ -762,6 +827,9 @@ def parse_elf(data: bytes) -> NativeBinary | None:
     string_limit = string_offset + string_size
 
     exported_symbols = set()
+    symbol_names = CStringScanBudget(
+        "ELF dynamic symbol names", MAX_SYMBOL_STRING_BYTES
+    )
     for symbol_index in range(symbol_section.size // symbol_entry_size):
         entry_offset = symbol_section.offset + symbol_index * symbol_entry_size
         (
@@ -795,7 +863,7 @@ def parse_elf(data: bytes) -> NativeBinary | None:
             executable_load_segments,
             f"ELF dynamic symbol {symbol_index} function",
         )
-        raw_name = c_string_bytes(
+        raw_name = symbol_names.read(
             data,
             string_offset + name_offset,
             string_limit,
@@ -909,6 +977,11 @@ def parse_pe(data: bytes) -> NativeBinary | None:
         raise ValueError(f"unsupported PE machine 0x{machine:04x}")
     if section_count == 0:
         raise ValueError("PE image has no sections")
+    if section_count > MAX_NATIVE_SECTIONS:
+        raise ValueError(
+            f"PE image declares more than {MAX_NATIVE_SECTIONS} "
+            f"sections: {section_count}"
+        )
     if not characteristics & 0x2000:
         raise ValueError("PE image does not have the DLL characteristic")
 
@@ -1020,6 +1093,11 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                 names_rva,
                 ordinals_rva,
             ) = struct.unpack_from("<IIHHIIIIIII", data, export_offset)
+            if name_count > MAX_DYNAMIC_SYMBOLS:
+                raise ValueError(
+                    "PE export directory declares more than "
+                    f"{MAX_DYNAMIC_SYMBOLS} symbols"
+                )
             if name_count > function_count:
                 raise ValueError(
                     "PE export directory has more names than functions"
@@ -1072,6 +1150,9 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                 )
 
             previous_name = None
+            symbol_names = CStringScanBudget(
+                "PE export symbol names", MAX_SYMBOL_STRING_BYTES
+            )
             for index in range(name_count):
                 ordinal = struct.unpack_from(
                     "<H", data, ordinals_offset + index * 2
@@ -1097,7 +1178,7 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                     len(data),
                     f"PE export name {index}",
                 )
-                raw_name = c_string_bytes(
+                raw_name = symbol_names.read(
                     data,
                     name_offset,
                     name_offset + name_available,
@@ -1114,7 +1195,7 @@ def parse_pe(data: bytes) -> NativeBinary | None:
                 if export_rva <= function_rva < export_rva + export_size:
                     forwarder_offset = export_offset + function_rva - export_rva
                     forwarder = ascii_symbol(
-                        c_string_bytes(
+                        symbol_names.read(
                             data,
                             forwarder_offset,
                             export_offset + export_size,
@@ -1160,15 +1241,20 @@ def macho_uleb128(
 
 def parse_macho_export_trie(
     data: bytes, trie_offset: int, trie_size: int
-) -> frozenset[str]:
+) -> tuple[MachoExport, ...]:
     require_range(data, trie_offset, trie_size, "Mach-O export trie")
     if trie_size == 0:
-        return frozenset()
+        return ()
 
     trie_end = trie_offset + trie_size
-    exported_symbols = set()
+    exports = []
     active_nodes = set()
     visited_nodes = set()
+    string_bytes = CStringScanBudget(
+        "Mach-O export trie edge and re-export names",
+        MAX_MACHO_EXPORT_TRIE_STRING_BYTES,
+    )
+    prefix_bytes_remaining = MAX_MACHO_EXPORT_TRIE_PREFIX_BYTES
     stack = [(False, 0, b"")]
     while stack:
         leaving, node_offset, prefix = stack.pop()
@@ -1180,6 +1266,10 @@ def parse_macho_export_trie(
         if node_offset in visited_nodes:
             raise ValueError(
                 "Mach-O export trie references a node more than once"
+            )
+        if len(visited_nodes) >= MAX_MACHO_EXPORT_TRIE_NODES:
+            raise ValueError(
+                "Mach-O export trie node visits exceed the budget"
             )
         if node_offset >= trie_size:
             raise ValueError(
@@ -1222,22 +1312,25 @@ def parse_macho_export_trie(
                     terminal_end,
                     "Mach-O export trie re-export ordinal",
                 )
-                import_name = c_string_bytes(
+                import_name = string_bytes.read(
                     data,
                     cursor,
                     terminal_end,
                     "Mach-O export trie re-export name",
                 )
                 cursor += len(import_name) + 1
+                address = None
+                resolver = None
             else:
-                _address, cursor = macho_uleb128(
+                address, cursor = macho_uleb128(
                     data,
                     cursor,
                     terminal_end,
                     "Mach-O export trie terminal address",
                 )
+                resolver = None
                 if flags & 0x10:
-                    _resolver, cursor = macho_uleb128(
+                    resolver, cursor = macho_uleb128(
                         data,
                         cursor,
                         terminal_end,
@@ -1249,7 +1342,7 @@ def parse_macho_export_trie(
                 )
             name = ascii_symbol(prefix)
             if name:
-                exported_symbols.add(name)
+                exports.append(MachoExport(name, flags, address, resolver))
 
         cursor = terminal_end
         if cursor >= trie_end:
@@ -1261,7 +1354,7 @@ def parse_macho_export_trie(
         child_edges = set()
         children = []
         for child_index in range(child_count):
-            edge = c_string_bytes(
+            edge = string_bytes.read(
                 data,
                 cursor,
                 trie_end,
@@ -1287,17 +1380,24 @@ def parse_macho_export_trie(
                 raise ValueError(
                     "Mach-O export trie child offset is out of bounds"
                 )
-            child_prefix = prefix + edge
-            if len(child_prefix) > trie_size:
+            child_prefix_size = len(prefix) + len(edge)
+            if child_prefix_size > trie_size:
                 raise ValueError(
                     "Mach-O export trie symbol path is unreasonably long"
                 )
+            if child_prefix_size > prefix_bytes_remaining:
+                raise ValueError(
+                    "Mach-O export trie prefix construction exceeds "
+                    "the work budget"
+                )
+            prefix_bytes_remaining -= child_prefix_size
+            child_prefix = prefix + edge
             children.append((child_offset, child_prefix))
 
         for child_offset, child_prefix in reversed(children):
             stack.append((False, child_offset, child_prefix))
 
-    return frozenset(exported_symbols)
+    return tuple(exports)
 
 
 def parse_macho_thin(data: bytes) -> NativeBinary | None:
@@ -1336,6 +1436,11 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
         raise ValueError(f"Mach-O file type {file_type} is not MH_DYLIB")
     if command_count == 0:
         raise ValueError("Mach-O dylib has no load commands")
+    if command_count > MAX_NATIVE_SECTIONS:
+        raise ValueError(
+            f"Mach-O dylib declares more than {MAX_NATIVE_SECTIONS} "
+            f"load commands: {command_count}"
+        )
     if commands_size < command_count * 8:
         raise ValueError("Mach-O load-command region is too small")
     require_range(data, 32, commands_size, "Mach-O load commands")
@@ -1343,7 +1448,8 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
     command_offset = 32
     commands_end = 32 + commands_size
     has_file_backed_segment = False
-    section_count = 0
+    segment_addresses = []
+    sections = []
     symbol_table = None
     id_dylib_count = 0
     dyld_info_export_trie = None
@@ -1367,12 +1473,12 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 _command,
                 _command_size,
                 _segment_name,
-                _virtual_address,
-                _virtual_size,
+                virtual_address,
+                virtual_size,
                 file_offset,
                 file_size,
                 _maximum_protection,
-                _initial_protection,
+                initial_protection,
                 segment_section_count,
                 _segment_flags,
             ) = struct.unpack_from(
@@ -1383,6 +1489,11 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 raise ValueError(
                     f"Mach-O segment command {index} has invalid section data"
                 )
+            if len(sections) + segment_section_count > MAX_NATIVE_SECTIONS:
+                raise ValueError(
+                    f"Mach-O dylib declares more than {MAX_NATIVE_SECTIONS} "
+                    "sections"
+                )
             if file_size:
                 require_range(
                     data,
@@ -1391,13 +1502,15 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                     f"Mach-O segment {index} contents",
                 )
                 has_file_backed_segment = True
+            if virtual_size:
+                segment_addresses.append(virtual_address)
 
             for section_index in range(segment_section_count):
                 section_offset = command_offset + 72 + section_index * 80
                 (
                     _section_name,
                     _section_segment_name,
-                    _address,
+                    address,
                     size,
                     file_data_offset,
                     _alignment,
@@ -1416,16 +1529,27 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                         data,
                         file_data_offset,
                         size,
-                        f"Mach-O section {section_count} contents",
+                        f"Mach-O section {len(sections)} contents",
                     )
                 if relocation_count:
                     require_range(
                         data,
                         relocations_offset,
                         relocation_count * 8,
-                        f"Mach-O section {section_count} relocations",
+                        f"Mach-O section {len(sections)} relocations",
                     )
-                section_count += 1
+                sections.append(
+                    MachoSection(
+                        address=address,
+                        size=size,
+                        executable=bool(
+                            section_type not in (1, 12, 18)
+                            and size
+                            and initial_protection & 0x4
+                            and section_flags & (0x80000000 | 0x00000400)
+                        ),
+                    )
+                )
         elif command == 0x02:
             if command_size != 24:
                 raise ValueError(f"invalid Mach-O LC_SYMTAB command {index}")
@@ -1439,6 +1563,11 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 strings_offset,
                 strings_size,
             ) = struct.unpack_from("<IIIIII", data, command_offset)
+            if symbol_count > MAX_DYNAMIC_SYMBOLS:
+                raise ValueError(
+                    "Mach-O symbol table declares more than "
+                    f"{MAX_DYNAMIC_SYMBOLS} symbols"
+                )
             require_range(
                 data,
                 symbols_offset,
@@ -1535,15 +1664,33 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
         raise ValueError("Mach-O dylib is missing LC_ID_DYLIB")
 
     exported_symbols = set()
+    image_base = min(segment_addresses, default=0)
     export_trie = (
         dedicated_export_trie
         if dedicated_export_trie is not None
         else dyld_info_export_trie
     )
     if export_trie is not None:
-        exported_symbols.update(
-            parse_macho_export_trie(data, export_trie[0], export_trie[1])
-        )
+        for export in parse_macho_export_trie(
+            data, export_trie[0], export_trie[1]
+        ):
+            export_kind = export.flags & 0x03
+            if export.flags & 0x08 or export_kind != 0 or export.address is None:
+                continue
+            address = image_base + export.address
+            if not any(
+                section.executable and section.contains(address)
+                for section in sections
+            ):
+                continue
+            if export.resolver is not None:
+                resolver = image_base + export.resolver
+                if not any(
+                    section.executable and section.contains(resolver)
+                    for section in sections
+                ):
+                    continue
+            exported_symbols.add(export.name)
     elif symbol_table is not None:
         (
             symbols_offset,
@@ -1552,9 +1699,12 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
             strings_size,
         ) = symbol_table
         strings_end = strings_offset + strings_size
+        symbol_names = CStringScanBudget(
+            "Mach-O symbol names", MAX_SYMBOL_STRING_BYTES
+        )
         for index in range(symbol_count):
             offset = symbols_offset + index * 16
-            name_offset, symbol_type, symbol_section, _description, _value = (
+            name_offset, symbol_type, symbol_section, _description, value = (
                 struct.unpack_from("<IBBHQ", data, offset)
             )
             if name_offset >= strings_size:
@@ -1564,7 +1714,7 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
             if symbol_type & 0xE0:
                 continue
             basic_type = symbol_type & 0x0E
-            if basic_type == 0x0E and not 1 <= symbol_section <= section_count:
+            if basic_type == 0x0E and not 1 <= symbol_section <= len(sections):
                 raise ValueError(
                     f"Mach-O symbol {index} has an invalid section index"
                 )
@@ -1572,13 +1722,13 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
                 name_offset == 0
                 or not symbol_type & 0x01
                 or symbol_type & 0x10
-                # N_INDR aliases another symbol and N_PBUD is a prebound
-                # undefined reference, so neither one defines code here.
-                or basic_type not in (0x02, 0x0E)
+                or basic_type != 0x0E
+                or not sections[symbol_section - 1].executable
+                or not sections[symbol_section - 1].contains(value)
             ):
                 continue
             name = ascii_symbol(
-                c_string_bytes(
+                symbol_names.read(
                     data,
                     strings_offset + name_offset,
                     strings_end,
@@ -1595,91 +1745,29 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
     )
 
 
+FAT_MACHO_MAGICS = frozenset(
+    {
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+    }
+)
+
+
 def parse_macho(data: bytes) -> NativeBinary | None:
     if len(data) < 4:
         return None
-    fat = {
-        b"\xca\xfe\xba\xbe": (">", 20),
-        b"\xbe\xba\xfe\xca": ("<", 20),
-        b"\xca\xfe\xba\xbf": (">", 32),
-        b"\xbf\xba\xfe\xca": ("<", 32),
-    }.get(data[:4])
-    if fat is None:
-        return parse_macho_thin(data)
-    if len(data) < 8:
-        raise ValueError("truncated Mach-O fat header")
-
-    byte_order, entry_size = fat
-    architecture_count = struct.unpack_from(f"{byte_order}I", data, 4)[0]
-    if architecture_count == 0 or architecture_count > 64:
+    if data[:4] in FAT_MACHO_MAGICS:
+        # The release builds its one Mach-O target thin. A multi-slice image is
+        # rejected downstream by verify_native_target's architecture equality,
+        # but a single-slice universal image would have satisfied it, so refusing
+        # the container outright is a real narrowing of what can pass.
         raise ValueError(
-            f"invalid Mach-O fat architecture count {architecture_count}"
+            "Mach-O universal binaries are not a release artifact shape; "
+            "expected a thin image"
         )
-    table_size = architecture_count * entry_size
-    require_range(data, 8, table_size, "Mach-O fat architecture table")
-    table_end = 8 + table_size
-
-    slices = []
-    for index in range(architecture_count):
-        offset = 8 + index * entry_size
-        cpu_type = struct.unpack_from(f"{byte_order}I", data, offset)[0]
-        architecture = MACHO_CPU_ARCHITECTURE.get(cpu_type)
-        if architecture is None:
-            raise ValueError(
-                f"unsupported Mach-O CPU type 0x{cpu_type:08x}"
-            )
-        if entry_size == 20:
-            slice_offset, slice_size, alignment = struct.unpack_from(
-                f"{byte_order}III", data, offset + 8
-            )
-        else:
-            slice_offset, slice_size, alignment, _reserved = struct.unpack_from(
-                f"{byte_order}QQII", data, offset + 8
-            )
-        if slice_size == 0:
-            raise ValueError(f"Mach-O fat slice {index} is empty")
-        if slice_offset < table_end:
-            raise ValueError(
-                f"Mach-O fat slice {index} overlaps the architecture table"
-            )
-        if alignment >= 63 or slice_offset % (1 << alignment):
-            raise ValueError(f"Mach-O fat slice {index} is misaligned")
-        require_range(
-            data,
-            slice_offset,
-            slice_size,
-            f"Mach-O fat slice {index}",
-        )
-        slices.append((slice_offset, slice_size, architecture, index))
-
-    previous_end = table_end
-    for slice_offset, slice_size, _architecture, index in sorted(slices):
-        if slice_offset < previous_end:
-            raise ValueError(f"Mach-O fat slice {index} overlaps another slice")
-        previous_end = slice_offset + slice_size
-
-    architectures = set()
-    exported_symbols = set()
-    for slice_offset, slice_size, architecture, index in slices:
-        parsed = parse_macho_thin(
-            data[slice_offset : slice_offset + slice_size]
-        )
-        if parsed is None:
-            raise ValueError(f"Mach-O fat slice {index} is not a Mach-O image")
-        if parsed.architectures != frozenset({architecture}):
-            raise ValueError(
-                f"Mach-O fat slice {index} CPU type does not match its image"
-            )
-        if architecture in architectures:
-            raise ValueError(
-                f"Mach-O fat image contains duplicate {architecture} slices"
-            )
-        architectures.add(architecture)
-        exported_symbols.update(parsed.exported_symbols)
-
-    return NativeBinary(
-        "Mach-O", frozenset(architectures), frozenset(exported_symbols)
-    )
+    return parse_macho_thin(data)
 
 
 def native_binary(data: bytes) -> NativeBinary:
@@ -1711,10 +1799,14 @@ def verify_native_target(
             f"expected only {expected_architecture} for {target}"
         )
 
-    normalized_symbols = {
-        symbol[1:] if symbol.startswith("_") else symbol
-        for symbol in parsed.exported_symbols
-    }
+    normalized_symbols = (
+        {
+            symbol[1:] if symbol.startswith("_") else symbol
+            for symbol in parsed.exported_symbols
+        }
+        if parsed.binary_format == "Mach-O"
+        else set(parsed.exported_symbols)
+    )
     missing = sorted(
         MOSAIC_SYMBOL_FAMILIES[symbol_family] - normalized_symbols
     )

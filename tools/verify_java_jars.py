@@ -21,18 +21,20 @@ from __future__ import annotations
 
 import argparse
 import posixpath
+import re
 import stat
 import sys
-from pathlib import Path, PurePosixPath, PureWindowsPath
+import xml.etree.ElementTree as ET
+import zlib
+from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
+import archive_guard
 from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
 
-MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
-MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
-MAX_ARCHIVE_ENTRIES = 65536
 MAX_JAVA_CLASS_SIZE = 16 * 1024 * 1024
+ARCHIVE_READ_CHUNK_SIZE = 1024 * 1024
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -61,6 +63,11 @@ NESTED_LICENSE_MARKERS = (
     "For Zstandard software",
     "Apache Arrow",
 )
+PUBLIC_JAVA_TYPE = re.compile(
+    r"(?m)^public\s+"
+    r"(?:(?:abstract|final|sealed|non-sealed|strictfp)\s+)*"
+    r"(?:class|interface|enum|record|@interface)\s+"
+)
 
 
 def _validate_target_matrix() -> None:
@@ -80,52 +87,16 @@ def repository_root() -> Path:
 
 
 def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
-    entries: dict[str, ZipInfo] = {}
-    normalized_names: dict[str, str] = {}
-    # The per-entry cap does not bound the aggregate, so bound the total and the
-    # entry count too.
-    total_size = 0
-    infos = archive.infolist()
-    if len(infos) > MAX_ARCHIVE_ENTRIES:
-        raise ValueError(
-            f"archive declares more than {MAX_ARCHIVE_ENTRIES} entries: {len(infos)}"
-        )
-    for info in infos:
-        name = info.orig_filename
-        if not name or "\x00" in name or name != info.filename:
-            raise ValueError(f"invalid archive entry path: {name!r}")
-        if "\\" in name:
-            raise ValueError(f"archive entry uses a backslash: {name!r}")
-        if PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute():
-            raise ValueError(f"archive entry uses an absolute path: {name!r}")
-        if ".." in name.split("/"):
-            raise ValueError(f"archive entry uses a '..' path component: {name!r}")
-        if stat.S_ISLNK(info.external_attr >> 16):
-            raise ValueError(f"archive entry is a symbolic link: {name!r}")
-        if info.file_size > MAX_ARCHIVE_ENTRY_SIZE:
-            raise ValueError(
-                f"archive entry {name!r} exceeds the size limit of "
-                f"{MAX_ARCHIVE_ENTRY_SIZE} bytes: {info.file_size} bytes"
-            )
-        total_size += info.file_size
-        if total_size > MAX_ARCHIVE_TOTAL_SIZE:
-            raise ValueError(
-                f"archive exceeds the total size limit of "
-                f"{MAX_ARCHIVE_TOTAL_SIZE} bytes"
-            )
-        if name in entries:
-            raise ValueError(f"archive contains duplicate raw entry name: {name!r}")
-
-        normalized_name = posixpath.normpath(name)
-        previous_name = normalized_names.get(normalized_name)
-        if previous_name is not None:
-            raise ValueError(
-                "archive contains duplicate normalized entry names: "
-                f"{previous_name!r} and {name!r}"
-            )
-
-        entries[name] = info
-        normalized_names[normalized_name] = name
+    entries = archive_guard.validated_entries(archive, "JAR")
+    # ZipExtFile validates a member's CRC only when it is read through EOF.
+    # Header-only format detection below is therefore insufficient for ordinary
+    # resources, so stream every bounded member once before accepting the JAR.
+    for info in entries.values():
+        if info.is_dir():
+            continue
+        with archive.open(info) as source:
+            while source.read(ARCHIVE_READ_CHUNK_SIZE):
+                pass
     return entries
 
 
@@ -164,65 +135,92 @@ def skip_java_members(data: bytes, offset: int) -> int | None:
     return offset
 
 
-def is_java_class(data: bytes) -> bool:
-    """Distinguish a complete Java class from Mach-O's shared CAFEBABE magic."""
+def java_class_internal_name(data: bytes) -> str | None:
+    """Return a complete class file's declared internal name."""
     if len(data) < 10 or not data.startswith(JAVA_CLASS_MAGIC):
-        return False
+        return None
     major_version = int.from_bytes(data[6:8], "big")
     constant_pool_count = int.from_bytes(data[8:10], "big")
     if not 45 <= major_version <= 100 or constant_pool_count == 0:
-        return False
+        return None
 
+    utf8_entries: dict[int, bytes] = {}
+    class_entries: dict[int, int] = {}
     offset = 10
     index = 1
     while index < constant_pool_count:
         if offset >= len(data):
-            return False
+            return None
         tag = data[offset]
         offset += 1
         if tag == 1:
             result = read_java_u2(data, offset)
             if result is None:
-                return False
+                return None
             length, offset = result
             if length > len(data) - offset:
-                return False
+                return None
+            utf8_entries[index] = data[offset : offset + length]
             offset += length
         elif tag in (3, 4, 9, 10, 11, 12, 17, 18):
             offset += 4
         elif tag in (5, 6):
             offset += 8
             index += 1
-        elif tag in (7, 8, 16, 19, 20):
+        elif tag == 7:
+            result = read_java_u2(data, offset)
+            if result is None:
+                return None
+            class_entries[index], offset = result
+        elif tag in (8, 16, 19, 20):
             offset += 2
         elif tag == 15:
             offset += 3
         else:
-            return False
+            return None
         if offset > len(data):
-            return False
+            return None
         index += 1
 
     if offset > len(data) - 8:
-        return False
+        return None
+    this_class = int.from_bytes(data[offset + 2 : offset + 4], "big")
+    name_index = class_entries.get(this_class)
+    name_bytes = utf8_entries.get(name_index) if name_index is not None else None
+    if name_bytes is None:
+        return None
+    try:
+        internal_name = name_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not internal_name:
+        return None
+
     interfaces_count = int.from_bytes(data[offset + 6 : offset + 8], "big")
     offset += 8
     if interfaces_count > (len(data) - offset) // 2:
-        return False
+        return None
     offset += interfaces_count * 2
 
     offset = skip_java_members(data, offset)
     if offset is None:
-        return False
+        return None
     offset = skip_java_members(data, offset)
     if offset is None:
-        return False
+        return None
     result = read_java_u2(data, offset)
     if result is None:
-        return False
+        return None
     attributes_count, offset = result
     offset = skip_java_attributes(data, offset, attributes_count)
-    return offset == len(data)
+    if offset != len(data):
+        return None
+    return internal_name
+
+
+def is_java_class(data: bytes) -> bool:
+    """Distinguish a complete Java class from Mach-O's shared CAFEBABE magic."""
+    return java_class_internal_name(data) is not None
 
 
 def native_binary_magic(source, size: int, name: str) -> str | None:
@@ -261,6 +259,102 @@ def native_archive_entries(
         if name.lower().endswith(NATIVE_SUFFIXES) or magic is not None:
             native_entries.add(name)
     return native_entries
+
+
+def java_source_files(root: Path) -> dict[str, Path]:
+    source_root = root / "java/src/main/java"
+    return {
+        path.relative_to(source_root).as_posix(): path
+        for path in source_root.rglob("*.java")
+        if path.is_file()
+    }
+
+
+MAVEN_POM_NAMESPACE = "{http://maven.apache.org/POM/4.0.0}"
+# Written into every JAR by the ASF parent build rather than declared by the
+# project, so they are expected payload.
+BUILD_METADATA_ENTRIES = frozenset(
+    {"META-INF/MANIFEST.MF", "META-INF/DEPENDENCIES"}
+)
+
+
+def maven_descriptor_entries(root: Path) -> set[str]:
+    """Return the archived Maven descriptor paths implied by the POM coordinates.
+
+    Reads the repository's own version-controlled POM, not a downloaded
+    artifact, so this is inside the trust boundary the verifiers police.
+    """
+    try:
+        document = ET.parse(root / "java/pom.xml").getroot()
+    except ET.ParseError as error:
+        raise ValueError(f"java/pom.xml is not well-formed XML: {error}") from error
+
+    def coordinate(name: str) -> str:
+        for path in (
+            f"{MAVEN_POM_NAMESPACE}{name}",
+            f"{MAVEN_POM_NAMESPACE}parent/{MAVEN_POM_NAMESPACE}{name}",
+        ):
+            element = document.find(path)
+            if element is not None and element.text:
+                return element.text.strip()
+        raise ValueError(f"java/pom.xml declares no {name}")
+
+    prefix = f"META-INF/maven/{coordinate('groupId')}/{coordinate('artifactId')}"
+    return {f"{prefix}/pom.xml", f"{prefix}/pom.properties"}
+
+
+def verify_compiled_java_classes(
+    archive: ZipFile, entries: dict[str, ZipInfo], root: Path
+) -> set[str]:
+    sources = java_source_files(root)
+    if not sources:
+        raise ValueError("repository contains no Java sources")
+
+    required_classes = {
+        str(PurePosixPath(source_path).with_suffix(".class"))
+        for source_path in sources
+    }
+    missing = sorted(required_classes - entries.keys())
+    if missing:
+        raise ValueError(f"main JAR is missing compiled Java classes: {missing}")
+
+    # javac also emits nested and anonymous classes as Outer$Inner.class, which
+    # have no source file of their own. Map each one back to its outermost name
+    # rather than trusting the package prefix.
+    class_entries = {name for name in entries if name.endswith(".class")}
+    for name in sorted(class_entries):
+        stem = name.removesuffix(".class")
+        outer, _, nested = stem.partition("$")
+        # javac emits Outer$Inner in the owner's directory, so a '/' after the
+        # '$' means the entry is not a nested class of that owner at all: for
+        # `package p.Outer$x.evil` it emits p/Outer$x/evil/C.class, which would
+        # otherwise map back to p/Outer.java.
+        if "/" in nested:
+            raise ValueError(
+                f"main JAR class {name!r} is not a nested class of "
+                f"{outer + '.class'!r}"
+            )
+        if outer + ".class" not in required_classes:
+            raise ValueError(
+                f"main JAR class {name!r} has no matching repository source"
+            )
+        class_file = entries[name]
+        if class_file.file_size > MAX_JAVA_CLASS_SIZE:
+            raise ValueError(
+                f"compiled Java class {name!r} exceeds the size limit of "
+                f"{MAX_JAVA_CLASS_SIZE} bytes: {class_file.file_size} bytes"
+            )
+        with archive.open(class_file) as class_stream:
+            class_bytes = class_stream.read(MAX_JAVA_CLASS_SIZE + 1)
+        internal_name = java_class_internal_name(class_bytes)
+        if internal_name is None:
+            raise ValueError(f"invalid compiled Java class: {name}")
+        expected_name = name.removesuffix(".class")
+        if internal_name != expected_name:
+            raise ValueError(
+                f"compiled Java class {name!r} declares {internal_name!r}"
+            )
+    return class_entries
 
 
 def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
@@ -311,10 +405,32 @@ def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
                 if marker not in report_text:
                     raise ValueError(f"{report_path} is missing {marker!r}")
 
+        class_entries = verify_compiled_java_classes(archive, entries, root)
+
         packaged_natives = native_archive_entries(archive, entries)
         unexpected_natives = packaged_natives - set(NATIVE_ENTRIES)
         if unexpected_natives:
             raise ValueError(f"unexpected native entries: {sorted(unexpected_natives)}")
+
+        # Presence checks alone let anything else ride along, so state the whole
+        # expected payload and reject the difference. Directory entries carry no
+        # payload and their names are already validated.
+        expected_payload = (
+            required
+            | BUILD_METADATA_ENTRIES
+            | maven_descriptor_entries(root)
+            | class_entries
+            | packaged_natives
+        )
+        unexpected_payload = sorted(
+            name
+            for name, info in entries.items()
+            if not info.is_dir() and name not in expected_payload
+        )
+        if unexpected_payload:
+            raise ValueError(
+                f"main JAR contains unexpected entries: {unexpected_payload}"
+            )
         if require_all_natives and packaged_natives != set(NATIVE_ENTRIES):
             raise ValueError(
                 "release JAR native entries differ from the four declared targets: "
@@ -331,36 +447,96 @@ def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
     print(f"verified main JAR: {path}")
 
 
-def verify_classifier(path: Path, root: Path | None = None) -> None:
+def _verify_classifier_entries(
+    archive: ZipFile, entries: dict[str, ZipInfo], root: Path
+) -> None:
+    for required in ("META-INF/LICENSE", "META-INF/NOTICE"):
+        if required not in entries:
+            raise ValueError(f"missing {required}")
+
+    expected_license = (root / "LICENSE").read_bytes()
+    if archive.read(entries["META-INF/LICENSE"]) != expected_license:
+        raise ValueError("classifier LICENSE differs from repository root LICENSE")
+    expected_notice = (root / "NOTICE").read_bytes()
+    if archive.read(entries["META-INF/NOTICE"]) != expected_notice:
+        raise ValueError("classifier NOTICE differs from repository root NOTICE")
+
+    forbidden = sorted(
+        name
+        for name in entries
+        if name.startswith("native/")
+        or name == "META-INF/DEPENDENCIES.rust.tsv"
+        or posixpath.basename(name) == "THIRD-PARTY-LICENSES.html"
+    )
+    forbidden.extend(
+        sorted(native_archive_entries(archive, entries) - set(forbidden))
+    )
+    if forbidden:
+        raise ValueError(f"classifier contains binary-only files: {forbidden}")
+
+
+def verify_sources_jar(path: Path, root: Path | None = None) -> None:
     if root is None:
         root = repository_root()
     with ZipFile(path) as archive:
         entries = validated_entries(archive)
-        for required in ("META-INF/LICENSE", "META-INF/NOTICE"):
-            if required not in entries:
-                raise ValueError(f"missing {required}")
+        _verify_classifier_entries(archive, entries, root)
+        print(f"verified classifier JAR: {path}")
+        expected = java_source_files(root)
+        if not expected:
+            raise ValueError("repository contains no Java sources")
+        packaged = {name for name in entries if name.endswith(".java")}
+        if packaged != set(expected):
+            missing = sorted(set(expected) - packaged)
+            unexpected = sorted(packaged - set(expected))
+            raise ValueError(
+                "sources JAR Java files differ from the repository sources: "
+                f"missing {missing}, unexpected {unexpected}"
+            )
+        for archive_path, source_path in expected.items():
+            if archive.read(entries[archive_path]) != source_path.read_bytes():
+                raise ValueError(
+                    f"sources JAR entry {archive_path} differs from "
+                    f"{source_path.as_posix()}"
+                )
+    print(f"verified sources JAR payload: {path}")
 
-        expected_license = (root / "LICENSE").read_bytes()
-        if archive.read(entries["META-INF/LICENSE"]) != expected_license:
-            raise ValueError("classifier LICENSE differs from repository root LICENSE")
-        expected_notice = (root / "NOTICE").read_bytes()
-        if archive.read(entries["META-INF/NOTICE"]) != expected_notice:
-            raise ValueError("classifier NOTICE differs from repository root NOTICE")
 
-        forbidden = sorted(
+def verify_javadoc_jar(path: Path, root: Path | None = None) -> None:
+    if root is None:
+        root = repository_root()
+    with ZipFile(path) as archive:
+        entries = validated_entries(archive)
+        _verify_classifier_entries(archive, entries, root)
+        print(f"verified classifier JAR: {path}")
+        sources = java_source_files(root)
+        if not sources:
+            raise ValueError("repository contains no Java sources")
+        documented_sources = {
+            source_path
+            for source_path, source in sources.items()
+            if PUBLIC_JAVA_TYPE.search(source.read_text(encoding="utf-8"))
+        }
+        if not documented_sources:
+            raise ValueError("repository contains no public Java API")
+        required = {
+            "index.html",
+            *(
+                f"{source_path.removesuffix('.java')}.html"
+                for source_path in documented_sources
+            ),
+        }
+        missing = sorted(required - entries.keys())
+        if missing:
+            raise ValueError(f"javadoc JAR is missing documentation pages: {missing}")
+        empty = sorted(
             name
-            for name in entries
-            if name.startswith("native/")
-            or name == "META-INF/DEPENDENCIES.rust.tsv"
-            or posixpath.basename(name) == "THIRD-PARTY-LICENSES.html"
+            for name in required
+            if entries[name].is_dir() or entries[name].file_size == 0
         )
-        forbidden.extend(
-            sorted(native_archive_entries(archive, entries) - set(forbidden))
-        )
-        if forbidden:
-            raise ValueError(f"classifier contains binary-only files: {forbidden}")
-
-    print(f"verified classifier JAR: {path}")
+        if empty:
+            raise ValueError(f"javadoc JAR contains empty documentation pages: {empty}")
+    print(f"verified javadoc JAR payload: {path}")
 
 
 def main() -> int:
@@ -372,13 +548,31 @@ def main() -> int:
     args = parser.parse_args()
     root = repository_root()
 
-    try:
-        verify_main_jar(args.main, root, args.require_all_natives)
-        verify_classifier(args.sources, root)
-        verify_classifier(args.javadoc, root)
-    except (BadZipFile, KeyError, OSError, ValueError) as error:
-        print(f"Java artifact verification failed: {error}", file=sys.stderr)
-        return 1
+    # The classifier checks share one code path, so their messages carry no
+    # artifact path; name the artifact here as the wheel verifier does. Unlike
+    # the wheel verifier this loop stops at the first failure, because a broken
+    # main JAR makes the classifier results uninteresting.
+    checks = (
+        (args.main, lambda: verify_main_jar(args.main, root, args.require_all_natives)),
+        (args.sources, lambda: verify_sources_jar(args.sources, root)),
+        (args.javadoc, lambda: verify_javadoc_jar(args.javadoc, root)),
+    )
+    for artifact, check in checks:
+        try:
+            check()
+        except (
+            BadZipFile,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            zlib.error,
+        ) as error:
+            print(
+                f"Java artifact verification failed: {artifact}: {error}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

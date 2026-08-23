@@ -92,9 +92,35 @@ def initialize_release_repo(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
         fake_bin / "gpg",
         """#!/usr/bin/env bash
 set -euo pipefail
+if command -v sha256sum > /dev/null; then
+  digest_of() { sha256sum "$1" | cut -d' ' -f1; }
+else
+  digest_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+fi
 if [[ " $* " == *" --detach-sig "* ]]; then
   archive="${@: -1}"
-  printf 'test signature\\n' > "${archive}.asc"
+  if [[ -n "${MOSAIC_TEST_GPG_BAD_SIG:-}" ]]; then
+    printf 'signed %s\\n' "deadbeef" > "${archive}.asc"
+  else
+    printf 'signed %s\\n' "$(digest_of "${archive}")" > "${archive}.asc"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == "--verify" ]]; then
+  signature="${2:-}"
+  archive="${3:-}"
+  if [[ ! -f "${signature}" || ! -f "${archive}" ]]; then
+    echo "gpg: cannot open ${signature} or ${archive}" >&2
+    exit 1
+  fi
+  # Bind the signature to the archive it was made over, so verifying against a
+  # decoy, against the checksum file, or against the signature itself fails.
+  if [[ "$(cat "${signature}")" != "signed $(digest_of "${archive}")" ]]; then
+    echo "gpg: BAD signature" >&2
+    exit 1
+  fi
+  echo "gpg: Good signature"
+  exit 0
 fi
 """,
     )
@@ -199,6 +225,41 @@ def test_skip_worktree_hidden_mutation_is_rejected(tmp_path: Path) -> None:
         index_flag="--skip-worktree",
         expected_marker="S ",
     )
+
+
+def test_source_release_ignores_inherited_git_dir_and_work_tree(
+    tmp_path: Path,
+) -> None:
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    inherited_repo = tmp_path / "inherited-repo"
+    inherited_repo.mkdir()
+    write(inherited_repo / "README.md", "different repository\n")
+    run(["git", "init", "-q"], cwd=inherited_repo)
+    run(["git", "config", "user.name", "Release Test"], cwd=inherited_repo)
+    run(
+        ["git", "config", "user.email", "release-test@example.invalid"],
+        cwd=inherited_repo,
+    )
+    run(["git", "add", "."], cwd=inherited_repo)
+    run(["git", "commit", "-q", "-m", "inherited fixture"], cwd=inherited_repo)
+
+    write(repo / "UNTRACKED", "must make the declared worktree dirty\n")
+    env["GIT_DIR"] = str(inherited_repo / ".git")
+    env["GIT_WORK_TREE"] = str(inherited_repo)
+    result = subprocess.run(
+        ["bash", script.name],
+        cwd=script.parent,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    output = (result.stdout + result.stderr).decode("utf-8")
+    assert result.returncode != 0
+    assert "clean Git worktree" in output
+    assert "UNTRACKED" in output
 
 
 def test_semantic_checks_run_against_the_archived_head_tree(
@@ -363,3 +424,50 @@ def test_same_length_mutation_keeps_pax_commit_but_fails_tree_verification(
     )
     assert result.returncode != 0
     assert b"file content differs" in result.stderr
+
+
+def test_source_release_emits_a_verified_signature_and_checksum(
+    tmp_path: Path,
+) -> None:
+    # Without these assertions the detach-sign and sha512 steps could both be
+    # deleted from the script with every test still passing.
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    archive = (
+        repo / "tools" / "release" / f"apache-paimon-mosaic-{VERSION}-src.tgz"
+    )
+
+    result = run(["bash", script.name], cwd=script.parent, env=env)
+
+    signature = archive.with_suffix(archive.suffix + ".asc")
+    checksum = archive.with_suffix(archive.suffix + ".sha512")
+    assert signature.is_file()
+    assert checksum.is_file()
+    assert b"Good signature" in result.stdout + result.stderr
+
+    recorded = checksum.read_text(encoding="utf-8").split()[0]
+    assert recorded == hashlib.sha512(archive.read_bytes()).hexdigest()
+    assert archive.name in checksum.read_text(encoding="utf-8")
+
+
+def test_source_release_fails_when_the_signature_does_not_verify(
+    tmp_path: Path,
+) -> None:
+    # Gives `gpg --verify` a deny path; without it, deleting that step from the
+    # script changes no test outcome.
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    hostile_env = dict(env)
+    hostile_env["MOSAIC_TEST_GPG_BAD_SIG"] = "1"
+
+    result = subprocess.run(
+        ["bash", script.name],
+        cwd=script.parent,
+        env=hostile_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert b"BAD signature" in result.stdout + result.stderr

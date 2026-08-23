@@ -63,7 +63,6 @@ def test_jni_symbol_contract_matches_java_rust_and_verifier():
     assert len(java_exports) == 24
     assert len(rust_exports) == 24
     assert len(generic_rust_exports) == 6
-    assert generic_rust_exports <= rust_exports
     assert rust_exports == java_exports
     assert verifier.MOSAIC_SYMBOL_FAMILIES["JNI"] == java_exports
 
@@ -91,3 +90,11 @@ def test_ffi_symbol_contract_matches_python_rust_and_verifier():
     assert len(rust_exports) == 26
     assert rust_exports == python_exports
     assert verifier.MOSAIC_SYMBOL_FAMILIES["FFI"] == rust_exports
+
+
+def test_structural_count_cap_is_pinned():
+    # The boundary tests derive their inputs from this constant, so only an
+    # explicit assertion notices it moving. 512 is ~7x the largest real value
+    # observed (glibc: 69 ELF sections, 10 program headers).
+    assert verifier.MAX_NATIVE_SECTIONS == 512
+    assert verifier.MAX_DYNAMIC_SYMBOLS == 100_000

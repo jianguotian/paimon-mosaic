@@ -33,6 +33,7 @@ TOOLS = TESTS.parent
 sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(TESTS))
 
+import archive_guard  # noqa: E402
 import verify_python_wheels as verifier  # noqa: E402
 import native_binary  # noqa: E402
 from native_binary_fixtures import FFI_SYMBOLS, build_elf  # noqa: E402
@@ -68,6 +69,11 @@ SUPPORTED_WHEELS = (
 )
 EXPECTED_NATIVE_LIBRARY = {
     target: native_path for target, _platform_tag, native_path in SUPPORTED_WHEELS
+}
+PYTHON_MODULES = {
+    "mosaic/__init__.py": b'"""Mosaic package fixture."""\n',
+    "mosaic/_ffi.py": b"def open_native():\n    return None\n",
+    "mosaic/mosaic.py": b"class MosaicReader:\n    pass\n",
 }
 
 
@@ -113,6 +119,7 @@ def build_wheel(
     directory_entries=None,
     native_bytes=b"native-library",
     native_path=None,
+    package_entries=None,
 ):
     dist_info_distribution = dist_info_distribution or filename_distribution
     dist_info_version = dist_info_version or filename_version
@@ -149,6 +156,7 @@ def build_wheel(
 
     native_path = native_path or EXPECTED_NATIVE_LIBRARY[target]
     contents = {
+        **(PYTHON_MODULES if package_entries is None else package_entries),
         "mosaic/LICENSE": license_text,
         "mosaic/NOTICE": notice_text,
         "mosaic/THIRD-PARTY-LICENSES.html": report_text,
@@ -178,6 +186,11 @@ def build_wheel(
     legal_root.mkdir(parents=True, exist_ok=True)
     for name, content in legal_files.items():
         (legal_root / name).write_bytes(content)
+    package_root = root / "python"
+    for name, content in PYTHON_MODULES.items():
+        source = package_root / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(content)
     return wheel, root
 
 
@@ -318,6 +331,38 @@ def test_verify_wheel_accepts_unrecorded_directory_entries(tmp_path, monkeypatch
     assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
 
 
+def test_verify_wheel_rejects_unexpected_directory_entries(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        directory_entries=("payload.pth/",),
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        ValueError,
+        match=r"unexpected wheel directories.*payload\.pth/",
+    ):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_rejects_nonempty_directory_entries(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        unrecorded_entries={"mosaic/": b"hidden payload"},
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        ValueError,
+        match=r"wheel directory entry carries payload.*mosaic/",
+    ):
+        verifier.verify_wheel(wheel, root)
+
+
 def test_main_requires_exactly_one_wheel_per_release_target(
     tmp_path, monkeypatch
 ):
@@ -380,6 +425,7 @@ def test_main_fails_closed_on_non_zip_wheel(tmp_path, monkeypatch, capsys):
     (
         "/mosaic/file.py",
         "C:/mosaic/file.py",
+        "C:../site-packages_evil/payload.py",
         "mosaic\\file.py",
         "mosaic/../file.py",
     ),
@@ -432,7 +478,7 @@ def test_verify_wheel_rejects_oversized_entry_before_archive_read(
         extra_entries={"mosaic/oversized.bin": b"x" * 4097},
     )
     monkeypatch.setattr(
-        verifier,
+        archive_guard,
         "MAX_ARCHIVE_ENTRY_SIZE",
         4096,
         raising=False,
@@ -455,8 +501,8 @@ def test_verify_wheel_rejects_oversized_total_before_archive_read(
         tmp_path,
         extra_entries={f"mosaic/chunk{index}.bin": b"x" * 900 for index in range(8)},
     )
-    monkeypatch.setattr(verifier, "MAX_ARCHIVE_ENTRY_SIZE", 4096, raising=False)
-    monkeypatch.setattr(verifier, "MAX_ARCHIVE_TOTAL_SIZE", 4096, raising=False)
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_ENTRY_SIZE", 4096)
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_TOTAL_SIZE", 4096)
 
     def fail_unbounded_read(*_args, **_kwargs):
         raise AssertionError("archive.read must not be called")
@@ -473,7 +519,7 @@ def test_verify_wheel_rejects_too_many_entries_before_archive_read(
         tmp_path,
         extra_entries={f"mosaic/chunk{index}.bin": b"x" for index in range(8)},
     )
-    monkeypatch.setattr(verifier, "MAX_ARCHIVE_ENTRIES", 4, raising=False)
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_ENTRIES", 4)
 
     def fail_unbounded_read(*_args, **_kwargs):
         raise AssertionError("archive.read must not be called")
@@ -481,20 +527,6 @@ def test_verify_wheel_rejects_too_many_entries_before_archive_read(
     monkeypatch.setattr(ZipFile, "read", fail_unbounded_read)
     with pytest.raises(ValueError, match="more than 4 entries"):
         verifier.verify_wheel(wheel, root)
-
-
-def test_archive_bounds_match_the_java_verifier():
-    # Both verifiers declare their own copies and, unlike the target matrix,
-    # nothing cross-checks them at import time. Divergence would leave one
-    # artifact type less protected than the other.
-    import verify_java_jars
-
-    for name in (
-        "MAX_ARCHIVE_ENTRY_SIZE",
-        "MAX_ARCHIVE_TOTAL_SIZE",
-        "MAX_ARCHIVE_ENTRIES",
-    ):
-        assert getattr(verifier, name) == getattr(verify_java_jars, name), name
 
 
 def test_target_matrix_guard_rejects_drift(monkeypatch):
@@ -669,6 +701,26 @@ def test_verify_wheel_requires_artifact_exact_legal_files(
         verifier.verify_wheel(wheel, root)
 
 
+def test_verify_wheel_requires_python_modules(tmp_path, monkeypatch):
+    wheel, root = build_wheel(tmp_path, package_entries={})
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match="Python modules differ"):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_requires_artifact_exact_python_modules(
+    tmp_path, monkeypatch
+):
+    changed = dict(PYTHON_MODULES)
+    changed["mosaic/mosaic.py"] = b"class DifferentImplementation:\n    pass\n"
+    wheel, root = build_wheel(tmp_path, package_entries=changed)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match=r"mosaic/mosaic\.py does not match"):
+        verifier.verify_wheel(wheel, root)
+
+
 def test_verify_wheel_rejects_unrecorded_archive_entry(tmp_path, monkeypatch):
     wheel, root = build_wheel(
         tmp_path,
@@ -677,6 +729,58 @@ def test_verify_wheel_rejects_unrecorded_archive_entry(tmp_path, monkeypatch):
     monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
     with pytest.raises(ValueError, match="omits wheel entries"):
+        verifier.verify_wheel(wheel, root)
+
+
+@pytest.mark.parametrize(
+    "entry,error_pattern",
+    (
+        ("payload.pth", r"payload\.pth"),
+        ("mosaic/extra.dat", r"mosaic/extra\.dat"),
+    ),
+)
+def test_verify_wheel_rejects_recorded_unexpected_payload(
+    tmp_path, monkeypatch, entry, error_pattern
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={entry: b"unexpected payload\n"},
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"unexpected wheel payload.*{error_pattern}",
+    ):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_accepts_standard_top_level_metadata(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={
+            "paimon_mosaic-0.3.0.dist-info/top_level.txt": b"mosaic\n",
+        },
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
+
+
+def test_verify_wheel_rejects_invalid_top_level_metadata(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        extra_entries={
+            "paimon_mosaic-0.3.0.dist-info/top_level.txt": b"payload\n",
+        },
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match=r"must contain exactly 'mosaic\\n'"):
         verifier.verify_wheel(wheel, root)
 
 
@@ -701,16 +805,9 @@ def test_verify_wheel_rejects_sidecar_native_by_magic(
         verifier.verify_wheel(wheel, root)
 
 
-def test_verify_wheel_does_not_treat_plain_mz_resource_as_pe(
-    tmp_path, monkeypatch
-):
+def test_native_binary_magic_does_not_treat_plain_mz_resource_as_pe():
     not_pe = bytearray(132)
     not_pe[:2] = b"MZ"
     not_pe[0x3C:0x40] = (0x80).to_bytes(4, "little")
-    wheel, root = build_wheel(
-        tmp_path,
-        extra_entries={"mosaic/data/resource.bin": bytes(not_pe)},
-    )
-    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
 
-    assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
+    assert verifier.native_binary_magic(io.BytesIO(not_pe), len(not_pe)) is None

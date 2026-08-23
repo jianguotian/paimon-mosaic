@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import stat
+import struct
 import sys
 import tempfile
 import unittest
@@ -29,13 +30,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 from unittest import mock
-from zipfile import ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile, ZipInfo
 
 
 TOOLS_DIRECTORY = Path(__file__).resolve().parent.parent
 REPOSITORY_ROOT = TOOLS_DIRECTORY.parent
 sys.path.insert(0, str(TOOLS_DIRECTORY))
 
+import archive_guard  # noqa: E402
 import verify_java_jars  # noqa: E402
 import native_binary  # noqa: E402
 
@@ -52,6 +54,35 @@ EXPECTED_NATIVE_ENTRIES = {
     "native/macos/aarch64/libpaimon_mosaic_jni.dylib": "aarch64-apple-darwin",
     "native/windows/x86_64/paimon_mosaic_jni.dll": "x86_64-pc-windows-msvc",
 }
+EXAMPLE_SOURCE_PATH = "org/apache/paimon/mosaic/Example.java"
+EXAMPLE_SOURCE_CONTENTS = (
+    b"package org.apache.paimon.mosaic;\n"
+    b"public class Example {}\n"
+)
+
+
+def minimal_valid_class_bytes(internal_name: str) -> bytes:
+    """Build a minimal classfile fixture without requiring a local JDK."""
+    encoded_name = internal_name.encode()
+    return (
+        b"\xca\xfe\xba\xbe"
+        b"\x00\x00"
+        b"\x00\x34"
+        b"\x00\x05"
+        b"\x01"
+        + len(encoded_name).to_bytes(2, "big")
+        + encoded_name
+        + b"\x07\x00\x01"
+        b"\x01\x00\x10java/lang/Object"
+        b"\x07\x00\x03"
+        b"\x00\x21"
+        b"\x00\x02"
+        b"\x00\x04"
+        b"\x00\x00"
+        b"\x00\x00"
+        b"\x00\x00"
+        b"\x00\x00"
+    )
 
 
 class VerifyJavaJarsTest(unittest.TestCase):
@@ -86,8 +117,14 @@ class VerifyJavaJarsTest(unittest.TestCase):
         path.write_bytes(contents.replace(original_bytes, replacement_bytes))
 
     def verify_classifier(self, path: Path) -> None:
+        # The shape verify_sources_jar and verify_javadoc_jar both run before
+        # their payload checks; the old public wrapper had no production caller.
         with redirect_stdout(StringIO()):
-            verify_java_jars.verify_classifier(path, self.root)
+            with ZipFile(path) as archive:
+                entries = verify_java_jars.validated_entries(archive)
+                verify_java_jars._verify_classifier_entries(
+                    archive, entries, self.root
+                )
 
     def classifier_entries(
         self, *extra_entries: tuple[str | ZipInfo, bytes]
@@ -98,9 +135,46 @@ class VerifyJavaJarsTest(unittest.TestCase):
             *extra_entries,
         ]
 
+    def prepare_classifier_payloads(
+        self,
+    ) -> tuple[list[tuple[str | ZipInfo, bytes]], list[tuple[str | ZipInfo, bytes]]]:
+        source_root = self.root / "java/src/main/java"
+        source = source_root / EXAMPLE_SOURCE_PATH
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(EXAMPLE_SOURCE_CONTENTS)
+        sources = self.classifier_entries(
+            (EXAMPLE_SOURCE_PATH, EXAMPLE_SOURCE_CONTENTS)
+        )
+        javadoc = self.classifier_entries(
+            ("index.html", b"<html>index</html>\n"),
+            (
+                "org/apache/paimon/mosaic/Example.html",
+                b"<html>Example</html>\n",
+            ),
+        )
+        return sources, javadoc
+
+    def write_java_pom(self) -> None:
+        pom = self.root / "java/pom.xml"
+        pom.parent.mkdir(parents=True, exist_ok=True)
+        pom.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<project xmlns="http://maven.apache.org/POM/4.0.0">\n'
+            "  <modelVersion>4.0.0</modelVersion>\n"
+            "  <groupId>org.apache.paimon</groupId>\n"
+            "  <artifactId>mosaic</artifactId>\n"
+            "  <version>0.3.0-SNAPSHOT</version>\n"
+            "</project>\n",
+            encoding="utf-8",
+        )
+
     def prepare_main_jar_fixture(
         self, native_entries: Iterable[str]
     ) -> list[tuple[str, bytes]]:
+        self.write_java_pom()
+        source = self.root / "java/src/main/java" / EXAMPLE_SOURCE_PATH
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(EXAMPLE_SOURCE_CONTENTS)
         binary_resources = self.root / "java/src/main/binary-resources/META-INF"
         report_paths = [
             f"META-INF/licenses/{target}/THIRD-PARTY-LICENSES.html"
@@ -114,6 +188,12 @@ class VerifyJavaJarsTest(unittest.TestCase):
         entries = [
             ("META-INF/LICENSE", license_contents),
             ("META-INF/NOTICE", b"Apache Arrow\n"),
+            (
+                "org/apache/paimon/mosaic/Example.class",
+                minimal_valid_class_bytes(
+                    "org/apache/paimon/mosaic/Example"
+                ),
+            ),
         ]
         for target, report_path in zip(EXPECTED_TARGETS, report_paths):
             report_contents = (
@@ -135,6 +215,12 @@ class VerifyJavaJarsTest(unittest.TestCase):
         cases = {
             "absolute": "/escape",
             "windows_absolute": "C:/escape",
+            "windows_drive_relative": "C:../site-packages_evil/payload.py",
+            "windows_drive_bare": "C:evil",
+            "normalizes_to_dot": "./",
+            # No trailing slash, so this reaches the normalized-name check
+            # rather than the directory-payload one.
+            "is_dot": ".",
             "backslash": "dir\\file",
             "dot_dot": "dir/../escape",
             "symlink": symlink,
@@ -158,7 +244,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "duplicate raw entry name"):
+        with self.assertRaisesRegex(ValueError, "duplicate JAR entry path"):
             self.verify_classifier(path)
 
     def test_rejects_duplicate_normalized_entry_names(self) -> None:
@@ -170,7 +256,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "duplicate normalized entry names"):
+        with self.assertRaisesRegex(ValueError, "duplicate normalized JAR entry path"):
             self.verify_classifier(path)
 
     def test_rejects_oversized_entry_before_archive_read(self) -> None:
@@ -180,18 +266,61 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
 
         with mock.patch.object(
-            verify_java_jars,
+            archive_guard,
             "MAX_ARCHIVE_ENTRY_SIZE",
             4096,
             create=True,
         ):
             with mock.patch.object(
                 ZipFile,
-                "read",
-                side_effect=AssertionError("archive.read must not be called"),
+                "open",
+                side_effect=AssertionError("archive.open must not be called"),
             ):
                 with self.assertRaisesRegex(
                     ValueError, r"oversized\.bin.*size limit"
+                ):
+                    self.verify_classifier(path)
+
+    def test_rejects_too_many_entries_before_archive_read(self) -> None:
+        path = self.write_jar(
+            "too-many-entries.jar",
+            self.classifier_entries(
+                *((f"payload/{index}.bin", b"x") for index in range(4))
+            ),
+        )
+
+        with mock.patch.object(
+            archive_guard, "MAX_ARCHIVE_ENTRIES", 5
+        ):
+            with mock.patch.object(
+                ZipFile,
+                "open",
+                side_effect=AssertionError("archive.open must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, r"declares more than 5 entries: 6"
+                ):
+                    self.verify_classifier(path)
+
+    def test_rejects_oversized_total_before_archive_read(self) -> None:
+        path = self.write_jar(
+            "oversized-total.jar",
+            self.classifier_entries(
+                ("payload/first.bin", b"x" * 3000),
+                ("payload/second.bin", b"y" * 3000),
+            ),
+        )
+
+        with mock.patch.object(
+            archive_guard, "MAX_ARCHIVE_TOTAL_SIZE", 4096
+        ):
+            with mock.patch.object(
+                ZipFile,
+                "open",
+                side_effect=AssertionError("archive.open must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, r"exceeds the total size limit of 4096 bytes"
                 ):
                     self.verify_classifier(path)
 
@@ -209,7 +338,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
         self.replace_jar_entry_name(path, placeholder, malicious)
 
         with mock.patch.object(verify_java_jars, "verify_native_target"):
-            with self.assertRaisesRegex(ValueError, "invalid archive entry path"):
+            with self.assertRaisesRegex(ValueError, "invalid JAR entry path"):
                 with redirect_stdout(StringIO()):
                     verify_java_jars.verify_main_jar(path, self.root, True)
 
@@ -238,27 +367,15 @@ class VerifyJavaJarsTest(unittest.TestCase):
             self.verify_classifier(wrong_notice)
 
     def test_classifier_does_not_treat_java_class_magic_as_macho(self) -> None:
-        java_class = (
-            b"\xca\xfe\xba\xbe"
-            b"\x00\x00"
-            b"\x00\x34"
-            b"\x00\x05"
-            b"\x01\x00\x07Example"
-            b"\x07\x00\x01"
-            b"\x01\x00\x10java/lang/Object"
-            b"\x07\x00\x03"
-            b"\x00\x21"
-            b"\x00\x02"
-            b"\x00\x04"
-            b"\x00\x00"
-            b"\x00\x00"
-            b"\x00\x00"
-            b"\x00\x00"
-        )
         path = self.write_jar(
             "java-class.jar",
             self.classifier_entries(
-                ("org/apache/paimon/mosaic/Example.class", java_class)
+                (
+                    "org/apache/paimon/mosaic/Example.class",
+                    minimal_valid_class_bytes(
+                        "org/apache/paimon/mosaic/Example"
+                    ),
+                )
             ),
         )
 
@@ -275,6 +392,31 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "binary-only"):
             self.verify_classifier(malformed)
+
+    def test_classifier_reads_every_member_to_verify_its_crc(self) -> None:
+        payload_size = verify_java_jars.ARCHIVE_READ_CHUNK_SIZE + 64 * 1024
+        path = self.write_jar(
+            "corrupt-resource.jar",
+            self.classifier_entries(("resource.bin", b"A" * payload_size)),
+        )
+        with ZipFile(path) as archive:
+            info = archive.getinfo("resource.bin")
+        with path.open("r+b") as file:
+            file.seek(info.header_offset + 26)
+            name_length = int.from_bytes(file.read(2), "little")
+            extra_length = int.from_bytes(file.read(2), "little")
+            file.seek(
+                info.header_offset
+                + 30
+                + name_length
+                + extra_length
+                + verify_java_jars.ARCHIVE_READ_CHUNK_SIZE
+                + 32 * 1024
+            )
+            file.write(b"B")
+
+        with self.assertRaisesRegex(BadZipFile, "Bad CRC-32"):
+            self.verify_classifier(path)
 
     def test_oversized_java_class_is_not_fully_read(self) -> None:
         class RecordingSource(BytesIO):
@@ -370,6 +512,79 @@ class VerifyJavaJarsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected native"):
                 with redirect_stdout(StringIO()):
                     verify_java_jars.verify_main_jar(injected, self.root, True)
+
+    def test_main_jar_requires_compiled_java_classes(self) -> None:
+        additional_source = (
+            self.root
+            / "java/src/main/java/org/apache/paimon/mosaic/Additional.java"
+        )
+        additional_source.parent.mkdir(parents=True, exist_ok=True)
+        additional_source.write_text(
+            "package org.apache.paimon.mosaic;\n"
+            "public class Additional {}\n",
+            encoding="utf-8",
+        )
+        entries = [
+            (name, contents)
+            for name, contents in self.prepare_main_jar_fixture(
+                EXPECTED_NATIVE_ENTRIES
+            )
+        ]
+        path = self.write_jar(
+            "main-with-one-source-class-missing.jar",
+            entries,
+        )
+
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with self.assertRaisesRegex(ValueError, "compiled Java classes"):
+                with redirect_stdout(StringIO()):
+                    verify_java_jars.verify_main_jar(path, self.root, True)
+
+    def test_main_jar_rejects_invalid_required_java_class(self) -> None:
+        entries = [
+            (
+                name,
+                b"not a Java class" if name.endswith("Example.class") else contents,
+            )
+            for name, contents in self.prepare_main_jar_fixture(
+                EXPECTED_NATIVE_ENTRIES
+            )
+        ]
+        path = self.write_jar("main-with-invalid-class.jar", entries)
+
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"invalid compiled Java class.*Example\.class",
+            ):
+                with redirect_stdout(StringIO()):
+                    verify_java_jars.verify_main_jar(path, self.root, True)
+
+    def test_main_jar_rejects_java_class_declared_at_wrong_path(self) -> None:
+        entries = [
+            (
+                name,
+                (
+                    minimal_valid_class_bytes(
+                        "org/apache/paimon/mosaic/Different"
+                    )
+                    if name.endswith("Example.class")
+                    else contents
+                ),
+            )
+            for name, contents in self.prepare_main_jar_fixture(
+                EXPECTED_NATIVE_ENTRIES
+            )
+        ]
+        path = self.write_jar("main-with-misnamed-class.jar", entries)
+
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"Example\.class.*declares.*Different",
+            ):
+                with redirect_stdout(StringIO()):
+                    verify_java_jars.verify_main_jar(path, self.root, True)
 
     def test_main_jar_propagates_native_verification_failure(self) -> None:
         path = self.write_jar(
@@ -520,8 +735,9 @@ class VerifyJavaJarsTest(unittest.TestCase):
             "main.jar",
             self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES),
         )
-        sources = self.write_jar("sources.jar", self.classifier_entries())
-        javadoc = self.write_jar("javadoc.jar", self.classifier_entries())
+        source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        sources = self.write_jar("sources.jar", source_entries)
+        javadoc = self.write_jar("javadoc.jar", javadoc_entries)
         arguments = [
             "verify_java_jars.py",
             "--main",
@@ -557,6 +773,72 @@ class VerifyJavaJarsTest(unittest.TestCase):
                     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                         self.assertEqual(verify_java_jars.main(), 1)
 
+    def test_sources_and_javadoc_validate_each_archive_once(self) -> None:
+        source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        cases = (
+            (
+                "sources",
+                self.write_jar("sources-single-pass.jar", source_entries),
+                verify_java_jars.verify_sources_jar,
+            ),
+            (
+                "javadoc",
+                self.write_jar("javadoc-single-pass.jar", javadoc_entries),
+                verify_java_jars.verify_javadoc_jar,
+            ),
+        )
+
+        for case, path, verifier in cases:
+            with self.subTest(case=case):
+                with mock.patch.object(
+                    verify_java_jars,
+                    "validated_entries",
+                    wraps=verify_java_jars.validated_entries,
+                ) as validate:
+                    with redirect_stdout(StringIO()):
+                        verifier(path, self.root)
+                self.assertEqual(validate.call_count, 1)
+
+    def test_sources_and_javadoc_classifiers_require_real_payloads(self) -> None:
+        self.prepare_classifier_payloads()
+        empty = self.write_jar("empty-classifier.jar", self.classifier_entries())
+
+        with self.assertRaisesRegex(ValueError, "sources JAR Java files differ"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_sources_jar(empty, self.root)
+        with self.assertRaisesRegex(ValueError, "missing documentation pages"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_javadoc_jar(empty, self.root)
+
+    def test_sources_jar_must_match_repository_sources(self) -> None:
+        source_entries, _javadoc_entries = self.prepare_classifier_payloads()
+        changed = [
+            (
+                name,
+                b"package org.apache.paimon.mosaic; public class Changed {}\n"
+                if name == "org/apache/paimon/mosaic/Example.java"
+                else contents,
+            )
+            for name, contents in source_entries
+        ]
+        path = self.write_jar("changed-sources.jar", changed)
+
+        with self.assertRaisesRegex(ValueError, "differs from"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_sources_jar(path, self.root)
+
+    def test_javadoc_pages_must_not_be_empty(self) -> None:
+        _source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        empty_index = [
+            (name, b"" if name == "index.html" else contents)
+            for name, contents in javadoc_entries
+        ]
+        path = self.write_jar("empty-javadoc-page.jar", empty_index)
+
+        with self.assertRaisesRegex(ValueError, "empty documentation pages"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_javadoc_jar(path, self.root)
+
     def test_main_fails_closed_on_non_zip_artifact(self) -> None:
         # A truncated / non-zip JAR raises zipfile.BadZipFile. It must be caught
         # at the CLI boundary and reported as a failure, not escape as an
@@ -568,6 +850,108 @@ class VerifyJavaJarsTest(unittest.TestCase):
             "verify_java_jars.py",
             "--main",
             str(broken),
+            "--sources",
+            str(classifier),
+            "--javadoc",
+            str(classifier),
+        ]
+        with mock.patch.object(
+            verify_java_jars, "repository_root", return_value=self.root
+        ):
+            with mock.patch.object(sys, "argv", arguments):
+                stderr = StringIO()
+                with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                    self.assertEqual(verify_java_jars.main(), 1)
+                self.assertIn(
+                    "Java artifact verification failed", stderr.getvalue()
+                )
+
+    def test_malformed_java_pom_is_reported_as_a_failure(self) -> None:
+        # maven_descriptor_entries derives the expected descriptor path from the
+        # POM, and ET.ParseError is a SyntaxError subclass, so without explicit
+        # handling it escapes main()'s except tuple as a traceback.
+        main_jar = self.write_jar(
+            "main.jar", self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        )
+        (self.root / "java/pom.xml").write_text("<project>", encoding="utf-8")
+        arguments = [
+            "verify_java_jars.py",
+            "--main",
+            str(main_jar),
+            "--sources",
+            str(main_jar),
+            "--javadoc",
+            str(main_jar),
+        ]
+
+        with mock.patch.object(
+            verify_java_jars, "repository_root", return_value=self.root
+        ):
+            with mock.patch.object(verify_java_jars, "verify_native_target"):
+                with mock.patch.object(sys, "argv", arguments):
+                    stderr = StringIO()
+                    with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                        self.assertEqual(verify_java_jars.main(), 1)
+                    self.assertIn("not well-formed XML", stderr.getvalue())
+
+    def test_main_names_the_failing_artifact(self) -> None:
+        # The three JAR checks shared one except clause, so a failure never said
+        # which artifact broke; the classifier messages carry no path of their own.
+        main_jar = self.write_jar(
+            "main.jar", self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        )
+        source_entries, _javadoc_entries = self.prepare_classifier_payloads()
+        sources = self.write_jar("sources.jar", source_entries)
+        broken_javadoc = self.root / "javadoc.jar"
+        broken_javadoc.write_bytes(b"not a zip file")
+        arguments = [
+            "verify_java_jars.py",
+            "--main",
+            str(main_jar),
+            "--sources",
+            str(sources),
+            "--javadoc",
+            str(broken_javadoc),
+        ]
+
+        with mock.patch.object(
+            verify_java_jars, "repository_root", return_value=self.root
+        ):
+            with mock.patch.object(verify_java_jars, "verify_native_target"):
+                with mock.patch.object(sys, "argv", arguments):
+                    stderr = StringIO()
+                    with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                        self.assertEqual(verify_java_jars.main(), 1)
+                    message = stderr.getvalue()
+                    self.assertIn(str(broken_javadoc), message)
+                    self.assertNotIn(str(main_jar), message)
+                    self.assertNotIn(str(sources), message)
+
+    def test_main_fails_closed_on_a_damaged_deflate_stream(self) -> None:
+        # validated_entries streams every member through EOF to force a CRC
+        # check, so a member corrupted deep inside its deflate stream raises
+        # zlib.error rather than BadZipFile.
+        classifier = self.root / "sources.jar"
+        with ZipFile(classifier, "w", ZIP_DEFLATED) as archive:
+            for name, contents in self.classifier_entries():
+                archive.writestr(name, contents)
+            archive.writestr("payload.bin", bytes(range(256)) * 20000)
+
+        raw = bytearray(classifier.read_bytes())
+        with ZipFile(classifier) as archive:
+            info = archive.getinfo("payload.bin")
+        name_length, extra_length = struct.unpack_from(
+            "<HH", raw, info.header_offset + 26
+        )
+        data_start = info.header_offset + 30 + name_length + extra_length
+        for offset in range(data_start + 2000, data_start + 2003):
+            raw[offset] ^= 0xFF
+        classifier.write_bytes(bytes(raw))
+
+        arguments = [
+            "verify_java_jars.py",
+            "--main",
+            str(classifier),
             "--sources",
             str(classifier),
             "--javadoc",
@@ -664,6 +1048,119 @@ class VerifyJavaJarsTest(unittest.TestCase):
         self.assertIn("tools/verify_java_jars.py", arguments)
         self.assertIn("--require-all-natives", arguments)
 
+    # Presence checks alone let anything else ride along. The build-metadata
+    # cases pin that the reverse set difference does not reject a real Maven
+    # artifact: mvn package emits MANIFEST.MF, META-INF/DEPENDENCIES,
+    # META-INF/maven/<groupId>/<artifactId>/pom.{xml,properties}, 13 directory
+    # entries and nested classes, none of which a source listing names.
 
+    def verify_main(self, entries: list[tuple[str, bytes]]) -> None:
+        path = self.write_jar("main.jar", entries)
+        with mock.patch.object(verify_java_jars, "verify_native_target"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_main_jar(path, self.root, False)
+
+    def test_accepts_the_entries_a_real_maven_build_adds(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        entries.extend(
+            [
+                ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+                ("META-INF/DEPENDENCIES", b"// generated\n"),
+                (
+                    "META-INF/maven/org.apache.paimon/mosaic/pom.xml",
+                    b"<project/>\n",
+                ),
+                (
+                    "META-INF/maven/org.apache.paimon/mosaic/pom.properties",
+                    b"artifactId=mosaic\n",
+                ),
+            ]
+        )
+        # A real `mvn package` artifact carries 13 empty directory entries. The
+        # fixture had none, which is why a directory entry carrying payload
+        # passed every test while failing on the real JAR.
+        entries.extend(
+            (directory, b"")
+            for directory in (
+                "META-INF/",
+                "META-INF/licenses/",
+                "META-INF/maven/",
+                "org/",
+                "org/apache/",
+                "org/apache/paimon/",
+                "org/apache/paimon/mosaic/",
+            )
+        )
+
+        self.verify_main(entries)
+
+    def test_rejects_a_directory_entry_carrying_payload(self) -> None:
+        # A ZIP directory entry is only a trailing slash, and the JVM still reads
+        # its data through getResourceAsStream / ServiceLoader.
+        for entry in (
+            "META-INF/services/java.sql.Driver/",
+            "native/linux/x86_64/rogue.so/",
+            "lib/extra.jar/",
+        ):
+            with self.subTest(entry=entry):
+                entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+                entries.append((entry, b"smuggled payload"))
+
+                with self.assertRaisesRegex(
+                    ValueError, "directory entry carries payload"
+                ):
+                    self.verify_main(entries)
+
+    def test_rejects_a_class_smuggled_below_a_nested_class_name(self) -> None:
+        # javac emits p/Outer$x/evil/C.class for `package p.Outer$x.evil`, which
+        # split("$", 1)[0] mapped back to the real p/Outer.java.
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        outer = EXAMPLE_SOURCE_PATH.removesuffix(".java")
+        smuggled = f"{outer}$x/evil/Backdoor"
+        entries.append((f"{smuggled}.class", minimal_valid_class_bytes(smuggled)))
+
+        with self.assertRaisesRegex(ValueError, "is not a nested class of"):
+            self.verify_main(entries)
+
+    def test_accepts_nested_and_anonymous_classes(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        outer = EXAMPLE_SOURCE_PATH.removesuffix(".java")
+        for suffix in ("$1", "$Inner"):
+            nested = f"{outer}{suffix}"
+            entries.append((f"{nested}.class", minimal_valid_class_bytes(nested)))
+
+        self.verify_main(entries)
+
+    def test_rejects_payload_no_source_or_build_step_accounts_for(self) -> None:
+        for entry, contents in (
+            ("META-INF/services/java.sql.Driver", b"com.evil.Driver\n"),
+            ("lib/extra.jar", b"PK\x03\x04nested"),
+            ("payload.sh", b"#!/bin/sh\n"),
+            ("META-INF/maven/org.other/mosaic/pom.xml", b"<project/>\n"),
+        ):
+            with self.subTest(entry=entry):
+                entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+                entries.append((entry, contents))
+
+                with self.assertRaisesRegex(ValueError, "unexpected entries"):
+                    self.verify_main(entries)
+
+    def test_rejects_a_class_with_no_repository_source(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        smuggled = "org/apache/paimon/mosaic/Smuggled"
+        entries.append((f"{smuggled}.class", minimal_valid_class_bytes(smuggled)))
+
+        with self.assertRaisesRegex(ValueError, "no matching repository source"):
+            self.verify_main(entries)
+
+    def test_rejects_a_nested_class_that_declares_another_name(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        outer = EXAMPLE_SOURCE_PATH.removesuffix(".java")
+        entries.append(
+            (f"{outer}$Fake.class", minimal_valid_class_bytes(f"{outer}$Other"))
+        )
+
+        with self.assertRaisesRegex(ValueError, "declares"):
+            self.verify_main(entries)
 if __name__ == "__main__":
     unittest.main()

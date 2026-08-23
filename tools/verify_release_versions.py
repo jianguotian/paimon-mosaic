@@ -589,6 +589,36 @@ def update_cargo_versions(root: Path, old_version: str, new_version: str) -> lis
     return sorted(updates)
 
 
+def update_python_version(root: Path, old_version: str, new_version: str) -> Path:
+    pyproject = root.resolve() / "python/pyproject.toml"
+    source = pyproject.read_text(encoding="utf-8")
+    assignments = [
+        assignment
+        for assignment in toml_assignments(source)
+        if assignment.table == ("project",) and assignment.key == ("version",)
+    ]
+    if len(assignments) != 1:
+        raise ValueError(
+            f"{pyproject}: expected one [project] version assignment, "
+            f"found {len(assignments)}"
+        )
+
+    actual = tomllib.loads(source)["project"]["version"]
+    if actual not in {old_version, new_version}:
+        raise ValueError(
+            f"{pyproject}: expected project version {old_version} or "
+            f"{new_version}, found {actual}"
+        )
+
+    assignment = assignments[0]
+    start, end = quoted_value_span(source, assignment.equals + 1, assignment.end)
+    updated = source[:start] + new_version + source[end:]
+    if tomllib.loads(updated)["project"]["version"] != new_version:
+        raise ValueError(f"{pyproject}: project version was not updated")
+    pyproject.write_text(updated, encoding="utf-8")
+    return pyproject
+
+
 def verify(expected: str, java_snapshot: bool, root: Path = ROOT) -> list[str]:
     failures = []
     expected_java = f"{expected}-SNAPSHOT" if java_snapshot else expected
@@ -650,16 +680,28 @@ def main() -> int:
             "dependencies"
         ),
     )
+    parser.add_argument(
+        "--update-python",
+        nargs=2,
+        metavar=("OLD_VERSION", "NEW_VERSION"),
+        help="update python/pyproject.toml [project].version",
+    )
     args = parser.parse_args()
 
-    if args.update_cargo:
+    if args.update_cargo and args.update_python:
+        parser.error("--update-cargo and --update-python are mutually exclusive")
+
+    if args.update_cargo or args.update_python:
         if args.version is not None or args.java_snapshot:
-            parser.error("--update-cargo cannot be combined with version verification")
-        old_version, new_version = args.update_cargo
+            parser.error("version updates cannot be combined with version verification")
+        old_version, new_version = args.update_cargo or args.update_python
         if not SEMVER.fullmatch(old_version) or not SEMVER.fullmatch(new_version):
-            parser.error("Cargo versions must be three-part numeric release versions")
+            parser.error("versions must be three-part numeric release versions")
         try:
-            updated = update_cargo_versions(ROOT, old_version, new_version)
+            if args.update_cargo:
+                updated = update_cargo_versions(ROOT, old_version, new_version)
+            else:
+                updated = [update_python_version(ROOT, old_version, new_version)]
         except (
             KeyError,
             OSError,
@@ -667,7 +709,8 @@ def main() -> int:
             tomllib.TOMLDecodeError,
             ValueError,
         ) as error:
-            print(f"Cargo version update failed: {error}", file=sys.stderr)
+            component = "Cargo" if args.update_cargo else "Python"
+            print(f"{component} version update failed: {error}", file=sys.stderr)
             return 1
         for manifest in updated:
             print(f"updated {manifest.relative_to(ROOT)}")

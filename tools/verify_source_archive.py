@@ -50,6 +50,16 @@ SOURCE_PATHSPECS = (
 
 WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 MAX_SOURCE_TAR_SIZE = 512 * 1024 * 1024
+MAX_SOURCE_TAR_ENTRIES = 65536
+GIT_REPOSITORY_ENVIRONMENT = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +93,8 @@ def resolve_commit(repository: Path, commit: str) -> str:
 
 def git_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    for variable in GIT_REPOSITORY_ENVIRONMENT:
+        environment.pop(variable, None)
     environment["GIT_ATTR_NOSYSTEM"] = "1"
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     return environment
@@ -207,7 +219,12 @@ def archive_entries(archive: tarfile.TarFile, prefix: str) -> dict[str, ArchiveE
     prefix_root = validated_prefix(prefix)
     entries: dict[str, ArchiveEntry] = {}
     normalized_names: dict[str, str] = {}
-    for member in archive.getmembers():
+    for member_count, member in enumerate(archive, 1):
+        if member_count > MAX_SOURCE_TAR_ENTRIES:
+            raise ValueError(
+                "source archive declares more than "
+                f"{MAX_SOURCE_TAR_ENTRIES} entries"
+            )
         if member.isfile():
             kind = "file"
         elif member.isdir():
@@ -255,14 +272,6 @@ def archive_entries(archive: tarfile.TarFile, prefix: str) -> dict[str, ArchiveE
         )
         normalized_names[path] = raw_name
     return entries
-
-
-def read_archive(path: Path, prefix: str) -> dict[str, ArchiveEntry]:
-    try:
-        with tarfile.open(path, mode="r:*") as archive:
-            return archive_entries(archive, prefix)
-    except (tarfile.TarError, EOFError) as error:
-        raise ValueError(f"cannot read source archive {path}: {error}") from error
 
 
 def read_source_archive(

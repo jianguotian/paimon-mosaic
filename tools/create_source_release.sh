@@ -34,6 +34,17 @@ set -o pipefail
 # print command before executing
 set -o xtrace
 
+# The repository selected by this script must not be redirected by an inherited
+# Git environment from a wrapper, hook, or another checkout.
+unset \
+  GIT_DIR \
+  GIT_WORK_TREE \
+  GIT_COMMON_DIR \
+  GIT_INDEX_FILE \
+  GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES \
+  GIT_NAMESPACE
+
 CURR_DIR=$(pwd -P)
 if [[ $(basename "${CURR_DIR}") != "tools" ]] ; then
   echo "You have to call the script from the tools/ dir"

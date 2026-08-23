@@ -62,10 +62,15 @@ def project_version_spans(document: bytes) -> list[tuple[int, int]]:
 def bump_pom_version(pom: Path, old_version: str, new_version: str) -> bool:
     document = pom.read_bytes()
     replaced = False
+    accepted_old_versions = {old_version}
+    if not old_version.endswith("-SNAPSHOT"):
+        accepted_old_versions.add(f"{old_version}-SNAPSHOT")
     # Rewrite back to front so earlier spans keep their offsets.
     for start_index, end_index in sorted(project_version_spans(document), reverse=True):
         element = document[start_index:end_index].decode("utf-8")
-        if element.strip() != f"<version>{old_version}</version>":
+        if element.strip() not in {
+            f"<version>{version}</version>" for version in accepted_old_versions
+        }:
             continue
         document = (
             document[:start_index]
@@ -76,7 +81,8 @@ def bump_pom_version(pom: Path, old_version: str, new_version: str) -> bool:
 
     if not replaced:
         raise PomBumpError(
-            f"{pom}: no project or parent version element holds {old_version}"
+            f"{pom}: no project or parent version element holds one of "
+            f"{sorted(accepted_old_versions)}"
         )
     pom.write_bytes(document)
     return replaced

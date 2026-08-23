@@ -343,26 +343,36 @@ def revoke_key(home: Path, fingerprint: str) -> None:
 
 
 def test_tag_signed_by_a_revoked_key_is_rejected(tmp_path):
-    root = Path(tmp_path).resolve()
-    home, fingerprint, keys = generate_key(root, "Compromised Release")
     repo = repository(tmp_path)
-    sign_tag(repo, "v5.0.0-rc1", home, fingerprint)
+    with tempfile.TemporaryDirectory(
+        prefix="pm-revoked-", dir=short_temporary_root()
+    ) as directory:
+        root = Path(directory).resolve()
+        home, fingerprint, keys = generate_key(root, "Compromised Release")
+        assert home.parent.parent == short_temporary_root()
+        assert len(str(home / "S.gpg-agent")) < GPG_AGENT_SOCKET_LIMIT
+        sign_tag(repo, "v5.0.0-rc1", home, fingerprint)
 
-    # The key is revoked only after it signed the tag, and the revocation reaches
-    # the verifier the way ASF distributes it: inside the published KEYS file.
-    revoke_key(home, fingerprint)
-    env = os.environ.copy()
-    env["GNUPGHOME"] = str(home)
-    keys.write_text(
-        run(["gpg", "--batch", "--armor", "--export", fingerprint], cwd=root, env=env)
-        + "\n",
-        encoding="utf-8",
-    )
+        # The key is revoked only after it signed the tag, and the revocation reaches
+        # the verifier the way ASF distributes it: inside the published KEYS file.
+        revoke_key(home, fingerprint)
+        env = os.environ.copy()
+        env["GNUPGHOME"] = str(home)
+        keys.write_text(
+            run(
+                ["gpg", "--batch", "--armor", "--export", fingerprint],
+                cwd=root,
+                env=env,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
-    with pytest.raises(
-        validator.TagValidationError, match="is not trusted: GnuPG reported REVKEYSIG"
-    ):
-        validator.validate_release_tag(repo, "v5.0.0-rc1", keys)
+        with pytest.raises(
+            validator.TagValidationError,
+            match="is not trusted: GnuPG reported REVKEYSIG",
+        ):
+            validator.validate_release_tag(repo, "v5.0.0-rc1", keys)
 
 
 @pytest.mark.parametrize("status", ["EXPKEYSIG", "EXPSIG"])
@@ -381,3 +391,40 @@ def test_untrusted_gnupg_statuses_are_rejected(monkeypatch, status):
 
     with pytest.raises(validator.TagValidationError, match=status):
         validator.verify_signature(Path("."), "v6.0.0-rc1", {})
+
+
+# Naming these explicitly rather than iterating the production tuple: deriving
+# both the input and the assertion from GIT_REPOSITORY_ENVIRONMENT made the test
+# pass even when that tuple was shrunk to a single name.
+GIT_REPOSITORY_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
+
+
+def test_git_environment_strips_the_repository_selecting_variables():
+    # An inherited GIT_DIR overrides both cwd= and `git -C`, so this module has
+    # to remove the variables rather than work around them. It previously only
+    # set GIT_NO_REPLACE_OBJECTS and stripped nothing.
+    inherited = {name: "/hostile" for name in GIT_REPOSITORY_VARIABLES}
+    inherited["PATH"] = os.environ.get("PATH", "")
+
+    result = validator.git_environment(inherited)
+
+    assert result["GIT_NO_REPLACE_OBJECTS"] == "1"
+    for name in GIT_REPOSITORY_VARIABLES:
+        assert name not in result, f"{name} survived git_environment()"
+    assert result["PATH"] == inherited["PATH"]
+
+
+def test_git_environment_shares_the_source_archive_variable_list():
+    # Three layers used to encode this rule with three different contents.
+    from verify_source_archive import GIT_REPOSITORY_ENVIRONMENT as shared
+
+    assert validator.GIT_REPOSITORY_ENVIRONMENT is shared
+    assert set(shared) == set(GIT_REPOSITORY_VARIABLES)

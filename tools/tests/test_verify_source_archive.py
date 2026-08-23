@@ -47,8 +47,8 @@ def run(command, cwd, env=None):
     )
 
 
-def initialize_repo(tmp_path):
-    repo = tmp_path / "repo"
+def initialize_repo(tmp_path, name="repo"):
+    repo = tmp_path / name
     repo.mkdir()
     (repo / "README.md").write_text("source contents\n", encoding="utf-8")
     (repo / "script.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -78,6 +78,19 @@ def write_tar(path, members):
     with tarfile.open(path, "w") as archive:
         for info, content in members:
             archive.addfile(info, io.BytesIO(content) if content is not None else None)
+
+
+def write_tgz(path, members):
+    """Write members as the gzip source archive the production reader expects."""
+    raw_tar = io.BytesIO()
+    with tarfile.open(fileobj=raw_tar, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for info, content in members:
+            archive.addfile(info, io.BytesIO(content) if content is not None else None)
+    with path.open("wb") as destination:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=destination, mtime=0
+        ) as compressed:
+            compressed.write(raw_tar.getvalue())
 
 
 def regular_file(name, content=b"content", mode=0o664):
@@ -134,6 +147,25 @@ def test_create_and_verify_exact_git_tree(tmp_path):
     assert f"{PREFIX}script.sh" in names
     assert f"{PREFIX}.gitignore" not in names
     assert not any(name.startswith(f"{PREFIX}.github") for name in names)
+
+
+def test_archive_creation_ignores_inherited_git_dir(tmp_path, monkeypatch):
+    repo, commit = initialize_repo(tmp_path, "declared")
+    other_repo, _ = initialize_repo(tmp_path, "inherited")
+    (other_repo / "README.md").write_text(
+        "different repository\n", encoding="utf-8"
+    )
+    run(["git", "add", "README.md"], cwd=other_repo)
+    run(["git", "commit", "-q", "-m", "different tree"], cwd=other_repo)
+
+    monkeypatch.setenv("GIT_DIR", str(other_repo / ".git"))
+    archive = tmp_path / "source.tgz"
+
+    assert verifier.create_archive(archive, repo, "HEAD", PREFIX) == commit
+    with tarfile.open(archive, "r:gz") as source:
+        readme = source.extractfile(f"{PREFIX}README.md")
+        assert readme is not None
+        assert readme.read() == b"source contents\n"
 
 
 def test_archive_verification_rejects_same_tree_from_different_commit(tmp_path):
@@ -223,6 +255,23 @@ def test_archive_verification_rejects_oversized_compressed_input_before_read(
     assert not archive.read_called
 
 
+def test_archive_verification_rejects_too_many_members_while_iterating(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "many-members.tar"
+    write_tgz(
+        archive,
+        [
+            regular_file(f"{PREFIX}file-{index}.txt", str(index).encode())
+            for index in range(4)
+        ],
+    )
+    monkeypatch.setattr(verifier, "MAX_SOURCE_TAR_ENTRIES", 3)
+
+    with pytest.raises(ValueError, match="more than 3 entries"):
+        verifier.read_source_archive(archive, PREFIX)
+
+
 def test_archive_verification_rejects_post_flush_size_overflow(monkeypatch):
     class Archive:
         class Stat:
@@ -265,6 +314,19 @@ def test_archive_verification_rejects_post_flush_size_overflow(monkeypatch):
     with pytest.raises(ValueError, match="uncompressed size limit"):
         verifier.read_source_archive(Archive(), PREFIX)
     assert decompressor.flushed
+
+
+def test_archive_verification_rejects_a_truncated_gzip_stream(tmp_path):
+    # Without the eof check a gzip cut short of its trailer decompresses to a
+    # prefix, and any tar that parses from that prefix would be accepted.
+    repo, commit = initialize_repo(tmp_path)
+    archive = tmp_path / "source.tgz"
+    verifier.create_archive(archive, repo, commit, PREFIX)
+    complete = archive.read_bytes()
+    archive.write_bytes(complete[: len(complete) - 8])
+
+    with pytest.raises(ValueError, match="ended before its trailer"):
+        verifier.read_source_archive(archive, PREFIX)
 
 
 def test_archive_verification_rejects_second_tar_segment(tmp_path):
@@ -372,17 +434,17 @@ def test_archive_creation_rejects_repository_local_attributes(tmp_path):
 
 
 def test_archive_verification_rejects_unsafe_entry_path(tmp_path):
-    archive = tmp_path / "unsafe.tar"
-    write_tar(archive, [regular_file("../escape")])
+    archive = tmp_path / "unsafe.tgz"
+    write_tgz(archive, [regular_file("../escape")])
 
     with pytest.raises(ValueError, match="unsafe archive entry path"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 def test_archive_verification_rejects_duplicate_entry(tmp_path):
-    archive = tmp_path / "duplicate.tar"
+    archive = tmp_path / "duplicate.tgz"
     path = f"{PREFIX}README.md"
-    write_tar(
+    write_tgz(
         archive,
         [
             regular_file(path, b"first"),
@@ -391,19 +453,19 @@ def test_archive_verification_rejects_duplicate_entry(tmp_path):
     )
 
     with pytest.raises(ValueError, match="duplicate archive entry"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 def test_archive_verification_rejects_escaping_symlink(tmp_path):
-    archive = tmp_path / "symlink.tar"
+    archive = tmp_path / "symlink.tgz"
     info = tarfile.TarInfo(f"{PREFIX}link")
     info.type = tarfile.SYMTYPE
     info.mode = 0o777
     info.linkname = "../../outside"
-    write_tar(archive, [(info, None)])
+    write_tgz(archive, [(info, None)])
 
     with pytest.raises(ValueError, match="escapes the archive prefix"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 @pytest.mark.parametrize(
@@ -411,15 +473,15 @@ def test_archive_verification_rejects_escaping_symlink(tmp_path):
     ("C:outside", "C:../outside", "C:/outside"),
 )
 def test_archive_verification_rejects_windows_drive_symlink(tmp_path, target):
-    archive = tmp_path / "symlink.tar"
+    archive = tmp_path / "symlink.tgz"
     info = tarfile.TarInfo(f"{PREFIX}link")
     info.type = tarfile.SYMTYPE
     info.mode = 0o777
     info.linkname = target
-    write_tar(archive, [(info, None)])
+    write_tgz(archive, [(info, None)])
 
     with pytest.raises(ValueError, match="unsafe symbolic-link target"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 @pytest.mark.parametrize("prefix", ("C:release/", "C:/release/"))

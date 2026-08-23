@@ -92,6 +92,25 @@ def test_apache_parent_version_is_not_bumped(tmp_path):
     assert "<version>0.3.0</version>" in text
 
 
+def test_release_version_matches_snapshot_project_version(tmp_path):
+    pom = write_pom(
+        tmp_path,
+        """    <version>0.3.0-SNAPSHOT</version>
+    <dependencies>
+        <dependency>
+            <artifactId>unrelated</artifactId>
+            <version>0.3.0-SNAPSHOT</version>
+        </dependency>
+    </dependencies>""",
+    )
+
+    bumper.bump_pom_version(pom, "0.3.0", "0.4.0-SNAPSHOT")
+
+    text = pom.read_text(encoding="utf-8")
+    assert text.count("<version>0.4.0-SNAPSHOT</version>") == 1
+    assert text.count("<version>0.3.0-SNAPSHOT</version>") == 1
+
+
 def test_module_parent_version_is_bumped_with_the_project(tmp_path):
     pom = write_pom(
         tmp_path,

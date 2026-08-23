@@ -64,29 +64,14 @@ NEW_VERSION_CLEAN=$(echo "$NEW_VERSION" | sed 's/-SNAPSHOT//')
 find . -name 'pom.xml' -not -path '*/target/*' -type f \
   -exec python3 tools/bump_pom_version.py "$OLD_VERSION" "$NEW_VERSION" {} +
 
-# Only the project version element may change. Anything more means the match
-# escaped into a dependency, plugin, or parent version.
-POM_LINES_CHANGED=$(git diff --numstat -- '*pom.xml' | awk '{sum += $1} END {print sum + 0}')
-if [[ "${POM_LINES_CHANGED}" != "1" ]]; then
-  echo "expected exactly one changed pom.xml line, got ${POM_LINES_CHANGED}" >&2
-  git diff -- '*pom.xml' >&2
-  exit 1
-fi
-
 # Change workspace package versions and versioned path dependencies together.
 # The TOML-aware helper also supports retrying a partially completed bump.
 python3 tools/verify_release_versions.py \
   --update-cargo "$OLD_VERSION_CLEAN" "$NEW_VERSION_CLEAN"
 
 # Change version in pyproject.toml.
-export NEW_VERSION_CLEAN
-perl -pi -e '
-  BEGIN {
-    $old = quotemeta($ENV{"OLD_VERSION_CLEAN"});
-    $new = $ENV{"NEW_VERSION_CLEAN"};
-  }
-  s{^version = "${old}"$}{version = "${new}"};
-' python/pyproject.toml
+python3 tools/verify_release_versions.py \
+  --update-python "$OLD_VERSION_CLEAN" "$NEW_VERSION_CLEAN"
 
 # Refresh the lockfile without upgrading registry dependencies, then regenerate
 # every checked-in report containing workspace package versions.
@@ -111,7 +96,7 @@ git add \
   ffi/DEPENDENCIES.rust.tsv \
   jni/DEPENDENCIES.rust.tsv \
   cli/DEPENDENCIES.rust.tsv \
-  java/pom.xml \
+  ':(glob)**/pom.xml' \
   java/src/main/binary-resources \
   python/pyproject.toml \
   python/licenses

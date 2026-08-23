@@ -15,10 +15,13 @@
 
 from __future__ import annotations
 
+import platform
 import runpy
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -104,3 +107,59 @@ def test_find_native_lib_returns_none_when_no_library_exists(tmp_path, monkeypat
     monkeypatch.delenv("MOSAIC_LIB_PATH", raising=False)
 
     assert setup_module["_find_native_lib"]() is None
+
+
+UNTARGETED_PLATFORMS = [
+    ("Darwin", "x86_64"),
+    ("Linux", "i686"),
+    ("Linux", "ppc64le"),
+    ("FreeBSD", "amd64"),
+]
+
+
+def test_setup_imports_on_platforms_the_release_does_not_target(monkeypatch, subtests):
+    # `pip install -e .` is a documented release-candidate verification step, so
+    # importing setup.py must not depend on the host being a release target.
+    for system, machine in UNTARGETED_PLATFORMS:
+        with subtests.test(system=system, machine=machine):
+            monkeypatch.setattr(platform, "system", lambda: system)
+            monkeypatch.setattr(platform, "machine", lambda: machine)
+
+            setup_module = load_setup_module(monkeypatch)
+
+            assert setup_module["_detect_rust_target"]() is None
+            assert setup_module["_license_files"]() == []
+
+
+def test_targeted_platforms_still_declare_the_exact_per_target_legal_files(
+    monkeypatch, subtests
+):
+    expected_targets = {
+        ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
+        ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
+        ("Darwin", "arm64"): "aarch64-apple-darwin",
+        ("Windows", "AMD64"): "x86_64-pc-windows-msvc",
+    }
+    for (system, machine), target in expected_targets.items():
+        with subtests.test(system=system, machine=machine):
+            monkeypatch.setattr(platform, "system", lambda: system)
+            monkeypatch.setattr(platform, "machine", lambda: machine)
+
+            setup_module = load_setup_module(monkeypatch)
+
+            assert setup_module["_license_files"]() == [
+                f"licenses/{target}/LICENSE",
+                f"licenses/{target}/NOTICE",
+                f"licenses/{target}/THIRD-PARTY-LICENSES.html",
+            ]
+
+
+def test_rust_target_still_rejects_untargeted_platforms(monkeypatch):
+    # The hard gate must survive on the wheel-build path; BuildPyWithNativeLib
+    # calls _rust_target() directly.
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    setup_module = load_setup_module(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="Unsupported wheel build platform"):
+        setup_module["_rust_target"]()

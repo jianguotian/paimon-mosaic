@@ -230,12 +230,28 @@ def encode_uleb128(value):
             return bytes(encoded)
 
 
-def build_macho_export_trie(symbols):
+def build_macho_export_trie(
+    symbols,
+    *,
+    flags=0,
+    address=0x1000,
+    resolver=None,
+    reexport_name=b"",
+):
     names = [b"_" + symbol.encode() for symbol in sorted(symbols)]
     if len(names) > 255:
         raise ValueError("test export trie has too many root children")
 
-    leaf = b"\x02\x00\x01\x00"
+    payload = encode_uleb128(flags)
+    if flags & 0x08:
+        payload += encode_uleb128(1) + reexport_name + b"\0"
+    else:
+        payload += encode_uleb128(address)
+        if flags & 0x10:
+            payload += encode_uleb128(
+                address if resolver is None else resolver
+            )
+    leaf = encode_uleb128(len(payload)) + payload + b"\0"
     root_size = 2
     for _ in range(10):
         child_offsets = [
@@ -302,9 +318,22 @@ def build_macho(
     dyld_info_export_trie_symbols=None,
     dyld_info_export_trie_data=None,
     symbol_type=0x0F,
+    symbol_value=0x1000,
+    section_flags=0x80000400,
+    segment_initial_protection=5,
+    export_trie_flags=0,
+    export_trie_address=0x1000,
+    export_trie_resolver=None,
+    export_trie_reexport_name=b"",
+    extra_sections=0,
+    extra_segments=(),
 ):
     symbol_list = sorted(symbols)
-    segment_size = 72 + 80
+    section_count = 1 + extra_sections
+    segment_size = 72 + 80 * section_count
+    # Additional __LINKEDIT-style segments, each declaring its own section
+    # count, so a test can exceed the cap only in aggregate.
+    extra_segment_sizes = [72 + 80 * count for count in extra_segments]
     if id_dylib == "missing":
         id_dylib_commands = []
     elif id_dylib == "duplicate":
@@ -322,7 +351,13 @@ def build_macho(
     if export_trie_data is not None:
         export_trie = bytes(export_trie_data)
     elif export_trie_symbols is not None:
-        export_trie = build_macho_export_trie(export_trie_symbols)
+        export_trie = build_macho_export_trie(
+            export_trie_symbols,
+            flags=export_trie_flags,
+            address=export_trie_address,
+            resolver=export_trie_resolver,
+            reexport_name=export_trie_reexport_name,
+        )
     else:
         export_trie = None
     if (
@@ -354,6 +389,7 @@ def build_macho(
 
     commands_size = (
         segment_size
+        + sum(extra_segment_sizes)
         + sum(len(command) for command in id_dylib_commands)
         + 24
         + export_command_size
@@ -393,7 +429,7 @@ def build_macho(
         command_export_size = export_trie_size_override
     data = bytearray(file_size)
 
-    command_count = 2 + len(id_dylib_commands)
+    command_count = 2 + len(extra_segments) + len(id_dylib_commands)
     if export_trie is not None:
         command_count += 1
     if dyld_info_export_trie is not None:
@@ -423,8 +459,8 @@ def build_macho(
         0,
         file_size,
         7,
-        5,
-        1,
+        segment_initial_protection,
+        section_count,
         0,
     )
     struct.pack_into(
@@ -439,12 +475,32 @@ def build_macho(
         0,
         0,
         0,
-        0x80000400,
+        section_flags,
         0,
         0,
         0,
     )
     command_offset = 32 + segment_size
+    for extra_index, (extra_count, extra_size) in enumerate(
+        zip(extra_segments, extra_segment_sizes)
+    ):
+        struct.pack_into(
+            "<II16sQQQQiiII",
+            data,
+            command_offset,
+            0x19,
+            extra_size,
+            f"__EXTRA{extra_index}\0".encode().ljust(16, b"\0"),
+            0,
+            0,
+            0,
+            0,
+            7,
+            segment_initial_protection,
+            extra_count,
+            0,
+        )
+        command_offset += extra_size
     for command in id_dylib_commands:
         data[command_offset : command_offset + len(command)] = command
         command_offset += len(command)
@@ -528,7 +584,7 @@ def build_macho(
             symbol_type,
             1,
             0,
-            0x1000,
+            symbol_value,
         )
     data[strings_offset : strings_offset + len(strings)] = strings
     if export_trie:
@@ -543,7 +599,7 @@ def build_macho(
     return bytes(data)
 
 
-def build_fat_macho(slices):
+def build_fat_macho(slices, magic=0xCAFEBABE):
     entry_size = 20
     table_end = 8 + len(slices) * entry_size
     offsets = []
@@ -552,7 +608,7 @@ def build_fat_macho(slices):
         offsets.append(offset)
         offset = align(offset + len(image), 0x1000)
     data = bytearray(offset)
-    struct.pack_into(">II", data, 0, 0xCAFEBABE, len(slices))
+    struct.pack_into(">II", data, 0, magic, len(slices))
     for index, ((cpu_type, image), slice_offset) in enumerate(
         zip(slices, offsets)
     ):
@@ -752,8 +808,7 @@ def test_elf_rejects_dynsym_entries_beyond_dt_hash_symbol_count():
 
 
 def test_elf_rejects_an_unbounded_dynamic_symbol_table(monkeypatch):
-    # Hash membership is checked once per symbol and a single-bucket table makes
-    # each check linear, so the entry count must be bounded before that loop.
+    # Keep a hard cap as defense in depth even though hash membership is O(1).
     monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 2)
     data = build_elf()
 
@@ -763,6 +818,48 @@ def test_elf_rejects_an_unbounded_dynamic_symbol_table(monkeypatch):
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
         )
+
+
+@pytest.mark.parametrize(
+    ("format_name", "data"),
+    (
+        ("PE", build_pe()),
+        ("Mach-O", build_macho()),
+    ),
+    ids=("pe", "macho"),
+)
+def test_pe_and_macho_reject_unbounded_symbol_tables(
+    monkeypatch, format_name, data
+):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 2)
+
+    with pytest.raises(
+        ValueError, match=rf"{format_name}.*more than 2 symbols"
+    ):
+        verifier.native_binary(data)
+
+
+@pytest.mark.parametrize(
+    ("format_name", "data"),
+    (
+        ("ELF", build_elf()),
+        ("PE", build_pe()),
+        ("Mach-O", build_macho()),
+    ),
+    ids=("elf", "pe", "macho"),
+)
+def test_native_symbol_name_scans_obey_a_common_budget(
+    monkeypatch, format_name, data
+):
+    # Every fixture name fits individually, but their cumulative scan does not.
+    # This kills implementations that cap one name without charging the loop.
+    monkeypatch.setattr(verifier, "MAX_SYMBOL_STRING_BYTES", 100)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{format_name}.*symbol names.*string scan budget",
+    ):
+        verifier.native_binary(data)
 
 
 def test_elf_does_not_accept_exports_unreachable_from_dt_hash():
@@ -912,6 +1009,112 @@ def test_elf_sysv_hash_rejects_buckets_that_alias_a_chain():
         verifier.parse_elf_sysv_hash(table, section)
 
 
+# The same three guards exist in parse_elf_gnu_hash, where commit 964df48 added
+# them without coverage: all three could be neutered with the suite still green.
+
+
+def gnu_hash_section(table):
+    return verifier.ElfSection(
+        section_type=0x6FFFFFF6,
+        flags=0,
+        address=0,
+        offset=0,
+        size=len(table),
+        link=0,
+        entry_size=4,
+    )
+
+
+def build_gnu_hash_table(symbol_offset, buckets, chains):
+    table = struct.pack("<IIII", len(buckets), symbol_offset, 1, 0)
+    table += struct.pack("<Q", 0)
+    table += struct.pack(f"<{len(buckets)}I", *buckets)
+    table += struct.pack(f"<{len(chains)}I", *chains)
+    return table
+
+
+def test_elf_gnu_hash_rejects_buckets_that_alias_a_chain():
+    # Both buckets head the chain entry at index 1; contains() compares only
+    # indices, so an aliased chain would resolve a symbol under a foreign bucket.
+    table = build_gnu_hash_table(0, (1, 1), (0, 1))
+
+    with pytest.raises(ValueError, match="bucket chains alias"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
+def test_elf_gnu_hash_rejects_a_bucket_preceding_the_symbol_offset():
+    # chain_index = bucket - symbol_offset, so a bucket below symbol_offset
+    # would index the chain table from before its start.
+    table = build_gnu_hash_table(2, (1,), (1,))
+
+    with pytest.raises(ValueError, match="bucket precedes the symbol offset"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
+def test_elf_gnu_hash_rejects_a_chain_that_is_not_terminated():
+    # No chain entry sets the terminator bit, so the walk runs off the table.
+    # Turning this raise into a break is a fail-closed to fail-open change.
+    table = build_gnu_hash_table(0, (1,), (0, 0))
+
+    with pytest.raises(ValueError, match="chain is not terminated"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
+@pytest.mark.parametrize("hash_style", ("sysv", "gnu"))
+def test_elf_hash_membership_accepts_each_reachable_symbol(hash_style):
+    parsed = verifier.native_binary(build_elf(hash_style=hash_style))
+
+    assert parsed.exported_symbols == JNI_SYMBOLS
+
+
+def test_elf_sysv_hash_membership_does_not_walk_the_chain():
+    class UnreadableChains:
+        def __getitem__(self, _index):
+            raise AssertionError("SysV membership walked the hash chain")
+
+    table = verifier.ElfSysvHash(
+        buckets=(1,),
+        chains=UnreadableChains(),
+        owners=(-1, 0),
+    )
+
+    assert table.contains(1, b"mosaic_writer_open")
+
+
+def test_elf_gnu_hash_membership_reads_only_the_requested_chain_entry():
+    name = b"mosaic_writer_open"
+    name_hash = verifier.elf_gnu_hash(name)
+
+    class CountingChains:
+        def __init__(self):
+            self.reads = 0
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            self.reads += 1
+            return name_hash | 1
+
+    chains = CountingChains()
+    table = verifier.ElfGnuHash(
+        symbol_offset=1,
+        bloom_shift=5,
+        bloom=(
+            (1 << (name_hash % 64))
+            | (1 << ((name_hash >> 5) % 64)),
+        ),
+        buckets=(1,),
+        chains=chains,
+        owners=(0,),
+        symbol_count=2,
+    )
+
+    assert table.contains(1, name)
+    assert chains.reads == 1
+
+
 def test_elf_does_not_accept_exports_unreachable_from_dt_gnu_hash():
     data = build_elf(hash_style="gnu", hash_reachable=False)
 
@@ -1056,6 +1259,41 @@ def test_pe_accepts_required_functions_with_unrelated_forwarder():
     assert verifier.native_binary(data).exported_symbols == frozenset(JNI_SYMBOLS)
 
 
+def test_pe_forwarder_shares_export_name_string_scan_budget(monkeypatch):
+    unrelated = "zz_unrelated_forwarder"
+    forwarder = "KERNEL32.Sleep"
+    symbols = JNI_SYMBOLS | {unrelated}
+    ordinary_name_bytes = sum(len(symbol.encode()) + 1 for symbol in symbols)
+    forwarder_bytes = len(forwarder.encode()) + 1
+    monkeypatch.setattr(
+        verifier,
+        "MAX_SYMBOL_STRING_BYTES",
+        ordinary_name_bytes + forwarder_bytes - 1,
+    )
+    data = build_pe(
+        symbols=symbols,
+        symbol_forwarders={unrelated: forwarder},
+    )
+
+    with pytest.raises(ValueError, match="PE export symbol names.*budget"):
+        verifier.native_binary(data)
+
+
+def test_pe_forwarder_accepts_exact_string_scan_budget(monkeypatch):
+    unrelated = "zz_unrelated_forwarder"
+    forwarder = "KERNEL32.Sleep"
+    symbols = JNI_SYMBOLS | {unrelated}
+    exact_budget = sum(len(symbol.encode()) + 1 for symbol in symbols)
+    exact_budget += len(forwarder.encode()) + 1
+    monkeypatch.setattr(verifier, "MAX_SYMBOL_STRING_BYTES", exact_budget)
+    data = build_pe(
+        symbols=symbols,
+        symbol_forwarders={unrelated: forwarder},
+    )
+
+    assert verifier.native_binary(data).exported_symbols == frozenset(JNI_SYMBOLS)
+
+
 def test_pe_rejects_unsorted_export_name_pointer_table():
     data = build_pe(
         export_name_order=list(reversed(sorted(JNI_SYMBOLS)))
@@ -1072,6 +1310,28 @@ def test_pe_rejects_duplicate_export_name_pointer():
 
     with pytest.raises(ValueError, match="strictly increasing"):
         verifier.native_binary(data)
+
+
+@pytest.mark.parametrize(
+    "target,path,data",
+    (
+        (
+            "x86_64-unknown-linux-gnu",
+            "libpaimon_mosaic_jni.so",
+            build_elf(symbols={f"_{symbol}" for symbol in JNI_SYMBOLS}),
+        ),
+        (
+            "x86_64-pc-windows-msvc",
+            "paimon_mosaic_jni.dll",
+            build_pe(symbols={f"_{symbol}" for symbol in JNI_SYMBOLS}),
+        ),
+    ),
+)
+def test_non_macho_targets_do_not_strip_leading_underscores(
+    target, path, data
+):
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verify_jni_target(data, target, path)
 
 
 @pytest.mark.parametrize(
@@ -1150,13 +1410,85 @@ def test_macho_reads_exports_from_loader_export_trie(
 def test_macho_export_trie_accumulates_multilevel_prefixes():
     # root -> "_mosaic_" -> {"open", "free"}
     root = b"\x00\x01_mosaic_\x00\x0c"
-    shared_prefix = b"\x00\x02open\x00\x1afree\x00\x1e"
-    export_leaf = b"\x02\x00\x01\x00"
+    shared_prefix = b"\x00\x02open\x00\x1afree\x00\x1f"
+    export_leaf = b"\x03\x00\x80\x20\x00"
     trie = root + shared_prefix + export_leaf + export_leaf
 
-    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == frozenset(
-        {"_mosaic_open", "_mosaic_free"}
+    assert {
+        export.name
+        for export in verifier.parse_macho_export_trie(trie, 0, len(trie))
+    } == {"_mosaic_open", "_mosaic_free"}
+
+
+def test_macho_export_trie_rejects_node_visits_over_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_NODES", 1, raising=False
     )
+    trie = b"\x00\x01a\x00\x05\x00\x00"
+
+    with pytest.raises(ValueError, match="node visits.*budget"):
+        verifier.parse_macho_export_trie(trie, 0, len(trie))
+
+
+def test_macho_export_trie_accepts_node_visits_at_exact_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_NODES", 2, raising=False
+    )
+    trie = b"\x00\x01a\x00\x05\x00\x00"
+
+    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == ()
+
+
+def test_macho_export_trie_shares_edge_and_reexport_byte_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_STRING_BYTES", 3, raising=False
+    )
+    trie = b"\x00\x01a\x00\x05\x04\x08\x01b\x00\x00"
+
+    with pytest.raises(ValueError, match="edge and re-export names.*budget"):
+        verifier.parse_macho_export_trie(trie, 0, len(trie))
+
+
+def test_macho_export_trie_accepts_strings_at_exact_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_STRING_BYTES", 4, raising=False
+    )
+    trie = b"\x00\x01a\x00\x05\x04\x08\x01b\x00\x00"
+
+    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == (
+        verifier.MachoExport("a", 0x08, None, None),
+    )
+
+
+def test_macho_export_trie_rejects_prefix_work_over_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_PREFIX_BYTES", 9, raising=False
+    )
+    trie = (
+        b"\x00\x01a\x00\x05"
+        b"\x00\x01b\x00\x0a"
+        b"\x00\x01c\x00\x0f"
+        b"\x00\x01d\x00\x14"
+        b"\x00\x00"
+    )
+
+    with pytest.raises(ValueError, match="prefix construction.*budget"):
+        verifier.parse_macho_export_trie(trie, 0, len(trie))
+
+
+def test_macho_export_trie_accepts_prefix_work_at_exact_budget(monkeypatch):
+    monkeypatch.setattr(
+        verifier, "MAX_MACHO_EXPORT_TRIE_PREFIX_BYTES", 10, raising=False
+    )
+    trie = (
+        b"\x00\x01a\x00\x05"
+        b"\x00\x01b\x00\x0a"
+        b"\x00\x01c\x00\x0f"
+        b"\x00\x01d\x00\x14"
+        b"\x00\x00"
+    )
+
+    assert verifier.parse_macho_export_trie(trie, 0, len(trie)) == ()
 
 
 def test_macho_empty_export_trie_is_authoritative():
@@ -1231,6 +1563,41 @@ def test_macho_does_not_fill_export_trie_gaps_from_symtab():
 
 
 @pytest.mark.parametrize(
+    "options",
+    (
+        {
+            "export_trie_flags": 0x08,
+            "export_trie_reexport_name": b"",
+        },
+        {"export_trie_flags": 0x02},
+        {"export_trie_flags": 0x01},
+        {"export_trie_address": 0x2000},
+        {"section_flags": 0},
+        {"section_flags": 0x80000401},
+        {"segment_initial_protection": 3},
+    ),
+    ids=(
+        "re-export",
+        "absolute",
+        "thread-local",
+        "non-executable-address",
+        "non-instruction-section",
+        "zero-fill-instruction-section",
+        "non-executable-segment",
+    ),
+)
+def test_macho_export_trie_only_accepts_direct_executable_functions(options):
+    data = build_macho(export_trie_symbols=JNI_SYMBOLS, **options)
+
+    with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
+        verify_jni_target(
+            data,
+            "aarch64-apple-darwin",
+            "libpaimon_mosaic_jni.dylib",
+        )
+
+
+@pytest.mark.parametrize(
     "export_trie,error",
     (
         (b"\x7f", "terminal.*out of bounds"),
@@ -1271,14 +1638,32 @@ def test_macho_rejects_out_of_bounds_export_trie_metadata(
 
 
 @pytest.mark.parametrize(
-    "symbol_type",
-    (0x0E, 0x1F, 0x0B, 0x0D),
-    ids=("local", "private-extern", "indirect", "prebound-undefined"),
+    "options",
+    (
+        {"symbol_type": 0x0E},
+        {"symbol_type": 0x1F},
+        {"symbol_type": 0x0B},
+        {"symbol_type": 0x0D},
+        {"symbol_type": 0x03},
+        {"section_flags": 0},
+        {"section_flags": 0x80000401},
+        {"segment_initial_protection": 3},
+        {"symbol_value": 0x2000},
+    ),
+    ids=(
+        "local",
+        "private-extern",
+        "indirect",
+        "prebound-undefined",
+        "absolute",
+        "non-instruction-section",
+        "zero-fill-instruction-section",
+        "non-executable-segment",
+        "outside-section",
+    ),
 )
-def test_macho_symtab_only_accepts_symbols_the_dylib_defines(
-    symbol_type,
-):
-    data = build_macho(symbol_type=symbol_type)
+def test_macho_symtab_only_accepts_symbols_the_dylib_defines(options):
+    data = build_macho(**options)
 
     with pytest.raises(ValueError, match="missing expected Mosaic JNI exports"):
         verify_jni_target(
@@ -1288,52 +1673,20 @@ def test_macho_symtab_only_accepts_symbols_the_dylib_defines(
         )
 
 
-def test_rejects_unexpected_extra_macho_architecture():
+@pytest.mark.parametrize(
+    "magic",
+    (0xCAFEBABE, 0xBEBAFECA, 0xCAFEBABF, 0xBFBAFECA),
+)
+def test_rejects_macho_universal_binaries(magic):
+    # The release builds the single Mach-O target thin, so a universal image is
+    # not a release artifact shape; it is refused before any slice is parsed.
     data = build_fat_macho(
-        (
-            (0x0100000C, build_macho(cpu_type=0x0100000C)),
-            (0x01000007, build_macho(cpu_type=0x01000007)),
-        )
+        ((0x0100000C, build_macho(cpu_type=0x0100000C)),), magic=magic
     )
 
-    with pytest.raises(ValueError, match="expected only aarch64"):
+    with pytest.raises(ValueError, match="universal binaries are not"):
         verify_jni_target(
             data,
-            "aarch64-apple-darwin",
-            "libpaimon_mosaic_jni.dylib",
-        )
-
-
-def test_rejects_macho_fat_slice_with_mismatched_cpu_type():
-    data = build_fat_macho(
-        ((0x01000007, build_macho(cpu_type=0x0100000C)),)
-    )
-
-    with pytest.raises(ValueError, match="CPU type does not match"):
-        verify_jni_target(
-            data,
-            "aarch64-apple-darwin",
-            "libpaimon_mosaic_jni.dylib",
-        )
-
-
-def test_rejects_truncated_macho_fat_slice():
-    data = bytearray(
-        build_fat_macho(
-            ((0x0100000C, build_macho(cpu_type=0x0100000C)),)
-        )
-    )
-    slice_size_offset = 8 + 12
-    struct.pack_into(
-        ">I",
-        data,
-        slice_size_offset,
-        struct.unpack_from(">I", data, slice_size_offset)[0] + len(data),
-    )
-
-    with pytest.raises(ValueError, match="fat slice 0.*out of bounds"):
-        verify_jni_target(
-            bytes(data),
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
         )
@@ -1384,3 +1737,95 @@ def test_raw_symbol_strings_do_not_count_as_elf_exports():
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
         )
+
+
+# Symbol counts are bounded, but every accepted symbol is range-checked against
+# the section or load-segment list, so the structural counts need their own cap.
+
+
+def test_rejects_elf_declaring_too_many_program_headers():
+    data = bytearray(build_elf())
+    struct.pack_into("<H", data, 56, verifier.MAX_NATIVE_SECTIONS + 1)
+
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} program headers: "
+        rf"{verifier.MAX_NATIVE_SECTIONS + 1}"):
+        verify_jni_target(
+            bytes(data), "x86_64-unknown-linux-gnu", "libpaimon_mosaic_jni.so"
+        )
+
+
+def test_accepts_elf_program_header_count_at_the_limit():
+    # The cap must reject 513 and not 512; require_range then rejects this
+    # image for the table it cannot actually hold.
+    data = bytearray(build_elf())
+    struct.pack_into("<H", data, 56, verifier.MAX_NATIVE_SECTIONS)
+
+    with pytest.raises(ValueError, match="program header table"):
+        verify_jni_target(
+            bytes(data), "x86_64-unknown-linux-gnu", "libpaimon_mosaic_jni.so"
+        )
+
+
+def test_rejects_elf_declaring_too_many_sections():
+    data = bytearray(build_elf())
+    struct.pack_into("<H", data, 60, verifier.MAX_NATIVE_SECTIONS + 1)
+
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} sections: "
+        rf"{verifier.MAX_NATIVE_SECTIONS + 1}"):
+        verify_jni_target(
+            bytes(data), "x86_64-unknown-linux-gnu", "libpaimon_mosaic_jni.so"
+        )
+
+
+def test_rejects_pe_declaring_too_many_sections():
+    data = bytearray(build_pe())
+    struct.pack_into("<H", data, 0x80 + 6, verifier.MAX_NATIVE_SECTIONS + 1)
+
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} sections: "
+        rf"{verifier.MAX_NATIVE_SECTIONS + 1}"):
+        verify_jni_target(
+            bytes(data), "x86_64-pc-windows-msvc", "paimon_mosaic_jni.dll"
+        )
+
+
+def test_rejects_macho_declaring_too_many_load_commands():
+    data = bytearray(build_macho())
+    struct.pack_into("<I", data, 16, verifier.MAX_NATIVE_SECTIONS + 1)
+
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} load commands: "
+        rf"{verifier.MAX_NATIVE_SECTIONS + 1}"):
+        verify_jni_target(
+            bytes(data), "aarch64-apple-darwin", "libpaimon_mosaic_jni.dylib"
+        )
+
+
+def test_rejects_macho_whose_single_segment_exceeds_the_section_cap():
+    # Zero-filled section headers are legal (size 0 skips the range check), so
+    # one segment can inflate the list the per-export scan walks.
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} sections"):
+        verify_jni_target(
+            build_macho(extra_sections=verifier.MAX_NATIVE_SECTIONS),
+            "aarch64-apple-darwin",
+            "libpaimon_mosaic_jni.dylib",
+        )
+
+
+def test_rejects_macho_whose_segments_exceed_the_cap_only_in_aggregate():
+    # Each segment stays under the cap on its own, so only the running total can
+    # reject this; a per-command check cannot see the aggregate.
+    half = verifier.MAX_NATIVE_SECTIONS // 2
+    with pytest.raises(ValueError, match=rf"more than {verifier.MAX_NATIVE_SECTIONS} sections"):
+        verify_jni_target(
+            build_macho(extra_sections=half, extra_segments=(half, half)),
+            "aarch64-apple-darwin",
+            "libpaimon_mosaic_jni.dylib",
+        )
+
+
+def test_accepts_macho_section_count_at_the_cumulative_cap():
+    half = verifier.MAX_NATIVE_SECTIONS // 2
+    verify_jni_target(
+        build_macho(extra_sections=half - 1, extra_segments=(half,)),
+        "aarch64-apple-darwin",
+        "libpaimon_mosaic_jni.dylib",
+    )
