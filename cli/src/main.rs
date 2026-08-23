@@ -642,6 +642,9 @@ struct JsonRecordScanner {
     record: usize,
     record_bytes: usize,
     line_bytes: usize,
+    // Defer a CR until the next byte distinguishes CRLF (a line delimiter)
+    // from a lone CR (JSON whitespace that still consumes the line budget).
+    pending_line_cr: bool,
     max_record_bytes: usize,
     structural_units: usize,
     max_structural_units: usize,
@@ -659,6 +662,7 @@ impl JsonRecordScanner {
             record: 0,
             record_bytes: 0,
             line_bytes: 0,
+            pending_line_cr: false,
             max_record_bytes,
             structural_units: 0,
             max_structural_units,
@@ -789,6 +793,27 @@ impl JsonRecordScanner {
 
     #[inline(always)]
     fn count_line_byte(&mut self, byte: u8) -> std::io::Result<()> {
+        if self.pending_line_cr {
+            self.pending_line_cr = false;
+            if byte == b'\n' {
+                self.line_bytes = 0;
+                return Ok(());
+            }
+            self.count_line_content_byte()?;
+        }
+        if byte == b'\r' {
+            self.pending_line_cr = true;
+            return Ok(());
+        }
+        if byte == b'\n' {
+            self.line_bytes = 0;
+            return Ok(());
+        }
+        self.count_line_content_byte()
+    }
+
+    #[inline(always)]
+    fn count_line_content_byte(&mut self) -> std::io::Result<()> {
         if self.line_bytes >= self.max_record_bytes {
             return Err(invalid_schema(format!(
                 "JSON input line exceeds the {} byte limit",
@@ -796,8 +821,13 @@ impl JsonRecordScanner {
             )));
         }
         self.line_bytes += 1;
-        if byte == b'\n' {
-            self.line_bytes = 0;
+        Ok(())
+    }
+
+    fn flush_pending_line_cr(&mut self) -> std::io::Result<()> {
+        if self.pending_line_cr {
+            self.pending_line_cr = false;
+            self.count_line_content_byte()?;
         }
         Ok(())
     }
@@ -823,19 +853,25 @@ impl JsonRecordScanner {
         let special = match self.state {
             JsonRecordScanState::BetweenRecords => bytes
                 .iter()
-                .position(|&byte| byte == b'\n' || !matches!(byte, b' ' | b'\r' | b'\t')),
+                .position(|&byte| matches!(byte, b'\n' | b'\r') || !matches!(byte, b' ' | b'\t')),
             JsonRecordScanState::Compound {
                 in_string: false, ..
             } => bytes
                 .iter()
-                .position(|&byte| matches!(byte, b'"' | b'{' | b'}' | b'[' | b']' | b'\n')),
+                .position(|&byte| matches!(byte, b'"' | b'{' | b'}' | b'[' | b']' | b'\n' | b'\r')),
             JsonRecordScanState::Compound {
                 in_string: true,
                 escaped: false,
                 ..
             }
             | JsonRecordScanState::String { escaped: false } => {
-                memchr::memchr3(b'"', b'\\', b'\n', bytes)
+                let primary = memchr::memchr3(b'"', b'\\', b'\n', bytes);
+                let carriage_return = memchr::memchr(b'\r', bytes);
+                match (primary, carriage_return) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (found @ Some(_), None) | (None, found @ Some(_)) => found,
+                    (None, None) => None,
+                }
             }
             JsonRecordScanState::Compound {
                 in_string: true,
@@ -853,6 +889,10 @@ impl JsonRecordScanner {
     #[inline(always)]
     fn advance_ordinary(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let len = bytes.len();
+        if self.pending_line_cr {
+            self.pending_line_cr = false;
+            self.count_line_content_byte()?;
+        }
         if matches!(self.state, JsonRecordScanState::BetweenRecords) {
             return self.advance_line(len);
         }
@@ -924,7 +964,11 @@ impl<R> JsonRecordLimitReader<R> {
 impl<R: std::io::Read> std::io::Read for JsonRecordLimitReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.inner.read(buffer)?;
-        self.scanner.scan_chunk(&buffer[..read])?;
+        if read == 0 {
+            self.scanner.flush_pending_line_cr()?;
+        } else {
+            self.scanner.scan_chunk(&buffer[..read])?;
+        }
         Ok(read)
     }
 }
@@ -1331,6 +1375,8 @@ fn data_type_needs_json_validation(data_type: &DataType) -> bool {
     match data_type {
         DataType::Int32
         | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
         | DataType::Date32
         | DataType::Time32(_)
         | DataType::Timestamp(_, _)
@@ -1563,6 +1609,9 @@ fn validate_json_special_value(
                 i128::from(i64::MAX),
             )?;
         }
+        DataType::Float32 | DataType::Float64 => {
+            validate_json_finite_float(raw, data_type, path, record)?;
+        }
         DataType::Decimal128(precision, scale) => {
             let raw_text = raw.get();
             let value = if raw_text.starts_with('"') {
@@ -1629,6 +1678,45 @@ fn validate_json_special_value(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_json_finite_float(
+    raw: &RawValue,
+    data_type: &DataType,
+    path: &str,
+    record: usize,
+) -> std::io::Result<()> {
+    let raw_value = raw.get();
+    let quoted = raw_value.starts_with('"');
+    let value = if quoted {
+        match serde_json::from_str::<String>(raw_value) {
+            Ok(value) => std::borrow::Cow::Owned(value),
+            Err(_) => return Ok(()),
+        }
+    } else {
+        std::borrow::Cow::Borrowed(raw_value)
+    };
+    let (overflowed, avro_type) = match data_type {
+        DataType::Float32 => (
+            value.parse::<f32>().is_ok_and(|value| !value.is_finite())
+                && !(quoted && is_non_finite_float_literal(&value)),
+            "float",
+        ),
+        DataType::Float64 => (
+            value.parse::<f64>().is_ok_and(|value| !value.is_finite())
+                && !(quoted && is_non_finite_float_literal(&value)),
+            "double",
+        ),
+        _ => return Ok(()),
+    };
+    if overflowed {
+        return Err(invalid_schema(format!(
+            "finite value '{}' for JSON field '{}' at record {record} is out of range for Avro {avro_type}",
+            fmt::safe(&value),
+            fmt::safe(path)
+        )));
     }
     Ok(())
 }
@@ -2027,7 +2115,12 @@ fn csv_error_with_line_offset(error: impl ToString, line_offset: u64) -> String 
     csv_error_message_with_line_offset(message, line_offset, search_end)
 }
 
-fn csv_read_error(error: csv::Error, context: &str, line_offset: u64) -> std::io::Error {
+fn csv_read_error(error: csv::Error, context: &str, physical_line: u64) -> std::io::Error {
+    let reported_line = error
+        .position()
+        .map(csv::Position::line)
+        .unwrap_or(physical_line);
+    let line_correction = physical_line.saturating_sub(reported_line);
     if error.is_io_error() {
         if let csv::ErrorKind::Io(error) = error.into_kind() {
             return error;
@@ -2036,7 +2129,7 @@ fn csv_read_error(error: csv::Error, context: &str, line_offset: u64) -> std::io
     }
     invalid_schema(format!(
         "{context}: {}",
-        csv_error_with_line_offset(error, line_offset)
+        csv_error_with_line_offset(error, line_correction)
     ))
 }
 
@@ -2073,12 +2166,42 @@ fn csv_error_message_with_line_offset(
     message
 }
 
-fn add_csv_record_line_offset(record: &mut csv::StringRecord, line_offset: u64) {
+fn set_csv_record_line(record: &mut csv::StringRecord, line: u64) {
     let Some(mut position) = record.position().cloned() else {
         return;
     };
-    position.set_line(position.line().saturating_add(line_offset));
+    position.set_line(line);
     record.set_position(Some(position));
+}
+
+fn read_csv_record_with_physical_line<R: std::io::Read>(
+    reader: &mut csv::Reader<CsvPhysicalLineReader<R>>,
+    record: &mut csv::StringRecord,
+    line_offset: u64,
+    context: &str,
+) -> std::io::Result<bool> {
+    match reader.read_record(record) {
+        Ok(true) => {
+            let line = reader
+                .get_mut()
+                .take_record_line()
+                .ok_or_else(|| {
+                    invalid_schema("CSV physical line scanner fell out of sync with CSV records")
+                })?
+                .saturating_add(line_offset);
+            set_csv_record_line(record, line);
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(error) => {
+            let line = reader
+                .get_mut()
+                .take_record_line()
+                .unwrap_or_else(|| reader.get_ref().current_record_line())
+                .saturating_add(line_offset);
+            Err(csv_read_error(error, context, line))
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2089,9 +2212,199 @@ struct CsvInputLayout {
 }
 
 struct CsvInput<R> {
-    reader: csv::Reader<R>,
+    reader: csv::Reader<CsvPhysicalLineReader<R>>,
     layout: CsvInputLayout,
     first_record: Option<csv::StringRecord>,
+}
+
+struct CsvPhysicalLineReader<R> {
+    inner: R,
+    scanner: CsvPhysicalRecordScanner,
+}
+
+impl<R> CsvPhysicalLineReader<R> {
+    fn new(inner: R, dialect: CsvDialect) -> Self {
+        Self {
+            inner,
+            scanner: CsvPhysicalRecordScanner::new(dialect),
+        }
+    }
+
+    fn take_record_line(&mut self) -> Option<u64> {
+        self.scanner.record_lines.pop_front()
+    }
+
+    fn current_record_line(&self) -> u64 {
+        self.scanner.record_start_line
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CsvPhysicalLineReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return self.inner.read(buffer);
+        }
+        let capacity = buffer.len().min(CSV_LIMIT_SCAN_BUFFER_BYTES);
+        let read = self.inner.read(&mut buffer[..capacity])?;
+        if read == 0 {
+            self.scanner.finish();
+        } else {
+            self.scanner.scan(&buffer[..read]);
+        }
+        Ok(read)
+    }
+}
+
+// This sidecar parser exists separately from CsvRecordLimitScanner because
+// inferred inputs are snapshotted and reopened after the limit pass. It emits
+// one physical start line per non-empty csv_core record into a bounded read-
+// ahead queue, so csv::Reader can retain the original bytes while CR, LF,
+// CRLF, blank lines, and multiline quoted fields receive accurate diagnostics.
+struct CsvPhysicalRecordScanner {
+    parser: csv_core::Reader,
+    scratch: Vec<u8>,
+    record_lines: std::collections::VecDeque<u64>,
+    current_line: u64,
+    record_start_line: u64,
+    record_has_data: bool,
+    previous_was_cr: bool,
+    bom_prefix: Vec<u8>,
+    bom_checked: bool,
+    finished: bool,
+}
+
+impl CsvPhysicalRecordScanner {
+    fn new(dialect: CsvDialect) -> Self {
+        let mut builder = csv_core::ReaderBuilder::new();
+        builder
+            .delimiter(dialect.delimiter)
+            .quote(dialect.quote)
+            .escape(dialect.escape);
+        Self {
+            parser: builder.build(),
+            scratch: vec![0; CSV_LIMIT_SCAN_BUFFER_BYTES],
+            record_lines: std::collections::VecDeque::new(),
+            current_line: 1,
+            record_start_line: 1,
+            record_has_data: false,
+            previous_was_cr: false,
+            bom_prefix: Vec::with_capacity(3),
+            bom_checked: false,
+            finished: false,
+        }
+    }
+
+    fn scan(&mut self, input: &[u8]) {
+        let mut offset = 0;
+        while offset < input.len() {
+            let (result, consumed, decoded) =
+                self.parser.read_field(&input[offset..], &mut self.scratch);
+            self.observe(&input[offset..offset + consumed]);
+            offset = offset.saturating_add(consumed);
+            match result {
+                csv_core::ReadFieldResult::InputEmpty => break,
+                csv_core::ReadFieldResult::OutputFull => {
+                    debug_assert!(consumed > 0 || decoded > 0);
+                }
+                csv_core::ReadFieldResult::Field { record_end } => {
+                    if record_end {
+                        self.finish_record();
+                    }
+                }
+                csv_core::ReadFieldResult::End => {
+                    self.finished = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        loop {
+            let (result, consumed, _) = self.parser.read_field(&[], &mut self.scratch);
+            debug_assert_eq!(consumed, 0);
+            match result {
+                csv_core::ReadFieldResult::Field { record_end } => {
+                    if record_end {
+                        self.finish_record();
+                    }
+                }
+                csv_core::ReadFieldResult::End | csv_core::ReadFieldResult::InputEmpty => {
+                    self.finished = true;
+                    return;
+                }
+                csv_core::ReadFieldResult::OutputFull => {}
+            }
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if !self.bom_checked {
+                const UTF8_BOM: &[u8; 3] = b"\xef\xbb\xbf";
+                self.bom_prefix.push(byte);
+                let index = self.bom_prefix.len() - 1;
+                if byte != UTF8_BOM[index] {
+                    self.bom_checked = true;
+                    let prefix = std::mem::take(&mut self.bom_prefix);
+                    for byte in prefix {
+                        self.observe_byte(byte);
+                    }
+                } else if self.bom_prefix.len() == UTF8_BOM.len() {
+                    self.bom_checked = true;
+                    self.bom_prefix.clear();
+                }
+                continue;
+            }
+            self.observe_byte(byte);
+        }
+    }
+
+    fn observe_byte(&mut self, byte: u8) {
+        match byte {
+            b'\r' => {
+                self.current_line = self.current_line.saturating_add(1);
+                self.previous_was_cr = true;
+                if !self.record_has_data {
+                    self.record_start_line = self.current_line;
+                }
+            }
+            b'\n' => {
+                if !self.previous_was_cr {
+                    self.current_line = self.current_line.saturating_add(1);
+                }
+                self.previous_was_cr = false;
+                if !self.record_has_data {
+                    self.record_start_line = self.current_line;
+                }
+            }
+            _ => {
+                self.previous_was_cr = false;
+                if !self.record_has_data {
+                    self.record_has_data = true;
+                    self.record_start_line = self.current_line;
+                }
+            }
+        }
+    }
+
+    fn finish_record(&mut self) {
+        if !self.bom_checked {
+            self.bom_checked = true;
+            let prefix = std::mem::take(&mut self.bom_prefix);
+            for byte in prefix {
+                self.observe_byte(byte);
+            }
+        }
+        if self.record_has_data {
+            self.record_lines.push_back(self.record_start_line);
+        }
+        self.record_has_data = false;
+        self.record_start_line = self.current_line;
+    }
 }
 
 struct OpenCsvSource {
@@ -2102,13 +2415,11 @@ struct OpenCsvSource {
 
 impl OpenCsvSource {
     fn open(path: &Path, skip_lines: usize) -> std::io::Result<Self> {
-        use std::io::BufRead;
-
         let file = std::fs::File::open(path)?;
         let mut reader = std::io::BufReader::new(file);
         let mut skipped = 0_u64;
         for _ in 0..skip_lines {
-            if reader.skip_until(b'\n')? == 0 {
+            if !skip_csv_physical_line(&mut reader)? {
                 break;
             }
             skipped = skipped.saturating_add(1);
@@ -2135,6 +2446,38 @@ impl OpenCsvSource {
             MAX_CSV_COLUMNS,
             MAX_CSV_RECORD_BYTES,
         ))
+    }
+}
+
+fn skip_csv_physical_line<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<bool> {
+    let mut consumed = false;
+    loop {
+        let (buffer_len, delimiter) = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(consumed);
+            }
+            (
+                buffer.len(),
+                buffer
+                    .iter()
+                    .position(|byte| matches!(byte, b'\n' | b'\r'))
+                    .map(|index| (index, buffer[index])),
+            )
+        };
+        match delimiter {
+            Some((index, delimiter)) => {
+                reader.consume(index + 1);
+                if delimiter == b'\r' && reader.fill_buf()?.first() == Some(&b'\n') {
+                    reader.consume(1);
+                }
+                return Ok(true);
+            }
+            None => {
+                reader.consume(buffer_len);
+                consumed = true;
+            }
+        }
     }
 }
 
@@ -2398,7 +2741,7 @@ fn open_csv_input_from_reader<R: std::io::Read>(
         .delimiter(dialect.delimiter)
         .quote(dialect.quote)
         .escape(dialect.escape);
-    let mut reader = builder.from_reader(reader);
+    let mut reader = builder.from_reader(CsvPhysicalLineReader::new(reader, dialect));
     let file_header = options.header.is_none() && !options.no_header;
     let header = if let Some(header) = &options.header {
         Some(parse_csv_header(header, options)?)
@@ -2406,11 +2749,12 @@ fn open_csv_input_from_reader<R: std::io::Read>(
         None
     } else {
         let mut record = csv::StringRecord::new();
-        if reader
-            .read_record(&mut record)
-            .map_err(|e| csv_read_error(e, "invalid CSV header", line_offset))?
-        {
-            add_csv_record_line_offset(&mut record, line_offset);
+        if read_csv_record_with_physical_line(
+            &mut reader,
+            &mut record,
+            line_offset,
+            "invalid CSV header",
+        )? {
             Some(record.iter().map(ToString::to_string).collect())
         } else {
             Some(Vec::new())
@@ -2420,11 +2764,13 @@ fn open_csv_input_from_reader<R: std::io::Read>(
         ensure_csv_column_limit(path, header.len())?;
     }
     let mut first_record = csv::StringRecord::new();
-    let has_records = reader
-        .read_record(&mut first_record)
-        .map_err(|e| csv_read_error(e, "invalid CSV record", line_offset))?;
+    let has_records = read_csv_record_with_physical_line(
+        &mut reader,
+        &mut first_record,
+        line_offset,
+        "invalid CSV record",
+    )?;
     if has_records {
-        add_csv_record_line_offset(&mut first_record, line_offset);
         ensure_csv_column_limit(path, first_record.len())?;
     }
     if has_records && file_header {
@@ -2471,19 +2817,18 @@ fn write_explicit_schema_csv_input(
     validate_csv_mapping(schema, &input_reader.layout, &source_mapping, &input)?;
 
     let first = input_reader.first_record.take().into_iter().map(Ok);
+    let read_context = format!("invalid CSV record in {}", input.display());
     let rest = std::iter::from_fn(|| {
         let mut record = csv::StringRecord::new();
-        match input_reader.reader.read_record(&mut record) {
-            Ok(true) => {
-                add_csv_record_line_offset(&mut record, line_offset);
-                Some(ensure_csv_column_limit(&input, record.len()).map(|_| record))
-            }
+        match read_csv_record_with_physical_line(
+            &mut input_reader.reader,
+            &mut record,
+            line_offset,
+            &read_context,
+        ) {
+            Ok(true) => Some(ensure_csv_column_limit(&input, record.len()).map(|_| record)),
             Ok(false) => None,
-            Err(e) => Some(Err(csv_read_error(
-                e,
-                &format!("invalid CSV record in {}", input.display()),
-                line_offset,
-            ))),
+            Err(error) => Some(Err(error)),
         }
     });
     for_each_explicit_csv_batch(
@@ -2596,8 +2941,12 @@ fn csv_column_array(
         }
         DataType::Int32 => csv_primitive_column::<Int32Type>(records, source, field),
         DataType::Int64 => csv_primitive_column::<Int64Type>(records, source, field),
-        DataType::Float32 => csv_primitive_column::<Float32Type>(records, source, field),
-        DataType::Float64 => csv_primitive_column::<Float64Type>(records, source, field),
+        DataType::Float32 => {
+            csv_float_column::<Float32Type>(records, source, field, "float", f32::is_finite)
+        }
+        DataType::Float64 => {
+            csv_float_column::<Float64Type>(records, source, field, "double", f64::is_finite)
+        }
         DataType::Date32 => csv_primitive_column::<Date32Type>(records, source, field),
         DataType::Time32(TimeUnit::Millisecond) => csv_time_millis_column(records, source, field),
         DataType::Timestamp(unit, timezone) => {
@@ -2697,6 +3046,59 @@ fn csv_time_millis_column(
             .into_iter()
             .collect::<PrimitiveArray<Time32MillisecondType>>(),
     ))
+}
+
+fn csv_float_column<T>(
+    records: &[csv::StringRecord],
+    source: usize,
+    field: &Field,
+    avro_type: &str,
+    is_finite: impl Fn(T::Native) -> bool,
+) -> std::io::Result<ArrayRef>
+where
+    T: ArrowPrimitiveType + ArrowValueParser,
+{
+    let values = records
+        .iter()
+        .map(|record| {
+            let Some(value) = csv_record_value(record, source) else {
+                return Ok(None);
+            };
+            let parsed =
+                T::parse(value).ok_or_else(|| csv_value_parse_error(record, field, value))?;
+            validate_csv_finite_float(is_finite(parsed), value, record, field, avro_type)?;
+            Ok(Some(parsed))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(Arc::new(values.into_iter().collect::<PrimitiveArray<T>>()))
+}
+
+fn validate_csv_finite_float(
+    finite: bool,
+    value: &str,
+    record: &csv::StringRecord,
+    field: &Field,
+    avro_type: &str,
+) -> std::io::Result<()> {
+    if finite || is_non_finite_float_literal(value) {
+        return Ok(());
+    }
+    Err(invalid_schema(format!(
+        "finite value '{}' for CSV field '{}' at line {} is out of range for Avro {avro_type}",
+        fmt::safe(value),
+        fmt::safe(field.name()),
+        record
+            .position()
+            .map(|position| position.line().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    )))
+}
+
+fn is_non_finite_float_literal(value: &str) -> bool {
+    let value = value.strip_prefix(['+', '-']).unwrap_or(value);
+    value.eq_ignore_ascii_case("nan")
+        || value.eq_ignore_ascii_case("inf")
+        || value.eq_ignore_ascii_case("infinity")
 }
 
 fn csv_primitive_column<T>(
@@ -3222,10 +3624,7 @@ fn parse_inferred_csv_float64(
                         Ok(_) | Err(DecimalParseFailure::Inexact) => {}
                     }
                 }
-            } else if !matches!(
-                value.to_ascii_lowercase().as_str(),
-                "nan" | "inf" | "+inf" | "-inf" | "infinity" | "+infinity" | "-infinity"
-            ) {
+            } else if !is_non_finite_float_literal(value) {
                 return Err(csv_inferred_float_parse_error(value, field, input));
             }
             Ok(Some(promoted))
@@ -3642,6 +4041,9 @@ fn parse_avro_union(types: &[Value]) -> Result<ParsedAvroType, String> {
     let mut has_null = false;
     let mut non_null = None;
     for ty in types {
+        if matches!(ty, Value::Array(_)) {
+            return Err("Avro unions cannot directly contain another union".to_string());
+        }
         let is_null = matches!(ty, Value::String(s) if s == "null")
             || matches!(
                 ty,
@@ -3649,6 +4051,9 @@ fn parse_avro_union(types: &[Value]) -> Result<ParsedAvroType, String> {
                     if matches!(obj.get("type"), Some(Value::String(s)) if s == "null")
             );
         if is_null {
+            if has_null {
+                return Err("Avro unions cannot contain duplicate null branches".to_string());
+            }
             has_null = true;
             continue;
         }
@@ -4221,6 +4626,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_avro_schema_rejects_invalid_unions() {
+        for (field_type, expected) in [
+            (r#"["null", {"type":"null"}, "string"]"#, "duplicate null"),
+            (r#"[["string"]]"#, "cannot directly contain another union"),
+        ] {
+            let err = parse_avro_schema(&format!(
+                r#"{{"type":"record","name":"T","fields":[{{"name":"value","type":{field_type}}}]}}"#
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
     fn parse_avro_schema_ignores_unknown_logical_types() {
         let schema = parse_avro_schema(
             r#"{
@@ -4471,6 +4891,7 @@ mod tests {
         let inputs: &[&[u8]] = &[
             br#"{"a":[1,{"b":"x\\\"y"}]} {"c":2}"#,
             b"{\n\"a\":\"line\nvalue\"\n}\r\n[1,2,3]",
+            b"{}\r  {}",
             br#"1{"a":2}["x"]"y" false null"#,
         ];
         for input in inputs {
@@ -4492,6 +4913,7 @@ mod tests {
                 assert_eq!(chunk_scanner.record, byte_scanner.record);
                 assert_eq!(chunk_scanner.record_bytes, byte_scanner.record_bytes);
                 assert_eq!(chunk_scanner.line_bytes, byte_scanner.line_bytes);
+                assert_eq!(chunk_scanner.pending_line_cr, byte_scanner.pending_line_cr);
                 assert_eq!(
                     chunk_scanner.structural_units,
                     byte_scanner.structural_units
@@ -4515,6 +4937,26 @@ mod tests {
         let input = format!("{{}}\n{}{{}}", " \n".repeat(32));
         let reader = std::io::BufReader::with_capacity(3, std::io::Cursor::new(input.into_bytes()));
         validate_json_record_limits(reader, 16).unwrap();
+    }
+
+    #[test]
+    fn json_record_limit_accepts_exact_limit_before_newline() {
+        for line_ending in ["\n", "\r\n"] {
+            let input = format!("{{}}{}{line_ending}{{}}", " ".repeat(14));
+            let reader =
+                std::io::BufReader::with_capacity(3, std::io::Cursor::new(input.into_bytes()));
+            validate_json_record_limits(reader, 16).unwrap();
+        }
+    }
+
+    #[test]
+    fn json_record_limit_counts_lone_cr_before_newline() {
+        let input = format!("{{}}{}\r \n{{}}", " ".repeat(13));
+        let reader = std::io::BufReader::with_capacity(3, std::io::Cursor::new(input.into_bytes()));
+        let err = validate_json_record_limits(reader, 16)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "JSON input line exceeds the 16 byte limit");
     }
 
     #[test]
