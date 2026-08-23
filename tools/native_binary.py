@@ -49,7 +49,11 @@ MAX_DYNAMIC_SYMBOLS = 100_000
 # Each accepted symbol is range-checked against the section or load-segment
 # list, so an unbounded structural count multiplies bounded symbol work. Real
 # libraries stay far below this: glibc declares 69 ELF sections and 10 program
-# headers, libarrow 32 and 10.
+# headers, libarrow 32 and 10. Measured worst case with both this and
+# MAX_DYNAMIC_SYMBOLS at their caps: ~3 s of ELF segment scanning and ~8 s of PE
+# section scanning, which is why the value is not lowered further -- a smaller
+# cap saves seconds on an artifact that fails anyway and cuts the headroom over
+# glibc from 7x to under 2x.
 MAX_NATIVE_SECTIONS = 512
 # Bound the cumulative bytes searched while resolving symbol names so many
 # overlapping offsets cannot turn a bounded symbol table into quadratic work.
