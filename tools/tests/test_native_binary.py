@@ -984,6 +984,57 @@ def test_elf_sysv_hash_rejects_buckets_that_alias_a_chain():
         verifier.parse_elf_sysv_hash(table, section)
 
 
+# The same three guards exist in parse_elf_gnu_hash, where commit 964df48 added
+# them without coverage: all three could be neutered with the suite still green.
+
+
+def gnu_hash_section(table):
+    return verifier.ElfSection(
+        section_type=0x6FFFFFF6,
+        flags=0,
+        address=0,
+        offset=0,
+        size=len(table),
+        link=0,
+        entry_size=4,
+    )
+
+
+def build_gnu_hash_table(symbol_offset, buckets, chains):
+    table = struct.pack("<IIII", len(buckets), symbol_offset, 1, 0)
+    table += struct.pack("<Q", 0)
+    table += struct.pack(f"<{len(buckets)}I", *buckets)
+    table += struct.pack(f"<{len(chains)}I", *chains)
+    return table
+
+
+def test_elf_gnu_hash_rejects_buckets_that_alias_a_chain():
+    # Both buckets head the chain entry at index 1; contains() compares only
+    # indices, so an aliased chain would resolve a symbol under a foreign bucket.
+    table = build_gnu_hash_table(0, (1, 1), (0, 1))
+
+    with pytest.raises(ValueError, match="bucket chains alias"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
+def test_elf_gnu_hash_rejects_a_bucket_preceding_the_symbol_offset():
+    # chain_index = bucket - symbol_offset, so a bucket below symbol_offset
+    # would index the chain table from before its start.
+    table = build_gnu_hash_table(2, (1,), (1,))
+
+    with pytest.raises(ValueError, match="bucket precedes the symbol offset"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
+def test_elf_gnu_hash_rejects_a_chain_that_is_not_terminated():
+    # No chain entry sets the terminator bit, so the walk runs off the table.
+    # Turning this raise into a break is a fail-closed to fail-open change.
+    table = build_gnu_hash_table(0, (1,), (0, 0))
+
+    with pytest.raises(ValueError, match="chain is not terminated"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
 @pytest.mark.parametrize("hash_style", ("sysv", "gnu"))
 def test_elf_hash_membership_accepts_each_reachable_symbol(hash_style):
     parsed = verifier.native_binary(build_elf(hash_style=hash_style))
