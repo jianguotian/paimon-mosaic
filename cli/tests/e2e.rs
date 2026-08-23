@@ -2876,6 +2876,67 @@ fn convert_json_supports_avro_array_and_map_schema() {
 }
 
 #[test]
+fn convert_json_enforces_avro_map_value_nullability() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_avro_required_map_value.json", dir.display());
+    std::fs::write(&js, "{\"props\":{\"x\":1,\"y\":null}}\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_avro_required_map_value.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "props", "type": {"type": "map", "values": "long"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_avro_required_map_value.mosaic",
+        dir.display()
+    );
+    let _ = std::fs::remove_file(&out);
+
+    let (_, err, ok) = run(&["convert", &js, "-o", &out, "--schema", &schema]);
+    assert!(!ok, "conversion unexpectedly succeeded");
+    assert!(err.contains("props{}"), "{err}");
+    assert!(err.contains("cannot be null"), "{err}");
+    assert!(err.contains("record 1"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
+
+    let nullable_schema = format!("{}/mosaic_e2e_avro_nullable_map_value.avsc", dir.display());
+    std::fs::write(
+        &nullable_schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "props", "type": {"type": "map", "values": ["null", "long"]}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let nullable_out = format!(
+        "{}/mosaic_e2e_avro_nullable_map_value.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert",
+        &js,
+        "-o",
+        &nullable_out,
+        "--schema",
+        &nullable_schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &nullable_out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert!(rows.contains(r#""props":{"x":1,"y":null}"#), "{rows}");
+}
+
+#[test]
 fn convert_json_rejects_duplicate_string_map_keys() {
     let dir = std::env::temp_dir();
     let js = format!("{}/mosaic_e2e_duplicate_string_map.json", dir.display());

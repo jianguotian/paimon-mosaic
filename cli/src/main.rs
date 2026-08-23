@@ -1489,7 +1489,16 @@ fn validate_json_special_value(
     path: &str,
     record: usize,
 ) -> std::io::Result<()> {
-    if raw.get() == "null" || !field_needs_json_validation(field) {
+    if raw.get() == "null" {
+        if field.is_nullable() {
+            return Ok(());
+        }
+        return Err(invalid_schema(format!(
+            "JSON field '{}' at record {record} cannot be null",
+            fmt::safe(path)
+        )));
+    }
+    if !field_needs_json_validation(field) {
         return Ok(());
     }
     if field_is_avro_uuid(field) {
@@ -3633,7 +3642,13 @@ fn parse_avro_union(types: &[Value]) -> Result<ParsedAvroType, String> {
     let mut has_null = false;
     let mut non_null = None;
     for ty in types {
-        if matches!(ty, Value::String(s) if s == "null") {
+        let is_null = matches!(ty, Value::String(s) if s == "null")
+            || matches!(
+                ty,
+                Value::Object(obj)
+                    if matches!(obj.get("type"), Some(Value::String(s)) if s == "null")
+            );
+        if is_null {
             has_null = true;
             continue;
         }
@@ -4184,6 +4199,25 @@ mod tests {
             schema.fields()[4].data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
+    }
+
+    #[test]
+    fn parse_avro_schema_accepts_object_form_null_in_unions() {
+        let schema = parse_avro_schema(
+            r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "leading", "type": [{"type": "null"}, "string"]},
+    {"name": "trailing", "type": ["long", {"type": "null"}]}
+  ]
+}"#,
+        )
+        .unwrap();
+        assert_eq!(schema.fields()[0].data_type(), &DataType::Utf8);
+        assert!(schema.fields()[0].is_nullable());
+        assert_eq!(schema.fields()[1].data_type(), &DataType::Int64);
+        assert!(schema.fields()[1].is_nullable());
     }
 
     #[test]
