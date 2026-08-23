@@ -581,6 +581,49 @@ def test_verify_wheel_rejects_too_many_entries_before_archive_read(
         verifier.verify_wheel(wheel, root)
 
 
+def test_verify_wheel_rejects_a_record_longer_than_the_entry_cap(
+    tmp_path, monkeypatch
+):
+    # RECORD must list exactly the archive entries, which are already capped, so a
+    # longer table cannot describe a valid wheel and must be rejected while it is
+    # read rather than after the whole mapping and both difference lists exist.
+    def pad_record(rows):
+        template = rows[0]
+        rows.extend(
+            [f"mosaic/pad{index}.py", template[1], template[2]]
+            for index in range(64)
+        )
+
+    wheel, root = build_wheel(tmp_path, mutate_record=pad_record)
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_ENTRIES", 64)
+
+    with pytest.raises(ValueError, match="RECORD declares more than 64 entries"):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_accepts_a_record_at_the_entry_cap(tmp_path, monkeypatch):
+    wheel, root = build_wheel(tmp_path)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+    with ZipFile(wheel) as archive:
+        entry_count = len(archive.infolist())
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_ENTRIES", entry_count)
+
+    verifier.verify_wheel(wheel, root)
+
+
+def test_verify_wheel_bounds_the_names_a_record_rejection_reports(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(verifier, "MAX_REPORTED_NAMES", 2)
+    wheel, root = build_wheel(
+        tmp_path,
+        unrecorded_entries={f"mosaic/extra{index}.py": b"x" for index in range(6)},
+    )
+
+    with pytest.raises(ValueError, match=r"omits wheel entries:.*and 4 more"):
+        verifier.verify_wheel(wheel, root)
+
+
 def test_target_matrix_guard_rejects_drift(monkeypatch):
     monkeypatch.setitem(
         verifier.EXPECTED_WHEEL_TAG,
