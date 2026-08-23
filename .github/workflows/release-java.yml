@@ -20,6 +20,12 @@ name: Release Java
 
 on:
   workflow_call:
+    inputs:
+      preflight_completed:
+        description: The caller already passed release-preflight.yml
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
 
 env:
@@ -30,7 +36,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-preflight:
+    if: github.event_name == 'workflow_dispatch' || !inputs.preflight_completed
+    uses: ./.github/workflows/release-preflight.yml
+
   build-native:
+    needs: [release-preflight]
+    if: >-
+      ${{
+        always() &&
+        (
+          (github.event_name != 'workflow_dispatch' && inputs.preflight_completed) ||
+          needs.release-preflight.result == 'success'
+        )
+      }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
