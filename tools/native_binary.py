@@ -360,6 +360,15 @@ def parse_elf_sysv_hash(data: bytes, section: ElfSection) -> ElfSysvHash:
     bucket_count, symbol_count = struct.unpack_from("<II", data, section.offset)
     if bucket_count == 0 or symbol_count == 0:
         raise ValueError("ELF DT_HASH has invalid bucket or symbol count")
+    # These counts are bounded only by the hash section size, and the check that
+    # reconciles symbol_count with the already-capped SHT_DYNSYM size runs after
+    # the tables are materialized. A conforming table cannot exceed the dynamic
+    # symbol cap, so apply it here rather than allocating first.
+    if bucket_count > MAX_DYNAMIC_SYMBOLS or symbol_count > MAX_DYNAMIC_SYMBOLS:
+        raise ValueError(
+            f"ELF DT_HASH declares more than {MAX_DYNAMIC_SYMBOLS} "
+            f"buckets or symbols: {bucket_count} buckets, {symbol_count} symbols"
+        )
     if section.size != 8 + (bucket_count + symbol_count) * 4:
         raise ValueError("ELF DT_HASH has an inconsistent table size")
 
@@ -400,6 +409,16 @@ def parse_elf_gnu_hash(data: bytes, section: ElfSection) -> ElfGnuHash:
     ) = struct.unpack_from("<IIII", data, section.offset)
     if bucket_count == 0 or bloom_count == 0:
         raise ValueError("ELF DT_GNU_HASH has an invalid header")
+    # Bounded only by the hash section size, and the reconciliation against the
+    # capped SHT_DYNSYM size at the call site runs after the chain walk has
+    # traversed the whole array. A conforming table stays under the dynamic
+    # symbol cap, so reject an oversized one before materializing it.
+    if bucket_count > MAX_DYNAMIC_SYMBOLS or bloom_count > MAX_DYNAMIC_SYMBOLS:
+        raise ValueError(
+            f"ELF DT_GNU_HASH declares more than {MAX_DYNAMIC_SYMBOLS} "
+            f"buckets or bloom words: {bucket_count} buckets, "
+            f"{bloom_count} bloom words"
+        )
 
     bloom_offset = section.offset + 16
     buckets_offset = bloom_offset + bloom_count * 8
@@ -408,9 +427,15 @@ def parse_elf_gnu_hash(data: bytes, section: ElfSection) -> ElfGnuHash:
     if chains_offset > section_end or (section_end - chains_offset) % 4:
         raise ValueError("ELF DT_GNU_HASH has an inconsistent table size")
 
+    chain_count = (section_end - chains_offset) // 4
+    if chain_count > MAX_DYNAMIC_SYMBOLS:
+        raise ValueError(
+            f"ELF DT_GNU_HASH declares more than {MAX_DYNAMIC_SYMBOLS} "
+            f"chain entries: {chain_count}"
+        )
+
     bloom = struct.unpack_from(f"<{bloom_count}Q", data, bloom_offset)
     buckets = struct.unpack_from(f"<{bucket_count}I", data, buckets_offset)
-    chain_count = (section_end - chains_offset) // 4
     chains = struct.unpack_from(f"<{chain_count}I", data, chains_offset)
     symbol_count = symbol_offset
     owners = [-1] * chain_count

@@ -1060,6 +1060,90 @@ def test_elf_gnu_hash_rejects_a_chain_that_is_not_terminated():
         verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
 
 
+# The loader hash tables declare their own sizes, and the checks that reconcile
+# them with the already-capped SHT_DYNSYM size run only after the tables are
+# materialized. Every table below would parse successfully without the cap, so
+# deleting a cap makes the over-limit test fail rather than merely change the
+# message, and each at-limit sibling forbids flipping the comparison.
+
+
+def sysv_hash_section(table):
+    return verifier.ElfSection(
+        section_type=5,
+        flags=0,
+        address=0,
+        offset=0,
+        size=len(table),
+        link=0,
+        entry_size=4,
+    )
+
+
+def build_sysv_hash_table(buckets, chains):
+    table = struct.pack("<II", len(buckets), len(chains))
+    table += struct.pack(f"<{len(buckets)}I", *buckets)
+    table += struct.pack(f"<{len(chains)}I", *chains)
+    return table
+
+
+def build_gnu_hash_table_with_bloom(bloom_count, buckets, chains):
+    table = struct.pack("<IIII", len(buckets), 0, bloom_count, 0)
+    table += struct.pack(f"<{bloom_count}Q", *([0] * bloom_count))
+    table += struct.pack(f"<{len(buckets)}I", *buckets)
+    table += struct.pack(f"<{len(chains)}I", *chains)
+    return table
+
+
+def test_elf_sysv_hash_rejects_counts_above_the_symbol_cap(monkeypatch):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
+    table = build_sysv_hash_table((1, 2), (0, 0, 3, 0, 0))
+
+    with pytest.raises(ValueError, match="DT_HASH declares more than 4"):
+        verifier.parse_elf_sysv_hash(table, sysv_hash_section(table))
+
+
+def test_elf_sysv_hash_accepts_counts_at_the_symbol_cap(monkeypatch):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 5)
+    table = build_sysv_hash_table((1, 2), (0, 0, 3, 0, 0))
+
+    parsed = verifier.parse_elf_sysv_hash(table, sysv_hash_section(table))
+
+    assert parsed.chains == (0, 0, 3, 0, 0)
+
+
+def test_elf_gnu_hash_rejects_a_bucket_count_above_the_symbol_cap(monkeypatch):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
+    table = build_gnu_hash_table(0, (0, 0, 0, 0, 0), (1,))
+
+    with pytest.raises(ValueError, match="DT_GNU_HASH declares more than 4"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
+def test_elf_gnu_hash_rejects_a_bloom_count_above_the_symbol_cap(monkeypatch):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
+    table = build_gnu_hash_table_with_bloom(5, (0,), (1,))
+
+    with pytest.raises(ValueError, match="DT_GNU_HASH declares more than 4"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
+def test_elf_gnu_hash_rejects_a_chain_count_above_the_symbol_cap(monkeypatch):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
+    table = build_gnu_hash_table(0, (0,), (0, 0, 0, 0, 1))
+
+    with pytest.raises(ValueError, match="chain entries: 5"):
+        verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+
+def test_elf_gnu_hash_accepts_counts_at_the_symbol_cap(monkeypatch):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 5)
+    table = build_gnu_hash_table_with_bloom(5, (0, 0, 0, 0, 0), (0, 0, 0, 0, 1))
+
+    parsed = verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+    assert parsed.chains == (0, 0, 0, 0, 1)
+
+
 @pytest.mark.parametrize("hash_style", ("sysv", "gnu"))
 def test_elf_hash_membership_accepts_each_reachable_symbol(hash_style):
     parsed = verifier.native_binary(build_elf(hash_style=hash_style))
