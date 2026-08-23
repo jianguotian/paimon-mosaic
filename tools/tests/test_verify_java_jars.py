@@ -862,6 +862,34 @@ class VerifyJavaJarsTest(unittest.TestCase):
                     "Java artifact verification failed", stderr.getvalue()
                 )
 
+    def test_malformed_java_pom_is_reported_as_a_failure(self) -> None:
+        # maven_descriptor_entries derives the expected descriptor path from the
+        # POM, and ET.ParseError is a SyntaxError subclass, so without explicit
+        # handling it escapes main()'s except tuple as a traceback.
+        main_jar = self.write_jar(
+            "main.jar", self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        )
+        (self.root / "java/pom.xml").write_text("<project>", encoding="utf-8")
+        arguments = [
+            "verify_java_jars.py",
+            "--main",
+            str(main_jar),
+            "--sources",
+            str(main_jar),
+            "--javadoc",
+            str(main_jar),
+        ]
+
+        with mock.patch.object(
+            verify_java_jars, "repository_root", return_value=self.root
+        ):
+            with mock.patch.object(verify_java_jars, "verify_native_target"):
+                with mock.patch.object(sys, "argv", arguments):
+                    stderr = StringIO()
+                    with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                        self.assertEqual(verify_java_jars.main(), 1)
+                    self.assertIn("not well-formed XML", stderr.getvalue())
+
     def test_main_names_the_failing_artifact(self) -> None:
         # The three JAR checks shared one except clause, so a failure never said
         # which artifact broke; the classifier messages carry no path of their own.
