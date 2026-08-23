@@ -36,18 +36,28 @@ permissions:
   contents: read
 
 jobs:
+  release-preflight:
+    uses: ./.github/workflows/release-preflight.yml
+
   rust:
     name: Rust release
+    needs: [release-preflight]
     uses: ./.github/workflows/release-rust.yml
+    with:
+      preflight_completed: true
     secrets: inherit
 
   java:
     name: Java release
+    needs: [release-preflight]
     uses: ./.github/workflows/release-java.yml
+    with:
+      preflight_completed: true
     secrets: inherit
 
   python-wheels:
     name: Python wheels
+    needs: [release-preflight]
     uses: ./.github/workflows/release-python.yml
     secrets: inherit
 

@@ -37,13 +37,20 @@ jobs:
     if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: actions/download-artifact@v5
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
 
-      - name: Verify wheel versions
+      - name: Verify wheels
         env:
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
@@ -52,13 +59,21 @@ jobs:
 
           expected_version="${TAG_NAME#v}"
           expected_version="${expected_version/-rc/rc}"
-          shopt -s nullglob
+          shopt -s nullglob dotglob
+          artifacts=(dist/*)
           wheels=(dist/*.whl)
 
           if [[ "${#wheels[@]}" -eq 0 ]]; then
             echo "No wheels found in dist" >&2
             exit 1
           fi
+
+          for artifact in "${artifacts[@]}"; do
+            if [[ ! -f "$artifact" || "$artifact" != *.whl ]]; then
+              echo "Unexpected publish artifact: $artifact" >&2
+              exit 1
+            fi
+          done
 
           for wheel in "${wheels[@]}"; do
             base="$(basename "$wheel")"
@@ -70,6 +85,10 @@ jobs:
                 ;;
             esac
           done
+
+          python3 tools/verify_python_wheels.py \
+            --require-all-targets \
+            "${wheels[@]}"
 
       - name: Publish to TestPyPI
         if: contains(github.ref_name, '-rc')
