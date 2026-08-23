@@ -316,6 +316,19 @@ def test_archive_verification_rejects_post_flush_size_overflow(monkeypatch):
     assert decompressor.flushed
 
 
+def test_archive_verification_rejects_a_truncated_gzip_stream(tmp_path):
+    # Without the eof check a gzip cut short of its trailer decompresses to a
+    # prefix, and any tar that parses from that prefix would be accepted.
+    repo, commit = initialize_repo(tmp_path)
+    archive = tmp_path / "source.tgz"
+    verifier.create_archive(archive, repo, commit, PREFIX)
+    complete = archive.read_bytes()
+    archive.write_bytes(complete[: len(complete) - 8])
+
+    with pytest.raises(ValueError, match="ended before its trailer"):
+        verifier.read_source_archive(archive, PREFIX)
+
+
 def test_archive_verification_rejects_second_tar_segment(tmp_path):
     repo, commit = initialize_repo(tmp_path)
     archive = tmp_path / "source.tgz"
