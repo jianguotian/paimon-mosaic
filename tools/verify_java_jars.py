@@ -276,6 +276,7 @@ MAVEN_POM_NAMESPACE = "{http://maven.apache.org/POM/4.0.0}"
 BUILD_METADATA_ENTRIES = frozenset(
     {"META-INF/MANIFEST.MF", "META-INF/DEPENDENCIES"}
 )
+CLASSIFIER_LEGAL_ENTRIES = frozenset({"META-INF/LICENSE", "META-INF/NOTICE"})
 
 
 def maven_descriptor_entries(root: Path) -> set[str]:
@@ -301,6 +302,37 @@ def maven_descriptor_entries(root: Path) -> set[str]:
 
     prefix = f"META-INF/maven/{coordinate('groupId')}/{coordinate('artifactId')}"
     return {f"{prefix}/pom.xml", f"{prefix}/pom.properties"}
+
+
+def generated_javadoc_files(root: Path) -> dict[str, Path]:
+    javadoc_root = root / "java/target/apidocs"
+    if not javadoc_root.is_dir():
+        raise ValueError("generated Javadoc directory does not exist")
+    return {
+        path.relative_to(javadoc_root).as_posix(): path
+        for path in javadoc_root.rglob("*")
+        if path.is_file()
+    }
+
+
+def verify_classifier_payload_entries(
+    entries: dict[str, ZipInfo],
+    expected_payload: set[str],
+    required_metadata: set[str],
+    noun: str,
+) -> None:
+    actual_payload = {
+        name for name, info in entries.items() if not info.is_dir()
+    }
+    expected_entries = (
+        expected_payload | CLASSIFIER_LEGAL_ENTRIES | required_metadata
+    )
+    missing = sorted(expected_entries - actual_payload)
+    if missing:
+        raise ValueError(f"{noun} is missing expected entries: {missing}")
+    unexpected = sorted(actual_payload - expected_entries)
+    if unexpected:
+        raise ValueError(f"{noun} contains unexpected entries: {unexpected}")
 
 
 def verify_compiled_java_classes(
@@ -493,6 +525,12 @@ def verify_sources_jar(path: Path, root: Path | None = None) -> None:
                 "sources JAR Java files differ from the repository sources: "
                 f"missing {missing}, unexpected {unexpected}"
             )
+        verify_classifier_payload_entries(
+            entries,
+            set(expected),
+            set(BUILD_METADATA_ENTRIES) | maven_descriptor_entries(root),
+            "sources JAR",
+        )
         for archive_path, source_path in expected.items():
             if archive.read(entries[archive_path]) != source_path.read_bytes():
                 raise ValueError(
@@ -512,6 +550,9 @@ def verify_javadoc_jar(path: Path, root: Path | None = None) -> None:
         sources = java_source_files(root)
         if not sources:
             raise ValueError("repository contains no Java sources")
+        expected = generated_javadoc_files(root)
+        if not expected:
+            raise ValueError("generated Javadoc directory contains no files")
         documented_sources = {
             source_path
             for source_path, source in sources.items()
@@ -536,6 +577,18 @@ def verify_javadoc_jar(path: Path, root: Path | None = None) -> None:
         )
         if empty:
             raise ValueError(f"javadoc JAR contains empty documentation pages: {empty}")
+        verify_classifier_payload_entries(
+            entries,
+            set(expected),
+            set(BUILD_METADATA_ENTRIES),
+            "javadoc JAR",
+        )
+        for archive_path, generated_path in expected.items():
+            if archive.read(entries[archive_path]) != generated_path.read_bytes():
+                raise ValueError(
+                    f"javadoc JAR entry {archive_path} differs from "
+                    f"{generated_path.as_posix()}"
+                )
     print(f"verified javadoc JAR payload: {path}")
 
 

@@ -28,12 +28,13 @@ from __future__ import annotations
 import posixpath
 import re
 import stat
-from zipfile import ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 
 MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
 MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 65536
+SUPPORTED_COMPRESSION_METHODS = frozenset((ZIP_STORED, ZIP_DEFLATED))
 WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 
 
@@ -58,6 +59,13 @@ def validated_entries(archive: ZipFile, noun: str) -> dict[str, ZipInfo]:
         name = info.orig_filename
         if not name or "\x00" in name or name != info.filename:
             raise ValueError(f"invalid {noun} entry path: {name!r}")
+        if info.flag_bits & 0x1:
+            raise ValueError(f"{noun} entry is encrypted: {name!r}")
+        if info.compress_type not in SUPPORTED_COMPRESSION_METHODS:
+            raise ValueError(
+                f"{noun} entry uses unsupported compression method "
+                f"{info.compress_type}: {name!r}"
+            )
         if "\\" in name:
             raise ValueError(f"{noun} entry uses a backslash: {name!r}")
         if name.startswith("/") or WINDOWS_DRIVE_PATH.match(name):

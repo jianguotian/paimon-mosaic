@@ -52,6 +52,7 @@ def test_release_jobs_are_blocked_by_tag_and_version_preflight() -> None:
     shared_preflight = load_workflow("release-preflight.yml")
     validation = shared_preflight["jobs"]["validate"]
     assert "if" not in validation
+    assert validation.get("continue-on-error") is None
     steps = validation["steps"]
 
     checkout = next(

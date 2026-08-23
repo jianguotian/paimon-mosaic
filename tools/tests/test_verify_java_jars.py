@@ -138,20 +138,44 @@ class VerifyJavaJarsTest(unittest.TestCase):
     def prepare_classifier_payloads(
         self,
     ) -> tuple[list[tuple[str | ZipInfo, bytes]], list[tuple[str | ZipInfo, bytes]]]:
+        self.write_java_pom()
         source_root = self.root / "java/src/main/java"
         source = source_root / EXAMPLE_SOURCE_PATH
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_bytes(EXAMPLE_SOURCE_CONTENTS)
-        sources = self.classifier_entries(
-            (EXAMPLE_SOURCE_PATH, EXAMPLE_SOURCE_CONTENTS)
+        common_metadata = (
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+            ("META-INF/DEPENDENCIES", b"// generated\n"),
         )
-        javadoc = self.classifier_entries(
+        source_metadata = (
+            *common_metadata,
+            (
+                "META-INF/maven/org.apache.paimon/mosaic/pom.xml",
+                (self.root / "java/pom.xml").read_bytes(),
+            ),
+            (
+                "META-INF/maven/org.apache.paimon/mosaic/pom.properties",
+                b"artifactId=mosaic\n",
+            ),
+        )
+        javadoc_root = self.root / "java/target/apidocs"
+        javadoc_entries = (
             ("index.html", b"<html>index</html>\n"),
             (
                 "org/apache/paimon/mosaic/Example.html",
                 b"<html>Example</html>\n",
             ),
+            ("script.js", b"generated();\n"),
         )
+        for name, contents in javadoc_entries:
+            generated = javadoc_root / name
+            generated.parent.mkdir(parents=True, exist_ok=True)
+            generated.write_bytes(contents)
+        sources = self.classifier_entries(
+            *source_metadata,
+            (EXAMPLE_SOURCE_PATH, EXAMPLE_SOURCE_CONTENTS)
+        )
+        javadoc = self.classifier_entries(*common_metadata, *javadoc_entries)
         return sources, javadoc
 
     def write_java_pom(self) -> None:
@@ -234,6 +258,27 @@ class VerifyJavaJarsTest(unittest.TestCase):
                 )
                 with self.assertRaises(ValueError):
                     self.verify_classifier(path)
+
+    def test_rejects_zip_features_the_verifiers_cannot_read(self) -> None:
+        cases = (
+            ("encrypted", "encrypted", {"flag_bits": 1}),
+            (
+                "unsupported-compression",
+                "compression method",
+                {"compress_type": 99},
+            ),
+        )
+
+        for case, error, attributes in cases:
+            with self.subTest(case=case):
+                info = ZipInfo("payload")
+                for name, value in attributes.items():
+                    setattr(info, name, value)
+                archive = mock.Mock()
+                archive.infolist.return_value = [info]
+
+                with self.assertRaisesRegex(ValueError, error):
+                    archive_guard.validated_entries(archive, "JAR")
 
     def test_rejects_duplicate_raw_entry_names(self) -> None:
         path = self.write_jar(
@@ -827,6 +872,79 @@ class VerifyJavaJarsTest(unittest.TestCase):
             with redirect_stdout(StringIO()):
                 verify_java_jars.verify_sources_jar(path, self.root)
 
+    def test_classifiers_reject_unaccounted_payload(self) -> None:
+        source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        cases = (
+            (
+                "sources",
+                self.write_jar(
+                    "sources-extra-payload.jar",
+                    [*source_entries, ("payload.sh", b"#!/bin/sh\n")],
+                ),
+                verify_java_jars.verify_sources_jar,
+            ),
+            (
+                "javadoc",
+                self.write_jar(
+                    "javadoc-extra-payload.jar",
+                    [*javadoc_entries, ("payload.js", b"unexpected();\n")],
+                ),
+                verify_java_jars.verify_javadoc_jar,
+            ),
+        )
+
+        for case, path, verifier in cases:
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(ValueError, "unexpected entries"):
+                    with redirect_stdout(StringIO()):
+                        verifier(path, self.root)
+
+    def test_classifiers_require_maven_build_metadata(self) -> None:
+        source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        cases = (
+            (
+                "sources-manifest",
+                source_entries,
+                "META-INF/MANIFEST.MF",
+                verify_java_jars.verify_sources_jar,
+            ),
+            (
+                "sources-pom",
+                source_entries,
+                "META-INF/maven/org.apache.paimon/mosaic/pom.xml",
+                verify_java_jars.verify_sources_jar,
+            ),
+            (
+                "sources-pom-properties",
+                source_entries,
+                "META-INF/maven/org.apache.paimon/mosaic/pom.properties",
+                verify_java_jars.verify_sources_jar,
+            ),
+            (
+                "javadoc-dependencies",
+                javadoc_entries,
+                "META-INF/DEPENDENCIES",
+                verify_java_jars.verify_javadoc_jar,
+            ),
+        )
+
+        for case, entries, removed, verifier in cases:
+            with self.subTest(case=case):
+                path = self.write_jar(
+                    f"{case}.jar",
+                    [
+                        (name, contents)
+                        for name, contents in entries
+                        if name != removed
+                    ],
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"missing expected entries.*{removed}",
+                ):
+                    with redirect_stdout(StringIO()):
+                        verifier(path, self.root)
+
     def test_javadoc_pages_must_not_be_empty(self) -> None:
         _source_entries, javadoc_entries = self.prepare_classifier_payloads()
         empty_index = [
@@ -836,6 +954,34 @@ class VerifyJavaJarsTest(unittest.TestCase):
         path = self.write_jar("empty-javadoc-page.jar", empty_index)
 
         with self.assertRaisesRegex(ValueError, "empty documentation pages"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_javadoc_jar(path, self.root)
+
+    def test_javadoc_jar_requires_every_generated_file(self) -> None:
+        _source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        missing_script = [
+            (name, contents)
+            for name, contents in javadoc_entries
+            if name != "script.js"
+        ]
+        path = self.write_jar("javadoc-missing-script.jar", missing_script)
+
+        with self.assertRaisesRegex(ValueError, "missing expected entries.*script.js"):
+            with redirect_stdout(StringIO()):
+                verify_java_jars.verify_javadoc_jar(path, self.root)
+
+    def test_javadoc_jar_must_match_every_generated_file(self) -> None:
+        _source_entries, javadoc_entries = self.prepare_classifier_payloads()
+        changed_script = [
+            (
+                name,
+                b"changed();\n" if name == "script.js" else contents,
+            )
+            for name, contents in javadoc_entries
+        ]
+        path = self.write_jar("javadoc-changed-script.jar", changed_script)
+
+        with self.assertRaisesRegex(ValueError, "script.js differs from"):
             with redirect_stdout(StringIO()):
                 verify_java_jars.verify_javadoc_jar(path, self.root)
 
