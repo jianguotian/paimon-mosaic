@@ -274,14 +274,6 @@ def archive_entries(archive: tarfile.TarFile, prefix: str) -> dict[str, ArchiveE
     return entries
 
 
-def read_archive(path: Path, prefix: str) -> dict[str, ArchiveEntry]:
-    try:
-        with tarfile.open(path, mode="r:*") as archive:
-            return archive_entries(archive, prefix)
-    except (tarfile.TarError, EOFError) as error:
-        raise ValueError(f"cannot read source archive {path}: {error}") from error
-
-
 def read_source_archive(
     path: Path, prefix: str
 ) -> tuple[dict[str, ArchiveEntry], str | None]:

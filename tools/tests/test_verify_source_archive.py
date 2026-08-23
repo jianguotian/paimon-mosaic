@@ -80,6 +80,19 @@ def write_tar(path, members):
             archive.addfile(info, io.BytesIO(content) if content is not None else None)
 
 
+def write_tgz(path, members):
+    """Write members as the gzip source archive the production reader expects."""
+    raw_tar = io.BytesIO()
+    with tarfile.open(fileobj=raw_tar, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for info, content in members:
+            archive.addfile(info, io.BytesIO(content) if content is not None else None)
+    with path.open("wb") as destination:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=destination, mtime=0
+        ) as compressed:
+            compressed.write(raw_tar.getvalue())
+
+
 def regular_file(name, content=b"content", mode=0o664):
     info = tarfile.TarInfo(name)
     info.type = tarfile.REGTYPE
@@ -246,7 +259,7 @@ def test_archive_verification_rejects_too_many_members_while_iterating(
     tmp_path, monkeypatch
 ):
     archive = tmp_path / "many-members.tar"
-    write_tar(
+    write_tgz(
         archive,
         [
             regular_file(f"{PREFIX}file-{index}.txt", str(index).encode())
@@ -256,7 +269,7 @@ def test_archive_verification_rejects_too_many_members_while_iterating(
     monkeypatch.setattr(verifier, "MAX_SOURCE_TAR_ENTRIES", 3)
 
     with pytest.raises(ValueError, match="more than 3 entries"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 def test_archive_verification_rejects_post_flush_size_overflow(monkeypatch):
@@ -408,17 +421,17 @@ def test_archive_creation_rejects_repository_local_attributes(tmp_path):
 
 
 def test_archive_verification_rejects_unsafe_entry_path(tmp_path):
-    archive = tmp_path / "unsafe.tar"
-    write_tar(archive, [regular_file("../escape")])
+    archive = tmp_path / "unsafe.tgz"
+    write_tgz(archive, [regular_file("../escape")])
 
     with pytest.raises(ValueError, match="unsafe archive entry path"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 def test_archive_verification_rejects_duplicate_entry(tmp_path):
-    archive = tmp_path / "duplicate.tar"
+    archive = tmp_path / "duplicate.tgz"
     path = f"{PREFIX}README.md"
-    write_tar(
+    write_tgz(
         archive,
         [
             regular_file(path, b"first"),
@@ -427,19 +440,19 @@ def test_archive_verification_rejects_duplicate_entry(tmp_path):
     )
 
     with pytest.raises(ValueError, match="duplicate archive entry"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 def test_archive_verification_rejects_escaping_symlink(tmp_path):
-    archive = tmp_path / "symlink.tar"
+    archive = tmp_path / "symlink.tgz"
     info = tarfile.TarInfo(f"{PREFIX}link")
     info.type = tarfile.SYMTYPE
     info.mode = 0o777
     info.linkname = "../../outside"
-    write_tar(archive, [(info, None)])
+    write_tgz(archive, [(info, None)])
 
     with pytest.raises(ValueError, match="escapes the archive prefix"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 @pytest.mark.parametrize(
@@ -447,15 +460,15 @@ def test_archive_verification_rejects_escaping_symlink(tmp_path):
     ("C:outside", "C:../outside", "C:/outside"),
 )
 def test_archive_verification_rejects_windows_drive_symlink(tmp_path, target):
-    archive = tmp_path / "symlink.tar"
+    archive = tmp_path / "symlink.tgz"
     info = tarfile.TarInfo(f"{PREFIX}link")
     info.type = tarfile.SYMTYPE
     info.mode = 0o777
     info.linkname = target
-    write_tar(archive, [(info, None)])
+    write_tgz(archive, [(info, None)])
 
     with pytest.raises(ValueError, match="unsafe symbolic-link target"):
-        verifier.read_archive(archive, PREFIX)
+        verifier.read_source_archive(archive, PREFIX)
 
 
 @pytest.mark.parametrize("prefix", ("C:release/", "C:/release/"))
