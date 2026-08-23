@@ -37,6 +37,7 @@ TOOLS_DIRECTORY = Path(__file__).resolve().parent.parent
 REPOSITORY_ROOT = TOOLS_DIRECTORY.parent
 sys.path.insert(0, str(TOOLS_DIRECTORY))
 
+import archive_guard  # noqa: E402
 import verify_java_jars  # noqa: E402
 import native_binary  # noqa: E402
 
@@ -240,7 +241,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "duplicate raw entry name"):
+        with self.assertRaisesRegex(ValueError, "duplicate JAR entry path"):
             self.verify_classifier(path)
 
     def test_rejects_duplicate_normalized_entry_names(self) -> None:
@@ -252,7 +253,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "duplicate normalized entry names"):
+        with self.assertRaisesRegex(ValueError, "duplicate normalized JAR entry path"):
             self.verify_classifier(path)
 
     def test_rejects_oversized_entry_before_archive_read(self) -> None:
@@ -262,7 +263,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
 
         with mock.patch.object(
-            verify_java_jars,
+            archive_guard,
             "MAX_ARCHIVE_ENTRY_SIZE",
             4096,
             create=True,
@@ -286,7 +287,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
 
         with mock.patch.object(
-            verify_java_jars, "MAX_ARCHIVE_ENTRIES", 5, create=True
+            archive_guard, "MAX_ARCHIVE_ENTRIES", 5
         ):
             with mock.patch.object(
                 ZipFile,
@@ -308,7 +309,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
 
         with mock.patch.object(
-            verify_java_jars, "MAX_ARCHIVE_TOTAL_SIZE", 4096, create=True
+            archive_guard, "MAX_ARCHIVE_TOTAL_SIZE", 4096
         ):
             with mock.patch.object(
                 ZipFile,
@@ -334,7 +335,7 @@ class VerifyJavaJarsTest(unittest.TestCase):
         self.replace_jar_entry_name(path, placeholder, malicious)
 
         with mock.patch.object(verify_java_jars, "verify_native_target"):
-            with self.assertRaisesRegex(ValueError, "invalid archive entry path"):
+            with self.assertRaisesRegex(ValueError, "invalid JAR entry path"):
                 with redirect_stdout(StringIO()):
                     verify_java_jars.verify_main_jar(path, self.root, True)
 

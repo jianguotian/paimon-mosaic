@@ -29,15 +29,12 @@ import zlib
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
+import archive_guard
 from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
 
-MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
-MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
-MAX_ARCHIVE_ENTRIES = 65536
 MAX_JAVA_CLASS_SIZE = 16 * 1024 * 1024
 ARCHIVE_READ_CHUNK_SIZE = 1024 * 1024
-WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -90,67 +87,11 @@ def repository_root() -> Path:
 
 
 def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
-    entries: dict[str, ZipInfo] = {}
-    normalized_names: dict[str, str] = {}
-    # The per-entry cap does not bound the aggregate, so bound the total and the
-    # entry count too.
-    total_size = 0
-    infos = archive.infolist()
-    if len(infos) > MAX_ARCHIVE_ENTRIES:
-        raise ValueError(
-            f"archive declares more than {MAX_ARCHIVE_ENTRIES} entries: {len(infos)}"
-        )
-    for info in infos:
-        name = info.orig_filename
-        if not name or "\x00" in name or name != info.filename:
-            raise ValueError(f"invalid archive entry path: {name!r}")
-        if "\\" in name:
-            raise ValueError(f"archive entry uses a backslash: {name!r}")
-        if name.startswith("/") or WINDOWS_DRIVE_PATH.match(name):
-            raise ValueError(
-                f"archive entry uses an absolute or drive-qualified path: {name!r}"
-            )
-        if ".." in name.split("/"):
-            raise ValueError(f"archive entry uses a '..' path component: {name!r}")
-        if stat.S_ISLNK(info.external_attr >> 16):
-            raise ValueError(f"archive entry is a symbolic link: {name!r}")
-        # A ZIP directory entry is nothing but a trailing slash, yet it can carry
-        # data that ClassLoader.getResourceAsStream and ServiceLoader still read.
-        if info.is_dir() and info.file_size != 0:
-            raise ValueError(
-                f"archive directory entry carries payload: {name!r}"
-            )
-        if info.file_size > MAX_ARCHIVE_ENTRY_SIZE:
-            raise ValueError(
-                f"archive entry {name!r} exceeds the size limit of "
-                f"{MAX_ARCHIVE_ENTRY_SIZE} bytes: {info.file_size} bytes"
-            )
-        total_size += info.file_size
-        if total_size > MAX_ARCHIVE_TOTAL_SIZE:
-            raise ValueError(
-                f"archive exceeds the total size limit of "
-                f"{MAX_ARCHIVE_TOTAL_SIZE} bytes"
-            )
-        if name in entries:
-            raise ValueError(f"archive contains duplicate raw entry name: {name!r}")
-
-        normalized_name = posixpath.normpath(name)
-        if normalized_name in ("", ".", "/"):
-            raise ValueError(f"invalid archive entry path: {name!r}")
-        previous_name = normalized_names.get(normalized_name)
-        if previous_name is not None:
-            raise ValueError(
-                "archive contains duplicate normalized entry names: "
-                f"{previous_name!r} and {name!r}"
-            )
-
-        entries[name] = info
-        normalized_names[normalized_name] = name
-
+    entries = archive_guard.validated_entries(archive, "JAR")
     # ZipExtFile validates a member's CRC only when it is read through EOF.
     # Header-only format detection below is therefore insufficient for ordinary
     # resources, so stream every bounded member once before accepting the JAR.
-    for info in infos:
+    for info in entries.values():
         if info.is_dir():
             continue
         with archive.open(info) as source:

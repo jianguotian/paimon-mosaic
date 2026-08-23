@@ -33,6 +33,7 @@ TOOLS = TESTS.parent
 sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(TESTS))
 
+import archive_guard  # noqa: E402
 import verify_python_wheels as verifier  # noqa: E402
 import native_binary  # noqa: E402
 from native_binary_fixtures import FFI_SYMBOLS, build_elf  # noqa: E402
@@ -357,7 +358,7 @@ def test_verify_wheel_rejects_nonempty_directory_entries(
 
     with pytest.raises(
         ValueError,
-        match=r"wheel directory entries contain payload.*mosaic/",
+        match=r"wheel directory entry carries payload.*mosaic/",
     ):
         verifier.verify_wheel(wheel, root)
 
@@ -477,7 +478,7 @@ def test_verify_wheel_rejects_oversized_entry_before_archive_read(
         extra_entries={"mosaic/oversized.bin": b"x" * 4097},
     )
     monkeypatch.setattr(
-        verifier,
+        archive_guard,
         "MAX_ARCHIVE_ENTRY_SIZE",
         4096,
         raising=False,
@@ -500,8 +501,8 @@ def test_verify_wheel_rejects_oversized_total_before_archive_read(
         tmp_path,
         extra_entries={f"mosaic/chunk{index}.bin": b"x" * 900 for index in range(8)},
     )
-    monkeypatch.setattr(verifier, "MAX_ARCHIVE_ENTRY_SIZE", 4096, raising=False)
-    monkeypatch.setattr(verifier, "MAX_ARCHIVE_TOTAL_SIZE", 4096, raising=False)
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_ENTRY_SIZE", 4096)
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_TOTAL_SIZE", 4096)
 
     def fail_unbounded_read(*_args, **_kwargs):
         raise AssertionError("archive.read must not be called")
@@ -518,7 +519,7 @@ def test_verify_wheel_rejects_too_many_entries_before_archive_read(
         tmp_path,
         extra_entries={f"mosaic/chunk{index}.bin": b"x" for index in range(8)},
     )
-    monkeypatch.setattr(verifier, "MAX_ARCHIVE_ENTRIES", 4, raising=False)
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_ENTRIES", 4)
 
     def fail_unbounded_read(*_args, **_kwargs):
         raise AssertionError("archive.read must not be called")
@@ -526,20 +527,6 @@ def test_verify_wheel_rejects_too_many_entries_before_archive_read(
     monkeypatch.setattr(ZipFile, "read", fail_unbounded_read)
     with pytest.raises(ValueError, match="more than 4 entries"):
         verifier.verify_wheel(wheel, root)
-
-
-def test_archive_bounds_match_the_java_verifier():
-    # Both verifiers declare their own copies and, unlike the target matrix,
-    # nothing cross-checks them at import time. Divergence would leave one
-    # artifact type less protected than the other.
-    import verify_java_jars
-
-    for name in (
-        "MAX_ARCHIVE_ENTRY_SIZE",
-        "MAX_ARCHIVE_TOTAL_SIZE",
-        "MAX_ARCHIVE_ENTRIES",
-    ):
-        assert getattr(verifier, name) == getattr(verify_java_jars, name), name
 
 
 def test_target_matrix_guard_rejects_drift(monkeypatch):

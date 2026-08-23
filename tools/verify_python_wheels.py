@@ -34,12 +34,10 @@ import zlib
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
+import archive_guard
 from native_binary import TARGET_ARCHITECTURE, verify_native_target
 
 
-MAX_ARCHIVE_ENTRY_SIZE = 256 * 1024 * 1024
-MAX_ARCHIVE_TOTAL_SIZE = 1024 * 1024 * 1024
-MAX_ARCHIVE_ENTRIES = 65536
 NATIVE_LIBRARY = {
     "x86_64-unknown-linux-gnu": "mosaic/libpaimon_mosaic_ffi.so",
     "aarch64-unknown-linux-gnu": "mosaic/libpaimon_mosaic_ffi.so",
@@ -59,7 +57,6 @@ NESTED_LICENSE_MARKERS = (
     "Apache Arrow",
 )
 
-WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:")
 MACHO_MAGICS = {
     b"\xfe\xed\xfa\xce",
     b"\xce\xfa\xed\xfe",
@@ -182,54 +179,7 @@ def parse_dist_info_name(dist_info: str) -> tuple[str, str]:
 
 
 def validate_archive_paths(archive: ZipFile) -> set[str]:
-    names = set()
-    normalized_names = set()
-    # The per-entry cap does not bound the aggregate, and every entry is streamed
-    # through hashlib to check RECORD, so bound the total and the entry count too.
-    total_size = 0
-    entries = archive.infolist()
-    if len(entries) > MAX_ARCHIVE_ENTRIES:
-        raise ValueError(
-            f"wheel declares more than {MAX_ARCHIVE_ENTRIES} entries: {len(entries)}"
-        )
-    for info in entries:
-        raw_name = info.orig_filename
-        if not raw_name or "\x00" in raw_name or raw_name != info.filename:
-            raise ValueError(f"invalid wheel entry path: {raw_name!r}")
-        if "\\" in raw_name:
-            raise ValueError(f"wheel entry uses a backslash: {raw_name!r}")
-        if raw_name.startswith("/") or WINDOWS_DRIVE_PATH.match(raw_name):
-            raise ValueError(
-                f"wheel entry uses an absolute or drive-qualified path: {raw_name!r}"
-            )
-        if ".." in raw_name.split("/"):
-            raise ValueError(f"wheel entry uses '..': {raw_name!r}")
-        if stat.S_ISLNK(info.external_attr >> 16):
-            raise ValueError(f"wheel entry is a symbolic link: {raw_name!r}")
-        if info.file_size > MAX_ARCHIVE_ENTRY_SIZE:
-            raise ValueError(
-                f"wheel entry {raw_name!r} exceeds the size limit of "
-                f"{MAX_ARCHIVE_ENTRY_SIZE} bytes: {info.file_size} bytes"
-            )
-        total_size += info.file_size
-        if total_size > MAX_ARCHIVE_TOTAL_SIZE:
-            raise ValueError(
-                f"wheel exceeds the total size limit of "
-                f"{MAX_ARCHIVE_TOTAL_SIZE} bytes"
-            )
-
-        normalized_name = posixpath.normpath(raw_name)
-        if normalized_name in ("", ".", "/"):
-            raise ValueError(f"invalid wheel entry path: {raw_name!r}")
-        if raw_name in names:
-            raise ValueError(f"duplicate wheel entry path: {raw_name!r}")
-        if normalized_name in normalized_names:
-            raise ValueError(
-                f"duplicate normalized wheel entry path: {normalized_name!r}"
-            )
-        names.add(raw_name)
-        normalized_names.add(normalized_name)
-    return names
+    return set(archive_guard.validated_entries(archive, "wheel"))
 
 
 def native_binary_magic(source, size: int) -> str | None:
@@ -501,13 +451,6 @@ def verify_wheel(wheel: Path, root: Path) -> str:
         directory_entries = [
             info for info in archive.infolist() if info.is_dir()
         ]
-        nonempty_directories = sorted(
-            info.filename for info in directory_entries if info.file_size != 0
-        )
-        if nonempty_directories:
-            raise ValueError(
-                f"wheel directory entries contain payload: {nonempty_directories}"
-            )
         allowed_directories = parent_directories(
             allowed_payload | {top_level_path}
         )
