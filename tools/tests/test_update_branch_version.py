@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import shutil
 import subprocess
 from pathlib import Path
@@ -154,3 +155,44 @@ def test_documented_version_transitions(
         run(["git", "log", "-1", "--pretty=%s"], cwd=root).stdout.strip()
         == f"Update version to {new_version}"
     )
+
+
+def test_multi_module_pom_bump_rewrites_every_module(tmp_path: Path) -> None:
+    # The removed POM_LINES_CHANGED guard aborted unless exactly one line across
+    # all POMs changed, contradicting bump_pom_version.py, which deliberately
+    # rewrites project/parent/version so a child module legitimately changes a
+    # second line. Drive the same find invocation the script runs.
+    root = release_fixture(tmp_path)
+    module = root / "java/child"
+    module.mkdir(parents=True)
+    (module / "pom.xml").write_text(
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">\n'
+        "  <parent>\n"
+        "    <artifactId>mosaic</artifactId>\n"
+        "    <version>0.3.0-SNAPSHOT</version>\n"
+        "  </parent>\n"
+        "  <artifactId>mosaic-child</artifactId>\n"
+        "  <dependencies>\n"
+        "    <dependency><version>0.3.0-SNAPSHOT</version></dependency>\n"
+        "  </dependencies>\n"
+        "</project>\n",
+        encoding="utf-8",
+    )
+
+    run(
+        [
+            "find", ".", "-name", "pom.xml", "-not", "-path", "*/target/*",
+            "-type", "f", "-exec", sys.executable, "tools/bump_pom_version.py",
+            "0.3.0-SNAPSHOT", "0.4.0-SNAPSHOT", "{}", "+",
+        ],
+        cwd=root,
+    )
+
+    parent_pom = (root / "java/pom.xml").read_text(encoding="utf-8")
+    child_pom = (root / "java/child/pom.xml").read_text(encoding="utf-8")
+    assert "<version>0.4.0-SNAPSHOT</version>" in parent_pom
+    assert "<version>0.4.0-SNAPSHOT</version>" in child_pom
+    # The decoy dependency in each POM keeps the old version: the rewrite is
+    # structural, so it never escapes into a dependency element.
+    assert parent_pom.count("<version>0.3.0-SNAPSHOT</version>") == 1
+    assert child_pom.count("<version>0.3.0-SNAPSHOT</version>") == 1

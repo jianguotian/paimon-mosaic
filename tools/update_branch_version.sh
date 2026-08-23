@@ -64,15 +64,6 @@ NEW_VERSION_CLEAN=$(echo "$NEW_VERSION" | sed 's/-SNAPSHOT//')
 find . -name 'pom.xml' -not -path '*/target/*' -type f \
   -exec python3 tools/bump_pom_version.py "$OLD_VERSION" "$NEW_VERSION" {} +
 
-# Only the project version element may change. Anything more means the match
-# escaped into a dependency, plugin, or parent version.
-POM_LINES_CHANGED=$(git diff --numstat -- '*pom.xml' | awk '{sum += $1} END {print sum + 0}')
-if [[ "${POM_LINES_CHANGED}" != "1" ]]; then
-  echo "expected exactly one changed pom.xml line, got ${POM_LINES_CHANGED}" >&2
-  git diff -- '*pom.xml' >&2
-  exit 1
-fi
-
 # Change workspace package versions and versioned path dependencies together.
 # The TOML-aware helper also supports retrying a partially completed bump.
 python3 tools/verify_release_versions.py \
