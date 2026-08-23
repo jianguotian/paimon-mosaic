@@ -30,10 +30,10 @@ def _package_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "mosaic")
 
 
-def _rust_target():
+def _detect_rust_target():
     system = platform.system()
     machine = platform.machine().lower()
-    detected = {
+    return {
         ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
         ("Linux", "amd64"): "x86_64-unknown-linux-gnu",
         ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
@@ -43,15 +43,26 @@ def _rust_target():
         ("Windows", "x86_64"): "x86_64-pc-windows-msvc",
         ("Windows", "amd64"): "x86_64-pc-windows-msvc",
     }.get((system, machine))
+
+
+def _rust_target():
+    detected = _detect_rust_target()
     if not detected:
         raise RuntimeError(
-            f"Unsupported wheel build platform: system={system}, machine={machine}"
+            f"Unsupported wheel build platform: "
+            f"system={platform.system()}, machine={platform.machine().lower()}"
         )
     return detected
 
 
 def _license_files():
-    target = _rust_target()
+    # setup() evaluates this at import, so it also runs for `pip install -e .`
+    # on platforms the release does not target. Only the wheel carries the
+    # per-target legal files, and BuildPyWithNativeLib.run still calls
+    # _rust_target() and fails closed there.
+    target = _detect_rust_target()
+    if not target:
+        return []
     return [
         f"licenses/{target}/LICENSE",
         f"licenses/{target}/NOTICE",
