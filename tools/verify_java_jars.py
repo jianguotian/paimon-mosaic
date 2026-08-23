@@ -24,6 +24,7 @@ import posixpath
 import re
 import stat
 import sys
+import zlib
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
@@ -455,16 +456,6 @@ def _verify_classifier_entries(
         raise ValueError(f"classifier contains binary-only files: {forbidden}")
 
 
-def verify_classifier(path: Path, root: Path | None = None) -> None:
-    if root is None:
-        root = repository_root()
-    with ZipFile(path) as archive:
-        entries = validated_entries(archive)
-        _verify_classifier_entries(archive, entries, root)
-
-    print(f"verified classifier JAR: {path}")
-
-
 def verify_sources_jar(path: Path, root: Path | None = None) -> None:
     if root is None:
         root = repository_root()
@@ -542,7 +533,14 @@ def main() -> int:
         verify_main_jar(args.main, root, args.require_all_natives)
         verify_sources_jar(args.sources, root)
         verify_javadoc_jar(args.javadoc, root)
-    except (BadZipFile, KeyError, OSError, ValueError) as error:
+    except (
+        BadZipFile,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        zlib.error,
+    ) as error:
         print(f"Java artifact verification failed: {error}", file=sys.stderr)
         return 1
     return 0

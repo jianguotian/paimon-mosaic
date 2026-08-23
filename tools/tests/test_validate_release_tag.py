@@ -391,3 +391,26 @@ def test_untrusted_gnupg_statuses_are_rejected(monkeypatch, status):
 
     with pytest.raises(validator.TagValidationError, match=status):
         validator.verify_signature(Path("."), "v6.0.0-rc1", {})
+
+
+def test_git_environment_strips_the_repository_selecting_variables():
+    # An inherited GIT_DIR overrides both cwd= and `git -C`, so this module has
+    # to remove the variables rather than work around them. It previously only
+    # set GIT_NO_REPLACE_OBJECTS and stripped nothing.
+    inherited = {name: "/hostile" for name in validator.GIT_REPOSITORY_ENVIRONMENT}
+    inherited["PATH"] = os.environ.get("PATH", "")
+
+    result = validator.git_environment(inherited)
+
+    assert result["GIT_NO_REPLACE_OBJECTS"] == "1"
+    for name in validator.GIT_REPOSITORY_ENVIRONMENT:
+        assert name not in result, f"{name} survived git_environment()"
+    assert result["PATH"] == inherited["PATH"]
+
+
+def test_git_environment_shares_the_source_archive_variable_list():
+    # Three layers used to encode this rule with three different contents.
+    from verify_source_archive import GIT_REPOSITORY_ENVIRONMENT as shared
+
+    assert validator.GIT_REPOSITORY_ENVIRONMENT is shared
+    assert "GIT_DIR" in shared

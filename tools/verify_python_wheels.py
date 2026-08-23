@@ -30,6 +30,7 @@ import posixpath
 import re
 import stat
 import sys
+import zlib
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
@@ -618,7 +619,15 @@ def main() -> int:
     for wheel in args.wheels:
         try:
             targets.append(verify_wheel(wheel, root))
-        except (BadZipFile, csv.Error, KeyError, OSError, ValueError) as error:
+        except (
+            BadZipFile,
+            csv.Error,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            zlib.error,
+        ) as error:
             failed = True
             print(f"{wheel}: {error}", file=sys.stderr)
     if args.require_all_targets:

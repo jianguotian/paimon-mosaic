@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import stat
+import struct
 import sys
 import tempfile
 import unittest
@@ -29,7 +30,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
 from unittest import mock
-from zipfile import BadZipFile, ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile, ZipInfo
 
 
 TOOLS_DIRECTORY = Path(__file__).resolve().parent.parent
@@ -115,8 +116,14 @@ class VerifyJavaJarsTest(unittest.TestCase):
         path.write_bytes(contents.replace(original_bytes, replacement_bytes))
 
     def verify_classifier(self, path: Path) -> None:
+        # The shape verify_sources_jar and verify_javadoc_jar both run before
+        # their payload checks; the old public wrapper had no production caller.
         with redirect_stdout(StringIO()):
-            verify_java_jars.verify_classifier(path, self.root)
+            with ZipFile(path) as archive:
+                entries = verify_java_jars.validated_entries(archive)
+                verify_java_jars._verify_classifier_entries(
+                    archive, entries, self.root
+                )
 
     def classifier_entries(
         self, *extra_entries: tuple[str | ZipInfo, bytes]
@@ -824,6 +831,47 @@ class VerifyJavaJarsTest(unittest.TestCase):
             "verify_java_jars.py",
             "--main",
             str(broken),
+            "--sources",
+            str(classifier),
+            "--javadoc",
+            str(classifier),
+        ]
+        with mock.patch.object(
+            verify_java_jars, "repository_root", return_value=self.root
+        ):
+            with mock.patch.object(sys, "argv", arguments):
+                stderr = StringIO()
+                with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                    self.assertEqual(verify_java_jars.main(), 1)
+                self.assertIn(
+                    "Java artifact verification failed", stderr.getvalue()
+                )
+
+    def test_main_fails_closed_on_a_damaged_deflate_stream(self) -> None:
+        # validated_entries streams every member through EOF to force a CRC
+        # check, so a member corrupted deep inside its deflate stream raises
+        # zlib.error rather than BadZipFile.
+        classifier = self.root / "sources.jar"
+        with ZipFile(classifier, "w", ZIP_DEFLATED) as archive:
+            for name, contents in self.classifier_entries():
+                archive.writestr(name, contents)
+            archive.writestr("payload.bin", bytes(range(256)) * 20000)
+
+        raw = bytearray(classifier.read_bytes())
+        with ZipFile(classifier) as archive:
+            info = archive.getinfo("payload.bin")
+        name_length, extra_length = struct.unpack_from(
+            "<HH", raw, info.header_offset + 26
+        )
+        data_start = info.header_offset + 30 + name_length + extra_length
+        for offset in range(data_start + 2000, data_start + 2003):
+            raw[offset] ^= 0xFF
+        classifier.write_bytes(bytes(raw))
+
+        arguments = [
+            "verify_java_jars.py",
+            "--main",
+            str(classifier),
             "--sources",
             str(classifier),
             "--javadoc",

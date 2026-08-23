@@ -29,6 +29,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from verify_source_archive import GIT_REPOSITORY_ENVIRONMENT
+
 
 NUMBER = r"(?:0|[1-9][0-9]*)"
 FINAL_TAG = re.compile(rf"^v({NUMBER})\.({NUMBER})\.({NUMBER})$")
@@ -105,7 +107,11 @@ def run(
 def git_environment(
     environment: dict[str, str] | None = None,
 ) -> dict[str, str]:
+    # An inherited GIT_DIR overrides both cwd and `git -C`, so the variables
+    # have to be removed rather than worked around.
     result = os.environ.copy() if environment is None else environment.copy()
+    for variable in GIT_REPOSITORY_ENVIRONMENT:
+        result.pop(variable, None)
     result["GIT_NO_REPLACE_OBJECTS"] = "1"
     return result
 
