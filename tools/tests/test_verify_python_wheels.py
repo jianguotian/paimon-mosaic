@@ -18,6 +18,7 @@ import csv
 import hashlib
 import importlib.util
 import io
+import json
 import shutil
 import stat
 import sys
@@ -43,6 +44,9 @@ PE_SIDECAR = bytearray(132)
 PE_SIDECAR[:2] = b"MZ"
 PE_SIDECAR[0x3C:0x40] = (0x80).to_bytes(4, "little")
 PE_SIDECAR[0x80:0x84] = b"PE\0\0"
+
+# Distinguishes "leave this METADATA header out" from "set it to a wrong value".
+OMIT = object()
 
 
 SUPPORTED_WHEELS = (
@@ -120,12 +124,32 @@ def build_wheel(
     native_bytes=b"native-library",
     native_path=None,
     package_entries=None,
+    requires_python=">=3.9",
+    dependencies=("pyarrow",),
+    optional_dependencies=None,
+    metadata_requires_python=None,
+    metadata_requires_dist=None,
+    metadata_provides_extra=None,
 ):
     dist_info_distribution = dist_info_distribution or filename_distribution
     dist_info_version = dist_info_version or filename_version
     wheel_tags = wheel_tags or [f"{python_tag}-{abi_tag}-{platform_tag}"]
     dist_info = f"{dist_info_distribution}-{dist_info_version}.dist-info"
     record_path = f"{dist_info}/RECORD"
+
+    if optional_dependencies is None:
+        optional_dependencies = {"test": ["pytest"]}
+    extras = sorted(optional_dependencies)
+    if metadata_requires_python is None:
+        metadata_requires_python = requires_python
+    if metadata_provides_extra is None:
+        metadata_provides_extra = extras
+    if metadata_requires_dist is None:
+        metadata_requires_dist = list(dependencies) + [
+            f'{requirement}; extra == "{extra}"'
+            for extra in extras
+            for requirement in optional_dependencies[extra]
+        ]
 
     license_text = b"Apache License\nTHIRD-PARTY-LICENSES.html\n"
     notice_text = b"Apache Arrow\n"
@@ -145,7 +169,17 @@ def build_wheel(
         f"Version: {metadata_version}\n"
         "License-Expression: Apache-2.0\n"
         f"{expected_license_fields}"
-        "\n"
+        + (
+            f"Requires-Python: {metadata_requires_python}\n"
+            if metadata_requires_python is not OMIT
+            else ""
+        )
+        + "".join(f"Provides-Extra: {extra}\n" for extra in metadata_provides_extra)
+        + "".join(
+            f"Requires-Dist: {requirement}\n"
+            for requirement in metadata_requires_dist
+        )
+        + "\n"
     ).encode()
     wheel_metadata = (
         "Wheel-Version: 1.0\n"
@@ -191,6 +225,24 @@ def build_wheel(
         source = package_root / name
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_bytes(content)
+    pyproject = [
+        "[project]",
+        'name = "paimon-mosaic"',
+        f'version = "{filename_version}"',
+        f'requires-python = "{requires_python}"',
+        f"dependencies = {json.dumps(list(dependencies))}",
+    ]
+    if optional_dependencies:
+        pyproject.append("")
+        pyproject.append("[project.optional-dependencies]")
+        pyproject += [
+            f"{extra} = {json.dumps(list(optional_dependencies[extra]))}"
+            for extra in extras
+        ]
+    package_root.mkdir(parents=True, exist_ok=True)
+    (package_root / "pyproject.toml").write_text(
+        "\n".join(pyproject) + "\n", encoding="utf-8"
+    )
     return wheel, root
 
 
@@ -600,6 +652,75 @@ def test_verify_wheel_rejects_musllinux_for_gnu_target(tmp_path):
 
     with pytest.raises(ValueError, match="musllinux"):
         verifier.verify_wheel(wheel, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    (
+        (
+            {
+                "metadata_requires_dist": [
+                    "pyarrow",
+                    "attacker-owned-package",
+                    'pytest; extra == "test"',
+                ]
+            },
+            "unexpected Requires-Dist",
+        ),
+        (
+            {
+                "metadata_requires_dist": [
+                    "pyarrow",
+                    "requests ; sys_platform == 'linux'",
+                    'pytest; extra == "test"',
+                ]
+            },
+            "unexpected Requires-Dist",
+        ),
+        ({"metadata_requires_dist": []}, "unexpected Requires-Dist"),
+        (
+            {"metadata_provides_extra": ["backdoor", "test"]},
+            "unexpected Provides-Extra",
+        ),
+        ({"metadata_provides_extra": []}, "unexpected Provides-Extra"),
+        ({"metadata_requires_python": ">=3.8"}, "unexpected Requires-Python"),
+        ({"metadata_requires_python": OMIT}, "unexpected Requires-Python"),
+    ),
+)
+def test_verify_wheel_rejects_tampered_dependency_metadata(
+    tmp_path, monkeypatch, options, error
+):
+    # Requires-Dist is the only METADATA field pip acts on at install time, so an
+    # unpinned value lets a tampered candidate add or drop dependencies while
+    # still verifying.
+    wheel, root = build_wheel(tmp_path, **options)
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match=error):
+        verifier.verify_wheel(wheel, root)
+
+
+def test_expected_dependency_metadata_matches_the_repository():
+    requires_python, extras, requires_dist = verifier.expected_dependency_metadata(
+        verifier.repository_root()
+    )
+
+    assert requires_python == ">=3.9"
+    assert extras == ["test"]
+    assert requires_dist == ["pyarrow", 'pytest; extra == "test"']
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    (
+        ("pyarrow", "pyarrow"),
+        ("  pyarrow  ", "pyarrow"),
+        ("pytest ;  extra == 'test'", 'pytest; extra == "test"'),
+        ('pytest;\textra  ==  "test"', 'pytest; extra == "test"'),
+    ),
+)
+def test_normalized_requirement_ignores_rendering_differences(value, expected):
+    assert verifier.normalized_requirement(value) == expected
 
 
 def find_record_row(rows, suffix):
