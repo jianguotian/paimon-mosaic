@@ -94,7 +94,30 @@ def initialize_release_repo(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
 set -euo pipefail
 if [[ " $* " == *" --detach-sig "* ]]; then
   archive="${@: -1}"
-  printf 'test signature\\n' > "${archive}.asc"
+  if [[ -n "${MOSAIC_TEST_GPG_BAD_SIG:-}" ]]; then
+    printf 'corrupt signature\\n' > "${archive}.asc"
+  else
+    printf 'test signature\\n' > "${archive}.asc"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == "--verify" ]]; then
+  signature="${2:-}"
+  archive="${3:-}"
+  if [[ ! -f "${signature}" ]]; then
+    echo "gpg: cannot open signature ${signature}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${archive}" ]]; then
+    echo "gpg: cannot open archive ${archive}" >&2
+    exit 1
+  fi
+  if [[ "$(cat "${signature}")" != "test signature" ]]; then
+    echo "gpg: BAD signature" >&2
+    exit 1
+  fi
+  echo "gpg: Good signature"
+  exit 0
 fi
 """,
     )
@@ -398,3 +421,50 @@ def test_same_length_mutation_keeps_pax_commit_but_fails_tree_verification(
     )
     assert result.returncode != 0
     assert b"file content differs" in result.stderr
+
+
+def test_source_release_emits_a_verified_signature_and_checksum(
+    tmp_path: Path,
+) -> None:
+    # Without these assertions the detach-sign and sha512 steps could both be
+    # deleted from the script with every test still passing.
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    archive = (
+        repo / "tools" / "release" / f"apache-paimon-mosaic-{VERSION}-src.tgz"
+    )
+
+    result = run(["bash", script.name], cwd=script.parent, env=env)
+
+    signature = archive.with_suffix(archive.suffix + ".asc")
+    checksum = archive.with_suffix(archive.suffix + ".sha512")
+    assert signature.is_file()
+    assert checksum.is_file()
+    assert b"Good signature" in result.stdout + result.stderr
+
+    recorded = checksum.read_text(encoding="utf-8").split()[0]
+    assert recorded == hashlib.sha512(archive.read_bytes()).hexdigest()
+    assert archive.name in checksum.read_text(encoding="utf-8")
+
+
+def test_source_release_fails_when_the_signature_does_not_verify(
+    tmp_path: Path,
+) -> None:
+    # Gives `gpg --verify` a deny path; without it, deleting that step from the
+    # script changes no test outcome.
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    hostile_env = dict(env)
+    hostile_env["MOSAIC_TEST_GPG_BAD_SIG"] = "1"
+
+    result = subprocess.run(
+        ["bash", script.name],
+        cwd=script.parent,
+        env=hostile_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert b"BAD signature" in result.stdout + result.stderr
