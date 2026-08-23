@@ -1094,15 +1094,45 @@ def build_gnu_hash_table_with_bloom(bloom_count, buckets, chains):
     return table
 
 
-def test_elf_sysv_hash_rejects_counts_above_the_symbol_cap(monkeypatch):
+def record_struct_unpack_formats(monkeypatch):
+    unpack_formats = []
+    unpack_from = verifier.struct.unpack_from
+
+    def recording_unpack_from(format_string, data, offset):
+        unpack_formats.append(format_string)
+        return unpack_from(format_string, data, offset)
+
+    monkeypatch.setattr(verifier.struct, "unpack_from", recording_unpack_from)
+    return unpack_formats
+
+
+def test_elf_sysv_hash_rejects_a_symbol_count_above_the_cap_before_unpacking(
+    monkeypatch,
+):
     monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
     table = build_sysv_hash_table((1, 2), (0, 0, 3, 0, 0))
+    unpack_formats = record_struct_unpack_formats(monkeypatch)
 
     with pytest.raises(ValueError, match="DT_HASH declares more than 4"):
         verifier.parse_elf_sysv_hash(table, sysv_hash_section(table))
 
+    assert unpack_formats == ["<II"]
 
-def test_elf_sysv_hash_accepts_counts_at_the_symbol_cap(monkeypatch):
+
+def test_elf_sysv_hash_rejects_a_bucket_count_above_the_cap_before_unpacking(
+    monkeypatch,
+):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
+    table = build_sysv_hash_table((0, 0, 0, 0, 0), (0,))
+    unpack_formats = record_struct_unpack_formats(monkeypatch)
+
+    with pytest.raises(ValueError, match="DT_HASH declares more than 4"):
+        verifier.parse_elf_sysv_hash(table, sysv_hash_section(table))
+
+    assert unpack_formats == ["<II"]
+
+
+def test_elf_sysv_hash_accepts_a_symbol_count_at_the_cap(monkeypatch):
     monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 5)
     table = build_sysv_hash_table((1, 2), (0, 0, 3, 0, 0))
 
@@ -1111,28 +1141,46 @@ def test_elf_sysv_hash_accepts_counts_at_the_symbol_cap(monkeypatch):
     assert parsed.chains == (0, 0, 3, 0, 0)
 
 
+def test_elf_sysv_hash_accepts_a_bucket_count_at_the_cap(monkeypatch):
+    monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 5)
+    table = build_sysv_hash_table((0, 0, 0, 0, 0), (0,))
+
+    parsed = verifier.parse_elf_sysv_hash(table, sysv_hash_section(table))
+
+    assert parsed.buckets == (0, 0, 0, 0, 0)
+
+
 def test_elf_gnu_hash_rejects_a_bucket_count_above_the_symbol_cap(monkeypatch):
     monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
     table = build_gnu_hash_table(0, (0, 0, 0, 0, 0), (1,))
+    unpack_formats = record_struct_unpack_formats(monkeypatch)
 
     with pytest.raises(ValueError, match="DT_GNU_HASH declares more than 4"):
         verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+    assert unpack_formats == ["<IIII"]
 
 
 def test_elf_gnu_hash_rejects_a_bloom_count_above_the_symbol_cap(monkeypatch):
     monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
     table = build_gnu_hash_table_with_bloom(5, (0,), (1,))
+    unpack_formats = record_struct_unpack_formats(monkeypatch)
 
     with pytest.raises(ValueError, match="DT_GNU_HASH declares more than 4"):
         verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+    assert unpack_formats == ["<IIII"]
 
 
 def test_elf_gnu_hash_rejects_a_chain_count_above_the_symbol_cap(monkeypatch):
     monkeypatch.setattr(verifier, "MAX_DYNAMIC_SYMBOLS", 4)
     table = build_gnu_hash_table(0, (0,), (0, 0, 0, 0, 1))
+    unpack_formats = record_struct_unpack_formats(monkeypatch)
 
     with pytest.raises(ValueError, match="chain entries: 5"):
         verifier.parse_elf_gnu_hash(table, gnu_hash_section(table))
+
+    assert unpack_formats == ["<IIII"]
 
 
 def test_elf_gnu_hash_accepts_counts_at_the_symbol_cap(monkeypatch):

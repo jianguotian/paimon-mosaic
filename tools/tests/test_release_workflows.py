@@ -33,6 +33,14 @@ def needs(job: dict) -> set[str]:
     return {value} if isinstance(value, str) else set(value)
 
 
+def normalize_condition(value: str) -> str:
+    """Ignore expression wrappers and formatting, but preserve its logic."""
+    condition = value.strip()
+    if condition.startswith("${{") and condition.endswith("}}"):
+        condition = condition[3:-2]
+    return "".join(condition.split())
+
+
 def test_release_jobs_are_blocked_by_tag_and_version_preflight() -> None:
     workflow = load_workflow("release.yml")
     jobs = workflow["jobs"]
@@ -52,6 +60,18 @@ def test_release_jobs_are_blocked_by_tag_and_version_preflight() -> None:
     assert checkout["with"]["fetch-depth"] == "0"
     assert checkout["with"]["fetch-tags"] == "true"
 
+    validation_steps = {step.get("name"): step for step in steps}
+    tag_condition = normalize_condition(
+        "startsWith(github.ref, 'refs/tags/')"
+    )
+    for step_name in (
+        "Validate signed release tag",
+        "Verify release component versions",
+    ):
+        step = validation_steps[step_name]
+        assert normalize_condition(step["if"]) == tag_condition
+        assert step.get("continue-on-error") is None
+
     scripts = "\n".join(step.get("run", "") for step in steps)
     for fragment in (
         "https://downloads.apache.org/paimon/KEYS",
@@ -66,12 +86,31 @@ def test_release_jobs_are_blocked_by_tag_and_version_preflight() -> None:
         assert fragment in scripts
 
     for name in ("rust", "java", "python-wheels"):
-        assert "release-preflight" in needs(jobs[name])
+        job = jobs[name]
+        assert needs(job) == {"release-preflight"}
+        assert "if" not in job
     for name in ("rust", "java"):
         assert jobs[name]["with"]["preflight_completed"] == "true"
 
 
 def test_direct_release_dispatch_cannot_bypass_preflight() -> None:
+    expected_preflight_condition = normalize_condition(
+        "github.event_name == 'workflow_dispatch' "
+        "|| !inputs.preflight_completed"
+    )
+    expected_gate_condition = normalize_condition(
+        """
+        ${{
+          always() &&
+          (
+            (github.event_name != 'workflow_dispatch'
+              && inputs.preflight_completed)
+            || needs.release-preflight.result == 'success'
+          )
+        }}
+        """
+    )
+
     for workflow_name, gated_job_name in (
         ("release-rust.yml", "publish"),
         ("release-java.yml", "build-native"),
@@ -88,15 +127,16 @@ def test_direct_release_dispatch_cannot_bypass_preflight() -> None:
 
         preflight = jobs["release-preflight"]
         assert preflight["uses"] == "./.github/workflows/release-preflight.yml"
-        preflight_condition = preflight["if"]
-        assert "github.event_name == 'workflow_dispatch'" in preflight_condition
-        assert "!inputs.preflight_completed" in preflight_condition
+        assert (
+            normalize_condition(preflight["if"])
+            == expected_preflight_condition
+        )
 
         gated_job = jobs[gated_job_name]
-        assert "release-preflight" in needs(gated_job)
-        gate_condition = gated_job["if"]
-        assert "always()" in gate_condition
-        assert "needs.release-preflight.result == 'success'" in gate_condition
+        assert needs(gated_job) == {"release-preflight"}
+        assert (
+            normalize_condition(gated_job["if"]) == expected_gate_condition
+        )
 
 
 def test_python_publish_verifies_the_downloaded_wheel_payloads() -> None:
@@ -129,6 +169,7 @@ def test_python_publish_verifies_the_downloaded_wheel_payloads() -> None:
     assert verification_index < min(publish_indices)
 
     verification = steps[verification_index]
+    assert "if" not in verification
     assert verification.get("continue-on-error") is None
     script = verification["run"]
     for fragment in (
@@ -140,6 +181,17 @@ def test_python_publish_verifies_the_downloaded_wheel_payloads() -> None:
         '"${wheels[@]}"',
     ):
         assert fragment in script
+
+    expected_publish_conditions = {
+        "Publish to TestPyPI": "contains(github.ref_name, '-rc')",
+        "Publish to PyPI": "!contains(github.ref_name, '-')",
+    }
+    for step_name, expected_condition in expected_publish_conditions.items():
+        publish = next(step for step in steps if step.get("name") == step_name)
+        assert normalize_condition(publish["if"]) == normalize_condition(
+            expected_condition
+        )
+        assert publish.get("continue-on-error") is None
 
 
 def test_python_publish_shell_rejects_every_unverified_artifact(tmp_path) -> None:
