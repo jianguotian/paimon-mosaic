@@ -1755,9 +1755,10 @@ def parse_macho(data: bytes) -> NativeBinary | None:
     if len(data) < 4:
         return None
     if data[:4] in FAT_MACHO_MAGICS:
-        # The release builds one Mach-O target thin, and verify_native_target
-        # requires the parsed architecture set to equal that single target, so
-        # a universal image could never satisfy it anyway.
+        # The release builds its one Mach-O target thin. A multi-slice image is
+        # rejected downstream by verify_native_target's architecture equality,
+        # but a single-slice universal image would have satisfied it, so refusing
+        # the container outright is a real narrowing of what can pass.
         raise ValueError(
             "Mach-O universal binaries are not a release artifact shape; "
             "expected a thin image"

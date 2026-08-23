@@ -269,8 +269,8 @@ class VerifyJavaJarsTest(unittest.TestCase):
         ):
             with mock.patch.object(
                 ZipFile,
-                "read",
-                side_effect=AssertionError("archive.read must not be called"),
+                "open",
+                side_effect=AssertionError("archive.open must not be called"),
             ):
                 with self.assertRaisesRegex(
                     ValueError, r"oversized\.bin.*size limit"
@@ -290,8 +290,8 @@ class VerifyJavaJarsTest(unittest.TestCase):
         ):
             with mock.patch.object(
                 ZipFile,
-                "read",
-                side_effect=AssertionError("archive.read must not be called"),
+                "open",
+                side_effect=AssertionError("archive.open must not be called"),
             ):
                 with self.assertRaisesRegex(
                     ValueError, r"declares more than 5 entries: 6"
@@ -312,8 +312,8 @@ class VerifyJavaJarsTest(unittest.TestCase):
         ):
             with mock.patch.object(
                 ZipFile,
-                "read",
-                side_effect=AssertionError("archive.read must not be called"),
+                "open",
+                side_effect=AssertionError("archive.open must not be called"),
             ):
                 with self.assertRaisesRegex(
                     ValueError, r"exceeds the total size limit of 4096 bytes"
@@ -1016,17 +1016,11 @@ class VerifyJavaJarsTest(unittest.TestCase):
         self.assertIn("tools/verify_java_jars.py", arguments)
         self.assertIn("--require-all-natives", arguments)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-class MainJarPayloadTest(VerifyJavaJarsTest):
-    # Presence checks alone let anything else ride along. These pin the reverse
-    # set difference, and the build-metadata cases pin that it does not reject a
-    # real Maven artifact: mvn package emits MANIFEST.MF, META-INF/DEPENDENCIES,
-    # META-INF/maven/<groupId>/<artifactId>/pom.{xml,properties} and nested
-    # classes such as MosaicWriter$1.class, none of which a source listing names.
+    # Presence checks alone let anything else ride along. The build-metadata
+    # cases pin that the reverse set difference does not reject a real Maven
+    # artifact: mvn package emits MANIFEST.MF, META-INF/DEPENDENCIES,
+    # META-INF/maven/<groupId>/<artifactId>/pom.{xml,properties}, 13 directory
+    # entries and nested classes, none of which a source listing names.
 
     def verify_main(self, entries: list[tuple[str, bytes]]) -> None:
         path = self.write_jar("main.jar", entries)
@@ -1050,8 +1044,51 @@ class MainJarPayloadTest(VerifyJavaJarsTest):
                 ),
             ]
         )
+        # A real `mvn package` artifact carries 13 empty directory entries. The
+        # fixture had none, which is why a directory entry carrying payload
+        # passed every test while failing on the real JAR.
+        entries.extend(
+            (directory, b"")
+            for directory in (
+                "META-INF/",
+                "META-INF/licenses/",
+                "META-INF/maven/",
+                "org/",
+                "org/apache/",
+                "org/apache/paimon/",
+                "org/apache/paimon/mosaic/",
+            )
+        )
 
         self.verify_main(entries)
+
+    def test_rejects_a_directory_entry_carrying_payload(self) -> None:
+        # A ZIP directory entry is only a trailing slash, and the JVM still reads
+        # its data through getResourceAsStream / ServiceLoader.
+        for entry in (
+            "META-INF/services/java.sql.Driver/",
+            "native/linux/x86_64/rogue.so/",
+            "lib/extra.jar/",
+        ):
+            with self.subTest(entry=entry):
+                entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+                entries.append((entry, b"smuggled payload"))
+
+                with self.assertRaisesRegex(
+                    ValueError, "directory entry carries payload"
+                ):
+                    self.verify_main(entries)
+
+    def test_rejects_a_class_smuggled_below_a_nested_class_name(self) -> None:
+        # javac emits p/Outer$x/evil/C.class for `package p.Outer$x.evil`, which
+        # split("$", 1)[0] mapped back to the real p/Outer.java.
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        outer = EXAMPLE_SOURCE_PATH.removesuffix(".java")
+        smuggled = f"{outer}$x/evil/Backdoor"
+        entries.append((f"{smuggled}.class", minimal_valid_class_bytes(smuggled)))
+
+        with self.assertRaisesRegex(ValueError, "is not a nested class of"):
+            self.verify_main(entries)
 
     def test_accepts_nested_and_anonymous_classes(self) -> None:
         entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
@@ -1093,3 +1130,5 @@ class MainJarPayloadTest(VerifyJavaJarsTest):
 
         with self.assertRaisesRegex(ValueError, "declares"):
             self.verify_main(entries)
+if __name__ == "__main__":
+    unittest.main()

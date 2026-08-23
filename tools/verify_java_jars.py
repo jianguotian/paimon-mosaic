@@ -114,6 +114,12 @@ def validated_entries(archive: ZipFile) -> dict[str, ZipInfo]:
             raise ValueError(f"archive entry uses a '..' path component: {name!r}")
         if stat.S_ISLNK(info.external_attr >> 16):
             raise ValueError(f"archive entry is a symbolic link: {name!r}")
+        # A ZIP directory entry is nothing but a trailing slash, yet it can carry
+        # data that ClassLoader.getResourceAsStream and ServiceLoader still read.
+        if info.is_dir() and info.file_size != 0:
+            raise ValueError(
+                f"archive directory entry carries payload: {name!r}"
+            )
         if info.file_size > MAX_ARCHIVE_ENTRY_SIZE:
             raise ValueError(
                 f"archive entry {name!r} exceeds the size limit of "
@@ -337,7 +343,10 @@ def maven_descriptor_entries(root: Path) -> set[str]:
     Reads the repository's own version-controlled POM, not a downloaded
     artifact, so this is inside the trust boundary the verifiers police.
     """
-    document = ET.parse(root / "java/pom.xml").getroot()
+    try:
+        document = ET.parse(root / "java/pom.xml").getroot()
+    except ET.ParseError as error:
+        raise ValueError(f"java/pom.xml is not well-formed XML: {error}") from error
 
     def coordinate(name: str) -> str:
         for path in (
@@ -371,14 +380,20 @@ def verify_compiled_java_classes(
     # javac also emits nested and anonymous classes as Outer$Inner.class, which
     # have no source file of their own. Map each one back to its outermost name
     # rather than trusting the package prefix.
-    class_entries = {
-        name
-        for name, info in entries.items()
-        if name.endswith(".class") and not info.is_dir()
-    }
+    class_entries = {name for name in entries if name.endswith(".class")}
     for name in sorted(class_entries):
-        outer = name.removesuffix(".class").split("$", 1)[0] + ".class"
-        if outer not in required_classes:
+        stem = name.removesuffix(".class")
+        outer, _, nested = stem.partition("$")
+        # javac emits Outer$Inner in the owner's directory, so a '/' after the
+        # '$' means the entry is not a nested class of that owner at all: for
+        # `package p.Outer$x.evil` it emits p/Outer$x/evil/C.class, which would
+        # otherwise map back to p/Outer.java.
+        if "/" in nested:
+            raise ValueError(
+                f"main JAR class {name!r} is not a nested class of "
+                f"{outer + '.class'!r}"
+            )
+        if outer + ".class" not in required_classes:
             raise ValueError(
                 f"main JAR class {name!r} has no matching repository source"
             )
@@ -593,7 +608,9 @@ def main() -> int:
     root = repository_root()
 
     # The classifier checks share one code path, so their messages carry no
-    # artifact path; name the artifact here as the wheel verifier does.
+    # artifact path; name the artifact here as the wheel verifier does. Unlike
+    # the wheel verifier this loop stops at the first failure, because a broken
+    # main JAR makes the classifier results uninteresting.
     checks = (
         (args.main, lambda: verify_main_jar(args.main, root, args.require_all_natives)),
         (args.sources, lambda: verify_sources_jar(args.sources, root)),
