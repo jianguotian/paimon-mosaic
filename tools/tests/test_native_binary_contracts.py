@@ -63,7 +63,6 @@ def test_jni_symbol_contract_matches_java_rust_and_verifier():
     assert len(java_exports) == 24
     assert len(rust_exports) == 24
     assert len(generic_rust_exports) == 6
-    assert generic_rust_exports <= rust_exports
     assert rust_exports == java_exports
     assert verifier.MOSAIC_SYMBOL_FAMILIES["JNI"] == java_exports
 

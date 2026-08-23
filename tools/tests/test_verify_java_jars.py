@@ -862,6 +862,39 @@ class VerifyJavaJarsTest(unittest.TestCase):
                     "Java artifact verification failed", stderr.getvalue()
                 )
 
+    def test_main_names_the_failing_artifact(self) -> None:
+        # The three JAR checks shared one except clause, so a failure never said
+        # which artifact broke; the classifier messages carry no path of their own.
+        main_jar = self.write_jar(
+            "main.jar", self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        )
+        source_entries, _javadoc_entries = self.prepare_classifier_payloads()
+        sources = self.write_jar("sources.jar", source_entries)
+        broken_javadoc = self.root / "javadoc.jar"
+        broken_javadoc.write_bytes(b"not a zip file")
+        arguments = [
+            "verify_java_jars.py",
+            "--main",
+            str(main_jar),
+            "--sources",
+            str(sources),
+            "--javadoc",
+            str(broken_javadoc),
+        ]
+
+        with mock.patch.object(
+            verify_java_jars, "repository_root", return_value=self.root
+        ):
+            with mock.patch.object(verify_java_jars, "verify_native_target"):
+                with mock.patch.object(sys, "argv", arguments):
+                    stderr = StringIO()
+                    with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                        self.assertEqual(verify_java_jars.main(), 1)
+                    message = stderr.getvalue()
+                    self.assertIn(str(broken_javadoc), message)
+                    self.assertNotIn(str(main_jar), message)
+                    self.assertNotIn(str(sources), message)
+
     def test_main_fails_closed_on_a_damaged_deflate_stream(self) -> None:
         # validated_entries streams every member through EOF to force a CRC
         # check, so a member corrupted deep inside its deflate stream raises

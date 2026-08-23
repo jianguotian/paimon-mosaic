@@ -592,20 +592,29 @@ def main() -> int:
     args = parser.parse_args()
     root = repository_root()
 
-    try:
-        verify_main_jar(args.main, root, args.require_all_natives)
-        verify_sources_jar(args.sources, root)
-        verify_javadoc_jar(args.javadoc, root)
-    except (
-        BadZipFile,
-        KeyError,
-        OSError,
-        TypeError,
-        ValueError,
-        zlib.error,
-    ) as error:
-        print(f"Java artifact verification failed: {error}", file=sys.stderr)
-        return 1
+    # The classifier checks share one code path, so their messages carry no
+    # artifact path; name the artifact here as the wheel verifier does.
+    checks = (
+        (args.main, lambda: verify_main_jar(args.main, root, args.require_all_natives)),
+        (args.sources, lambda: verify_sources_jar(args.sources, root)),
+        (args.javadoc, lambda: verify_javadoc_jar(args.javadoc, root)),
+    )
+    for artifact, check in checks:
+        try:
+            check()
+        except (
+            BadZipFile,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            zlib.error,
+        ) as error:
+            print(
+                f"Java artifact verification failed: {artifact}: {error}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 
