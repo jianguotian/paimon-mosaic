@@ -601,6 +601,38 @@ def test_verify_wheel_rejects_a_record_longer_than_the_entry_cap(
         verifier.verify_wheel(wheel, root)
 
 
+def test_verify_record_stops_at_the_first_row_beyond_the_entry_cap(
+    tmp_path, monkeypatch
+):
+    wheel, _root = build_wheel(tmp_path)
+    record_path = "paimon_mosaic-0.3.0.dist-info/RECORD"
+    row_cap = 3
+
+    class SentinelReader:
+        def __init__(self):
+            self.rows_requested = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.rows_requested += 1
+            if self.rows_requested > row_cap + 1:
+                raise AssertionError("RECORD reader consumed past the first excess row")
+            return [f"mosaic/entry{self.rows_requested}.py", "", ""]
+
+    sentinel = SentinelReader()
+    monkeypatch.setattr(archive_guard, "MAX_ARCHIVE_ENTRIES", row_cap)
+    monkeypatch.setattr(verifier.csv, "reader", lambda _source: sentinel)
+
+    with ZipFile(wheel) as archive, pytest.raises(
+        ValueError, match=f"RECORD declares more than {row_cap} entries"
+    ):
+        verifier.verify_record(archive, set(), record_path)
+
+    assert sentinel.rows_requested == row_cap + 1
+
+
 def test_verify_wheel_accepts_a_record_at_the_entry_cap(tmp_path, monkeypatch):
     wheel, root = build_wheel(tmp_path)
     monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
@@ -620,8 +652,15 @@ def test_verify_wheel_bounds_the_names_a_record_rejection_reports(
         unrecorded_entries={f"mosaic/extra{index}.py": b"x" for index in range(6)},
     )
 
-    with pytest.raises(ValueError, match=r"omits wheel entries:.*and 4 more"):
+    with pytest.raises(ValueError) as error:
         verifier.verify_wheel(wheel, root)
+
+    message = str(error.value)
+    assert "omits wheel entries:" in message
+    assert "mosaic/extra0.py" in message
+    assert "mosaic/extra1.py" in message
+    assert "and 4 more" in message
+    assert all(f"mosaic/extra{index}.py" not in message for index in range(2, 6))
 
 
 def test_target_matrix_guard_rejects_drift(monkeypatch):
@@ -764,6 +803,21 @@ def test_expected_dependency_metadata_matches_the_repository():
 )
 def test_normalized_requirement_ignores_rendering_differences(value, expected):
     assert verifier.normalized_requirement(value) == expected
+
+
+def test_verify_wheel_normalizes_requires_dist_before_comparison(
+    tmp_path, monkeypatch
+):
+    wheel, root = build_wheel(
+        tmp_path,
+        metadata_requires_dist=(
+            "  pyarrow  ",
+            "pytest ;  extra == 'test'",
+        ),
+    )
+    monkeypatch.setattr(verifier, "verify_native_target", lambda *args, **kwargs: None)
+
+    assert verifier.verify_wheel(wheel, root) == "aarch64-unknown-linux-gnu"
 
 
 def find_record_row(rows, suffix):
