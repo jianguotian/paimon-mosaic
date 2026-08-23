@@ -574,7 +574,7 @@ def build_macho(
     return bytes(data)
 
 
-def build_fat_macho(slices):
+def build_fat_macho(slices, magic=0xCAFEBABE):
     entry_size = 20
     table_end = 8 + len(slices) * entry_size
     offsets = []
@@ -583,7 +583,7 @@ def build_fat_macho(slices):
         offsets.append(offset)
         offset = align(offset + len(image), 0x1000)
     data = bytearray(offset)
-    struct.pack_into(">II", data, 0, 0xCAFEBABE, len(slices))
+    struct.pack_into(">II", data, 0, magic, len(slices))
     for index, ((cpu_type, image), slice_offset) in enumerate(
         zip(slices, offsets)
     ):
@@ -1597,52 +1597,20 @@ def test_macho_symtab_only_accepts_symbols_the_dylib_defines(options):
         )
 
 
-def test_rejects_unexpected_extra_macho_architecture():
+@pytest.mark.parametrize(
+    "magic",
+    (0xCAFEBABE, 0xBEBAFECA, 0xCAFEBABF, 0xBFBAFECA),
+)
+def test_rejects_macho_universal_binaries(magic):
+    # The release builds the single Mach-O target thin, so a universal image is
+    # not a release artifact shape; it is refused before any slice is parsed.
     data = build_fat_macho(
-        (
-            (0x0100000C, build_macho(cpu_type=0x0100000C)),
-            (0x01000007, build_macho(cpu_type=0x01000007)),
-        )
+        ((0x0100000C, build_macho(cpu_type=0x0100000C)),), magic=magic
     )
 
-    with pytest.raises(ValueError, match="expected only aarch64"):
+    with pytest.raises(ValueError, match="universal binaries are not"):
         verify_jni_target(
             data,
-            "aarch64-apple-darwin",
-            "libpaimon_mosaic_jni.dylib",
-        )
-
-
-def test_rejects_macho_fat_slice_with_mismatched_cpu_type():
-    data = build_fat_macho(
-        ((0x01000007, build_macho(cpu_type=0x0100000C)),)
-    )
-
-    with pytest.raises(ValueError, match="CPU type does not match"):
-        verify_jni_target(
-            data,
-            "aarch64-apple-darwin",
-            "libpaimon_mosaic_jni.dylib",
-        )
-
-
-def test_rejects_truncated_macho_fat_slice():
-    data = bytearray(
-        build_fat_macho(
-            ((0x0100000C, build_macho(cpu_type=0x0100000C)),)
-        )
-    )
-    slice_size_offset = 8 + 12
-    struct.pack_into(
-        ">I",
-        data,
-        slice_size_offset,
-        struct.unpack_from(">I", data, slice_size_offset)[0] + len(data),
-    )
-
-    with pytest.raises(ValueError, match="fat slice 0.*out of bounds"):
-        verify_jni_target(
-            bytes(data),
             "aarch64-apple-darwin",
             "libpaimon_mosaic_jni.dylib",
         )

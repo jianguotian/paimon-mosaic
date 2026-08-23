@@ -1741,91 +1741,28 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
     )
 
 
+FAT_MACHO_MAGICS = frozenset(
+    {
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+    }
+)
+
+
 def parse_macho(data: bytes) -> NativeBinary | None:
     if len(data) < 4:
         return None
-    fat = {
-        b"\xca\xfe\xba\xbe": (">", 20),
-        b"\xbe\xba\xfe\xca": ("<", 20),
-        b"\xca\xfe\xba\xbf": (">", 32),
-        b"\xbf\xba\xfe\xca": ("<", 32),
-    }.get(data[:4])
-    if fat is None:
-        return parse_macho_thin(data)
-    if len(data) < 8:
-        raise ValueError("truncated Mach-O fat header")
-
-    byte_order, entry_size = fat
-    architecture_count = struct.unpack_from(f"{byte_order}I", data, 4)[0]
-    if architecture_count == 0 or architecture_count > 64:
+    if data[:4] in FAT_MACHO_MAGICS:
+        # The release builds one Mach-O target thin, and verify_native_target
+        # requires the parsed architecture set to equal that single target, so
+        # a universal image could never satisfy it anyway.
         raise ValueError(
-            f"invalid Mach-O fat architecture count {architecture_count}"
+            "Mach-O universal binaries are not a release artifact shape; "
+            "expected a thin image"
         )
-    table_size = architecture_count * entry_size
-    require_range(data, 8, table_size, "Mach-O fat architecture table")
-    table_end = 8 + table_size
-
-    slices = []
-    for index in range(architecture_count):
-        offset = 8 + index * entry_size
-        cpu_type = struct.unpack_from(f"{byte_order}I", data, offset)[0]
-        architecture = MACHO_CPU_ARCHITECTURE.get(cpu_type)
-        if architecture is None:
-            raise ValueError(
-                f"unsupported Mach-O CPU type 0x{cpu_type:08x}"
-            )
-        if entry_size == 20:
-            slice_offset, slice_size, alignment = struct.unpack_from(
-                f"{byte_order}III", data, offset + 8
-            )
-        else:
-            slice_offset, slice_size, alignment, _reserved = struct.unpack_from(
-                f"{byte_order}QQII", data, offset + 8
-            )
-        if slice_size == 0:
-            raise ValueError(f"Mach-O fat slice {index} is empty")
-        if slice_offset < table_end:
-            raise ValueError(
-                f"Mach-O fat slice {index} overlaps the architecture table"
-            )
-        if alignment >= 63 or slice_offset % (1 << alignment):
-            raise ValueError(f"Mach-O fat slice {index} is misaligned")
-        require_range(
-            data,
-            slice_offset,
-            slice_size,
-            f"Mach-O fat slice {index}",
-        )
-        slices.append((slice_offset, slice_size, architecture, index))
-
-    previous_end = table_end
-    for slice_offset, slice_size, _architecture, index in sorted(slices):
-        if slice_offset < previous_end:
-            raise ValueError(f"Mach-O fat slice {index} overlaps another slice")
-        previous_end = slice_offset + slice_size
-
-    architectures = set()
-    exported_symbols = set()
-    for slice_offset, slice_size, architecture, index in slices:
-        parsed = parse_macho_thin(
-            data[slice_offset : slice_offset + slice_size]
-        )
-        if parsed is None:
-            raise ValueError(f"Mach-O fat slice {index} is not a Mach-O image")
-        if parsed.architectures != frozenset({architecture}):
-            raise ValueError(
-                f"Mach-O fat slice {index} CPU type does not match its image"
-            )
-        if architecture in architectures:
-            raise ValueError(
-                f"Mach-O fat image contains duplicate {architecture} slices"
-            )
-        architectures.add(architecture)
-        exported_symbols.update(parsed.exported_symbols)
-
-    return NativeBinary(
-        "Mach-O", frozenset(architectures), frozenset(exported_symbols)
-    )
+    return parse_macho_thin(data)
 
 
 def native_binary(data: bytes) -> NativeBinary:
