@@ -157,11 +157,11 @@ def test_documented_version_transitions(
     )
 
 
-def test_multi_module_pom_bump_rewrites_every_module(tmp_path: Path) -> None:
-    # The removed POM_LINES_CHANGED guard aborted unless exactly one line across
-    # all POMs changed, contradicting bump_pom_version.py, which deliberately
-    # rewrites project/parent/version so a child module legitimately changes a
-    # second line. Drive the same find invocation the script runs.
+def test_multi_module_version_bump_runs_end_to_end(tmp_path: Path) -> None:
+    # Two single-module assumptions used to break this: the POM_LINES_CHANGED
+    # guard aborted unless exactly one POM line changed, and the staging step
+    # named java/pom.xml literally, so a child POM was left uncommitted and the
+    # final clean-tree check failed.
     root = release_fixture(tmp_path)
     module = root / "java/child"
     module.mkdir(parents=True)
@@ -178,14 +178,17 @@ def test_multi_module_pom_bump_rewrites_every_module(tmp_path: Path) -> None:
         "</project>\n",
         encoding="utf-8",
     )
+    run(["git", "add", "."], cwd=root)
+    run(["git", "commit", "-q", "-m", "add module"], cwd=root)
 
     run(
-        [
-            "find", ".", "-name", "pom.xml", "-not", "-path", "*/target/*",
-            "-type", "f", "-exec", sys.executable, "tools/bump_pom_version.py",
-            "0.3.0-SNAPSHOT", "0.4.0-SNAPSHOT", "{}", "+",
-        ],
-        cwd=root,
+        ["bash", "update_branch_version.sh"],
+        cwd=root / "tools",
+        env={
+            **os.environ,
+            "OLD_VERSION": "0.3.0-SNAPSHOT",
+            "NEW_VERSION": "0.4.0-SNAPSHOT",
+        },
     )
 
     parent_pom = (root / "java/pom.xml").read_text(encoding="utf-8")
@@ -196,3 +199,5 @@ def test_multi_module_pom_bump_rewrites_every_module(tmp_path: Path) -> None:
     # structural, so it never escapes into a dependency element.
     assert parent_pom.count("<version>0.3.0-SNAPSHOT</version>") == 1
     assert child_pom.count("<version>0.3.0-SNAPSHOT</version>") == 1
+    # Both POMs must be committed, or the script's own clean-tree check fails.
+    assert run(["git", "status", "--porcelain"], cwd=root).stdout == ""

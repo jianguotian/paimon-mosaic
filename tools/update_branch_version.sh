@@ -96,7 +96,7 @@ git add \
   ffi/DEPENDENCIES.rust.tsv \
   jni/DEPENDENCIES.rust.tsv \
   cli/DEPENDENCIES.rust.tsv \
-  java/pom.xml \
+  ':(glob)**/pom.xml' \
   java/src/main/binary-resources \
   python/pyproject.toml \
   python/licenses
