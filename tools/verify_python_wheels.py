@@ -69,6 +69,10 @@ MACHO_MAGICS = {
     b"\xbf\xba\xfe\xca",
 }
 
+# Entry counts are capped, but a capped count still yields a message large
+# enough to matter, so bound how many names any rejection may name.
+MAX_REPORTED_NAMES = 20
+
 
 def _validate_target_matrix() -> None:
     if not (
@@ -205,6 +209,15 @@ def require_single_header(message: email.message.Message, name: str) -> str:
     return values[0]
 
 
+def summarize_names(names: list[str]) -> str:
+    # A rejected artifact must not dictate the size of the diagnostic main()
+    # prints to stderr.
+    if len(names) <= MAX_REPORTED_NAMES:
+        return repr(names)
+    remaining = len(names) - MAX_REPORTED_NAMES
+    return f"{names[:MAX_REPORTED_NAMES]!r} and {remaining} more"
+
+
 def normalized_requirement(value: str) -> str:
     requirement, separator, marker = value.partition(";")
     normalized = " ".join(requirement.split())
@@ -239,6 +252,15 @@ def verify_record(archive: ZipFile, file_names: set[str], record_path: str) -> N
     rows = {}
     reader = csv.reader(io.StringIO(record_text, newline=""))
     for line_number, row in enumerate(reader, 1):
+        # RECORD must list exactly the archive entries, and validated_entries has
+        # already capped those, so a longer table cannot describe a valid wheel.
+        # Reject it here rather than after materializing the whole mapping and
+        # both difference lists.
+        if line_number > archive_guard.MAX_ARCHIVE_ENTRIES:
+            raise ValueError(
+                f"{record_path} declares more than "
+                f"{archive_guard.MAX_ARCHIVE_ENTRIES} entries"
+            )
         if len(row) != 3:
             raise ValueError(
                 f"{record_path}:{line_number} must contain exactly three fields"
@@ -252,9 +274,14 @@ def verify_record(archive: ZipFile, file_names: set[str], record_path: str) -> N
     unlisted = sorted(file_names - listed)
     nonexistent = sorted(listed - file_names)
     if unlisted:
-        raise ValueError(f"{record_path} omits wheel entries: {unlisted}")
+        raise ValueError(
+            f"{record_path} omits wheel entries: {summarize_names(unlisted)}"
+        )
     if nonexistent:
-        raise ValueError(f"{record_path} lists missing wheel entries: {nonexistent}")
+        raise ValueError(
+            f"{record_path} lists missing wheel entries: "
+            f"{summarize_names(nonexistent)}"
+        )
 
     if rows.get(record_path) != ("", ""):
         raise ValueError(
@@ -472,7 +499,7 @@ def verify_wheel(wheel: Path, root: Path) -> str:
         )
         if unexpected_payload:
             raise ValueError(
-                f"unexpected wheel payload: {unexpected_payload}"
+                f"unexpected wheel payload: {summarize_names(unexpected_payload)}"
             )
         directory_entries = [
             info for info in archive.infolist() if info.is_dir()
@@ -486,7 +513,8 @@ def verify_wheel(wheel: Path, root: Path) -> str:
         )
         if unexpected_directories:
             raise ValueError(
-                f"unexpected wheel directories: {unexpected_directories}"
+                "unexpected wheel directories: "
+                f"{summarize_names(unexpected_directories)}"
             )
         if (
             top_level_path in file_names
