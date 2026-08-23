@@ -46,6 +46,11 @@ MACHO_CPU_ARCHITECTURE = {
 # A Mosaic native library exports on the order of a hundred symbols; keep all
 # format-specific symbol loops within one shared defensive work bound.
 MAX_DYNAMIC_SYMBOLS = 100_000
+# Each accepted symbol is range-checked against the section or load-segment
+# list, so an unbounded structural count multiplies bounded symbol work. Real
+# libraries stay far below this: glibc declares 69 ELF sections and 10 program
+# headers, libarrow 32 and 10.
+MAX_NATIVE_SECTIONS = 512
 # Bound the cumulative bytes searched while resolving symbol names so many
 # overlapping offsets cannot turn a bounded symbol table into quadratic work.
 MAX_SYMBOL_STRING_BYTES = 16 * 1024 * 1024
@@ -471,6 +476,11 @@ def parse_elf(data: bytes) -> NativeBinary | None:
         raise ValueError(f"invalid ELF header size {header_size}")
     if program_count in (0, 0xFFFF):
         raise ValueError(f"invalid ELF program header count {program_count}")
+    if program_count > MAX_NATIVE_SECTIONS:
+        raise ValueError(
+            f"ELF image declares more than {MAX_NATIVE_SECTIONS} "
+            f"program headers: {program_count}"
+        )
     if program_entry_size != 56:
         raise ValueError(
             f"invalid ELF program header entry size {program_entry_size}"
@@ -635,6 +645,11 @@ def parse_elf(data: bytes) -> NativeBinary | None:
         return NativeBinary("ELF", frozenset({architecture}), frozenset())
     if section_count in (0, 0xFFFF):
         raise ValueError(f"invalid ELF section header count {section_count}")
+    if section_count > MAX_NATIVE_SECTIONS:
+        raise ValueError(
+            f"ELF image declares more than {MAX_NATIVE_SECTIONS} "
+            f"sections: {section_count}"
+        )
     if section_names_index == 0xFFFF:
         raise ValueError("extended ELF section-name indexes are unsupported")
     if section_entry_size != 64:
@@ -958,6 +973,11 @@ def parse_pe(data: bytes) -> NativeBinary | None:
         raise ValueError(f"unsupported PE machine 0x{machine:04x}")
     if section_count == 0:
         raise ValueError("PE image has no sections")
+    if section_count > MAX_NATIVE_SECTIONS:
+        raise ValueError(
+            f"PE image declares more than {MAX_NATIVE_SECTIONS} "
+            f"sections: {section_count}"
+        )
     if not characteristics & 0x2000:
         raise ValueError("PE image does not have the DLL characteristic")
 
@@ -1412,6 +1432,11 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
         raise ValueError(f"Mach-O file type {file_type} is not MH_DYLIB")
     if command_count == 0:
         raise ValueError("Mach-O dylib has no load commands")
+    if command_count > MAX_NATIVE_SECTIONS:
+        raise ValueError(
+            f"Mach-O dylib declares more than {MAX_NATIVE_SECTIONS} "
+            f"load commands: {command_count}"
+        )
     if commands_size < command_count * 8:
         raise ValueError("Mach-O load-command region is too small")
     require_range(data, 32, commands_size, "Mach-O load commands")
@@ -1459,6 +1484,11 @@ def parse_macho_thin(data: bytes) -> NativeBinary | None:
             if command_size != expected_size:
                 raise ValueError(
                     f"Mach-O segment command {index} has invalid section data"
+                )
+            if len(sections) + segment_section_count > MAX_NATIVE_SECTIONS:
+                raise ValueError(
+                    f"Mach-O dylib declares more than {MAX_NATIVE_SECTIONS} "
+                    "sections"
                 )
             if file_size:
                 require_range(

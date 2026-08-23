@@ -325,9 +325,11 @@ def build_macho(
     export_trie_address=0x1000,
     export_trie_resolver=None,
     export_trie_reexport_name=b"",
+    extra_sections=0,
 ):
     symbol_list = sorted(symbols)
-    segment_size = 72 + 80
+    section_count = 1 + extra_sections
+    segment_size = 72 + 80 * section_count
     if id_dylib == "missing":
         id_dylib_commands = []
     elif id_dylib == "duplicate":
@@ -453,7 +455,7 @@ def build_macho(
         file_size,
         7,
         segment_initial_protection,
-        1,
+        section_count,
         0,
     )
     struct.pack_into(
@@ -1691,3 +1693,79 @@ def test_raw_symbol_strings_do_not_count_as_elf_exports():
             "x86_64-unknown-linux-gnu",
             "libpaimon_mosaic_jni.so",
         )
+
+
+# Symbol counts are bounded, but every accepted symbol is range-checked against
+# the section or load-segment list, so the structural counts need their own cap.
+
+
+def test_rejects_elf_declaring_too_many_program_headers():
+    data = bytearray(build_elf())
+    struct.pack_into("<H", data, 56, verifier.MAX_NATIVE_SECTIONS + 1)
+
+    with pytest.raises(ValueError, match="more than 512 program headers: 513"):
+        verify_jni_target(
+            bytes(data), "x86_64-unknown-linux-gnu", "libpaimon_mosaic_jni.so"
+        )
+
+
+def test_accepts_elf_program_header_count_at_the_limit():
+    # The cap must reject 513 and not 512; require_range then rejects this
+    # image for the table it cannot actually hold.
+    data = bytearray(build_elf())
+    struct.pack_into("<H", data, 56, verifier.MAX_NATIVE_SECTIONS)
+
+    with pytest.raises(ValueError, match="program header table"):
+        verify_jni_target(
+            bytes(data), "x86_64-unknown-linux-gnu", "libpaimon_mosaic_jni.so"
+        )
+
+
+def test_rejects_elf_declaring_too_many_sections():
+    data = bytearray(build_elf())
+    struct.pack_into("<H", data, 60, verifier.MAX_NATIVE_SECTIONS + 1)
+
+    with pytest.raises(ValueError, match="more than 512 sections: 513"):
+        verify_jni_target(
+            bytes(data), "x86_64-unknown-linux-gnu", "libpaimon_mosaic_jni.so"
+        )
+
+
+def test_rejects_pe_declaring_too_many_sections():
+    data = bytearray(build_pe())
+    struct.pack_into("<H", data, 0x80 + 6, verifier.MAX_NATIVE_SECTIONS + 1)
+
+    with pytest.raises(ValueError, match="more than 512 sections: 513"):
+        verify_jni_target(
+            bytes(data), "x86_64-pc-windows-msvc", "paimon_mosaic_jni.dll"
+        )
+
+
+def test_rejects_macho_declaring_too_many_load_commands():
+    data = bytearray(build_macho())
+    struct.pack_into("<I", data, 16, verifier.MAX_NATIVE_SECTIONS + 1)
+
+    with pytest.raises(ValueError, match="more than 512 load commands: 513"):
+        verify_jni_target(
+            bytes(data), "aarch64-apple-darwin", "libpaimon_mosaic_jni.dylib"
+        )
+
+
+def test_rejects_macho_whose_segments_exceed_the_cumulative_section_cap():
+    # Zero-filled section headers are legal (size 0 skips the range check), so
+    # one segment can inflate the list the per-export scan walks. Only the
+    # running total catches that; the per-command size check cannot see it.
+    with pytest.raises(ValueError, match="more than 512 sections"):
+        verify_jni_target(
+            build_macho(extra_sections=verifier.MAX_NATIVE_SECTIONS),
+            "aarch64-apple-darwin",
+            "libpaimon_mosaic_jni.dylib",
+        )
+
+
+def test_accepts_macho_section_count_at_the_cumulative_cap():
+    verify_jni_target(
+        build_macho(extra_sections=verifier.MAX_NATIVE_SECTIONS - 1),
+        "aarch64-apple-darwin",
+        "libpaimon_mosaic_jni.dylib",
+    )
