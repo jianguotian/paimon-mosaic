@@ -218,6 +218,9 @@ class VerifyJavaJarsTest(unittest.TestCase):
             "windows_drive_relative": "C:../site-packages_evil/payload.py",
             "windows_drive_bare": "C:evil",
             "normalizes_to_dot": "./",
+            # No trailing slash, so this reaches the normalized-name check
+            # rather than the directory-payload one.
+            "is_dot": ".",
             "backslash": "dir\\file",
             "dot_dot": "dir/../escape",
             "symlink": symlink,
