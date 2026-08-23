@@ -30,6 +30,7 @@ import posixpath
 import re
 import stat
 import sys
+import tomllib
 import zlib
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
@@ -202,6 +203,31 @@ def require_single_header(message: email.message.Message, name: str) -> str:
     if len(values) != 1:
         raise ValueError(f"expected one {name} field, found {values}")
     return values[0]
+
+
+def normalized_requirement(value: str) -> str:
+    requirement, separator, marker = value.partition(";")
+    normalized = " ".join(requirement.split())
+    if separator:
+        normalized += "; " + " ".join(marker.split()).replace("'", '"')
+    return normalized
+
+
+def expected_dependency_metadata(root: Path) -> tuple[str, list[str], list[str]]:
+    """Return the Requires-Python, Provides-Extra and Requires-Dist a wheel must declare."""
+    with (root / "python/pyproject.toml").open("rb") as source:
+        project = tomllib.load(source)["project"]
+    extras = sorted(project.get("optional-dependencies", {}))
+    requires_dist = [
+        normalized_requirement(requirement)
+        for requirement in project.get("dependencies", [])
+    ]
+    requires_dist += [
+        normalized_requirement(f'{requirement}; extra == "{extra}"')
+        for extra in extras
+        for requirement in project["optional-dependencies"][extra]
+    ]
+    return project["requires-python"], extras, sorted(requires_dist)
 
 
 def verify_record(archive: ZipFile, file_names: set[str], record_path: str) -> None:
@@ -508,6 +534,31 @@ def verify_wheel(wheel: Path, root: Path) -> str:
             raise ValueError(
                 "unexpected License-File fields: "
                 + repr(metadata.get_all("License-File", []))
+            )
+        (
+            expected_requires_python,
+            expected_extras,
+            expected_requires_dist,
+        ) = expected_dependency_metadata(root)
+        if metadata.get("Requires-Python") != expected_requires_python:
+            raise ValueError(
+                f"unexpected Requires-Python: {metadata.get('Requires-Python')!r}, "
+                f"expected {expected_requires_python!r}"
+            )
+        if sorted(metadata.get_all("Provides-Extra", [])) != expected_extras:
+            raise ValueError(
+                "unexpected Provides-Extra fields: "
+                + repr(metadata.get_all("Provides-Extra", []))
+            )
+        requires_dist = sorted(
+            normalized_requirement(value)
+            for value in metadata.get_all("Requires-Dist", [])
+        )
+        if requires_dist != expected_requires_dist:
+            raise ValueError(
+                "unexpected Requires-Dist fields: "
+                + repr(metadata.get_all("Requires-Dist", []))
+                + f", expected {expected_requires_dist!r}"
             )
 
         wheel_metadata = email.message_from_bytes(archive.read(wheel_metadata_path))
