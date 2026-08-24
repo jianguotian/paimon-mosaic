@@ -229,7 +229,7 @@ git push origin ${RC_TAG}</code></pre>
             <p>Create source release artifacts from the same commit as the RC tag:</p>
 <pre><code>git checkout ${RC_TAG}
 cd tools
-RELEASE_VERSION=${RELEASE_VERSION} ./create_source_release.sh</code></pre>
+RELEASE_VERSION=${RELEASE_VERSION} RC_TAG=${RC_TAG} ./create_source_release.sh</code></pre>
             <p>This creates the following under <code>tools/release/</code>:</p>
             <ul>
                 <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz</code> &mdash; source archive</li>

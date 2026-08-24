@@ -1,0 +1,93 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Release Vote Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-vote-gate.yml"
+      - ".github/workflows/release.yml"
+      - "docs/creating-a-release.html"
+      - "tools/create_source_release.sh"
+      - "tools/verify_release_versions.py"
+      - "tools/verify_source_archive.py"
+      - "tools/tests/test_create_source_release.py"
+      - "tools/tests/test_release_vote_workflow.py"
+      - "tools/tests/test_verify_release_versions.py"
+      - "tools/tests/test_verify_source_archive.py"
+  push:
+    branches: [main, "release-*"]
+    paths:
+      - ".github/workflows/release-vote-gate.yml"
+      - ".github/workflows/release.yml"
+      - "docs/creating-a-release.html"
+      - "tools/create_source_release.sh"
+      - "tools/verify_release_versions.py"
+      - "tools/verify_source_archive.py"
+      - "tools/tests/test_create_source_release.py"
+      - "tools/tests/test_release_vote_workflow.py"
+      - "tools/tests/test_verify_release_versions.py"
+      - "tools/tests/test_verify_source_archive.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-vote-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install pytest PyYAML
+
+      - name: Run PR A tests
+        run: |
+          python -m pytest -q \
+            tools/tests/test_create_source_release.py \
+            tools/tests/test_release_vote_workflow.py \
+            tools/tests/test_verify_release_versions.py \
+            tools/tests/test_verify_source_archive.py
+
+      - name: Run static checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q \
+            tools/verify_release_versions.py \
+            tools/verify_source_archive.py \
+            tools/tests/test_create_source_release.py \
+            tools/tests/test_release_vote_workflow.py \
+            tools/tests/test_verify_release_versions.py \
+            tools/tests/test_verify_source_archive.py
+          bash -n tools/create_source_release.sh
+          if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+            comparison_ref="origin/${GITHUB_BASE_REF}"
+          else
+            comparison_ref="HEAD^"
+          fi
+          git diff --check "$(git merge-base HEAD "${comparison_ref}")" HEAD
