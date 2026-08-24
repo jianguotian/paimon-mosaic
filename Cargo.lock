@@ -885,6 +885,7 @@ version = "0.3.0"
 dependencies = [
  "arrow",
  "clap",
+ "csv",
  "paimon-mosaic-core",
  "serde",
  "serde_json",

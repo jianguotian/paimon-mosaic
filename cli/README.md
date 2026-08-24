@@ -34,7 +34,7 @@ mosaic <command> <file>
 
 ## Commands
 
-All inspection and query commands accept `--json`; `convert` writes a file.
+All inspection and query commands accept `--json`; `convert` and `convert-csv` write files.
 
 | Command | Shows | Reads |
 |---------|-------|-------|
@@ -48,7 +48,8 @@ All inspection and query commands accept `--json`; `convert` writes a file.
 | `cat` | rows as a table (all rows by default; `-n` to limit) | column data |
 | `head` | first N rows (default 10) | column data |
 | `count` | total row count | footer + index |
-| `convert` | import CSV or JSON into a new file | writes file |
+| `convert` | import JSON into a new file | writes file |
+| `convert-csv` | import CSV into a new file | writes file |
 
 ## Inspect
 
@@ -97,12 +98,41 @@ $ mosaic head data.mosaic --json
 
 ## Convert
 
-Import CSV or JSON lines into a new Mosaic file; the schema is inferred.
+Import a JSON data file (`.json`/`.ndjson`/`.jsonl`, one object per line) into
+a new Mosaic file; the schema is inferred from the complete input. A field
+with no non-null value cannot be inferred and is reported as an error.
 An existing output is kept unless `--overwrite` is given.
-`--stats id` builds min/max for those columns, which `cat --where` then uses to
-skip row groups that cannot match.
+Use `-c`/`--column` to project top-level fields; each occurrence accepts a
+comma-separated list, and unselected fields do not participate in inference.
+`--stats id` builds min/max for those columns, which `cat --where` then uses
+to skip row groups that cannot match.
 
 ```text
-$ mosaic convert data.csv -o data.mosaic --stats id
-wrote data.mosaic (200 rows, 5 columns)
+$ mosaic convert data.json -o data.mosaic
+$ mosaic convert data.json -o data.mosaic -c id,name
+$ mosaic convert data.json -o data.mosaic --stats id
+```
+
+## Convert CSV
+
+Import one or more regular CSV files with an inferred schema. Header fields are
+matched by name across inputs, and compatible integer/float and timestamp
+precisions are promoted. Lossy bare-integer-to-`Float64` promotion and explicit
+timezones in inferred local timestamps are rejected. Empty files are skipped.
+CSV cannot say what type an all-empty column is, so columns inferred as Arrow
+`Null` fall back to nullable `Utf8`. `--require col` marks an inferred field as
+not null (repeat it for multiple fields). Backslash escaping is disabled by
+default; pass `--escape` only when the CSV dialect uses it.
+`--delimiter`, `--quote`, `--no-header`, `--header`, and `--skip-lines`
+control parsing. Inferred conversion rejects FIFOs, devices, and other
+non-regular paths instead of attempting a multi-pass read. Input files must
+remain unchanged while conversion is running.
+`--stats id` builds min/max for those columns, which `cat --where` then uses
+to skip row groups that cannot match.
+
+```text
+$ mosaic convert-csv data.csv -o data.mosaic
+
+$ mosaic convert-csv data.csv -o data.mosaic --require id --require ts
+$ mosaic convert-csv data.csv -o data.mosaic --stats id
 ```
