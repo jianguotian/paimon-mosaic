@@ -27,6 +27,8 @@ import subprocess
 import sys
 import tarfile
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SCRIPT = REPO_ROOT / "tools" / "create_source_release.sh"
@@ -57,6 +59,32 @@ def write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def release_gate_probe(gate: str) -> str:
+    return (
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"GATE = {gate!r}\n"
+        'marker = os.environ.get("MOSAIC_TEST_RELEASE_GATE_LOG")\n'
+        "if marker:\n"
+        '    with Path(marker).open("a", encoding="utf-8") as output:\n'
+        "        output.write(\n"
+        '            GATE + "\\t" + str(Path.cwd().resolve()) + "\\t"\n'
+        '            + " ".join(sys.argv[1:]) + "\\n"\n'
+        "        )\n"
+        'if os.environ.get("MOSAIC_TEST_FAIL_RELEASE_GATE") == GATE:\n'
+        "    raise SystemExit(23)\n"
+    )
+
+
+def read_release_gate_calls(marker: Path) -> list[tuple[str, str, str]]:
+    return [
+        tuple(line.split("\t", 2))
+        for line in marker.read_text(encoding="utf-8").splitlines()
+    ]
+
+
 def initialize_release_repo(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
     repo = tmp_path / "repo"
     tools = repo / "tools"
@@ -66,12 +94,15 @@ def initialize_release_repo(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
 
     shutil.copy2(SOURCE_SCRIPT, tools / SOURCE_SCRIPT.name)
     shutil.copy2(SOURCE_VERIFIER, tools / SOURCE_VERIFIER.name)
-    for verifier in (
-        "verify_release_versions.py",
-        "dependencies.py",
-        "generate_license_reports.py",
-    ):
-        write(tools / verifier, "#!/usr/bin/env python3\n")
+    write(tools / "verify_release_versions.py", "#!/usr/bin/env python3\n")
+    write(
+        tools / "dependencies.py",
+        release_gate_probe("dependency-inventory"),
+    )
+    write(
+        tools / "generate_license_reports.py",
+        release_gate_probe("generated-licenses"),
+    )
 
     for required_file in (
         "Cargo.lock",
@@ -86,7 +117,16 @@ def initialize_release_repo(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
 
     write(
         fake_bin / "cargo",
-        "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${MOSAIC_TEST_RELEASE_GATE_LOG:-}" ]]; then
+  printf 'cargo\\t%s\\t%s\\n' "$(pwd -P)" "$*" \
+    >> "${MOSAIC_TEST_RELEASE_GATE_LOG}"
+fi
+if [[ "${MOSAIC_TEST_FAIL_RELEASE_GATE:-}" == "cargo" ]]; then
+  exit 23
+fi
+""",
     )
     write(
         fake_bin / "gpg",
@@ -336,6 +376,78 @@ if Path("NOTICE").read_text(encoding="utf-8") != "NOTICE\\n":
         )
         assert archived_notice is not None
         assert archived_notice.read() == b"NOTICE\n"
+
+
+def test_source_release_runs_locked_dependency_and_legal_metadata_checks(
+    tmp_path: Path,
+) -> None:
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    marker = tmp_path / "release-gate-calls"
+    env["MOSAIC_TEST_RELEASE_GATE_LOG"] = str(marker)
+
+    run(["bash", script.name], cwd=script.parent, env=env)
+
+    calls = read_release_gate_calls(marker)
+    assert [(gate, arguments) for gate, _, arguments in calls] == [
+        ("cargo", "metadata --locked --format-version 1 --no-deps"),
+        ("dependency-inventory", "check"),
+        ("generated-licenses", "--check"),
+    ]
+    checked_roots = {Path(cwd) for _, cwd, _ in calls}
+    assert len(checked_roots) == 1
+    checked_root = checked_roots.pop()
+    assert checked_root.name == f"paimon-mosaic-{VERSION}"
+    assert checked_root.parent.name.startswith("paimon-source-check.")
+    assert checked_root != repo
+
+
+@pytest.mark.parametrize(
+    ("failed_gate", "expected_calls"),
+    [
+        ("cargo", ["cargo"]),
+        (
+            "dependency-inventory",
+            ["cargo", "dependency-inventory"],
+        ),
+        (
+            "generated-licenses",
+            ["cargo", "dependency-inventory", "generated-licenses"],
+        ),
+    ],
+)
+def test_source_release_propagates_release_gate_failures(
+    tmp_path: Path,
+    failed_gate: str,
+    expected_calls: list[str],
+) -> None:
+    repo, env, _ = initialize_release_repo(tmp_path)
+    script = repo / "tools" / SOURCE_SCRIPT.name
+    marker = tmp_path / "release-gate-calls"
+    archive = (
+        repo
+        / "tools"
+        / "release"
+        / f"apache-paimon-mosaic-{VERSION}-src.tgz"
+    )
+    env["MOSAIC_TEST_RELEASE_GATE_LOG"] = str(marker)
+    env["MOSAIC_TEST_FAIL_RELEASE_GATE"] = failed_gate
+
+    result = subprocess.run(
+        ["bash", script.name],
+        cwd=script.parent,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 23
+    assert [gate for gate, _, _ in read_release_gate_calls(marker)] == (
+        expected_calls
+    )
+    assert not archive.with_suffix(archive.suffix + ".asc").exists()
+    assert not archive.with_suffix(archive.suffix + ".sha512").exists()
 
 
 def test_source_archive_is_commit_bound_and_reproducible(tmp_path: Path) -> None:

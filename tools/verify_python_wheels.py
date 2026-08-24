@@ -72,6 +72,7 @@ MACHO_MAGICS = {
 # Entry counts are capped, but a capped count still yields a message large
 # enough to matter, so bound how many names any rejection may name.
 MAX_REPORTED_NAMES = 20
+MAX_EXPANDED_WHEEL_TAGS = 64
 
 
 def _validate_target_matrix() -> None:
@@ -94,11 +95,22 @@ def expand_tag(python_tag: str, abi_tag: str, platform_tag: str) -> set[str]:
     components = (python_tag, abi_tag, platform_tag)
     if any(
         not component
-        or any(not part for part in component.split("."))
+        or component.startswith(".")
+        or component.endswith(".")
+        or ".." in component
         or any(character.isspace() for character in component)
         for component in components
     ):
         raise ValueError(f"invalid wheel tag components: {components}")
+    component_counts = tuple(component.count(".") + 1 for component in components)
+    expanded_count = (
+        component_counts[0] * component_counts[1] * component_counts[2]
+    )
+    if expanded_count > MAX_EXPANDED_WHEEL_TAGS:
+        raise ValueError(
+            f"wheel tag expands to more than {MAX_EXPANDED_WHEEL_TAGS} tags: "
+            f"{expanded_count}"
+        )
     return {
         f"{python}-{abi}-{platform}".lower()
         for python in python_tag.split(".")
@@ -142,6 +154,11 @@ def parse_wheel_metadata_tags(tags: list[str]) -> set[str]:
         if parsed.intersection(expanded):
             raise ValueError(f"duplicate WHEEL Tag field: {tag!r}")
         parsed.update(expanded)
+        if len(parsed) > MAX_EXPANDED_WHEEL_TAGS:
+            raise ValueError(
+                "WHEEL metadata expands to more than "
+                f"{MAX_EXPANDED_WHEEL_TAGS} tags"
+            )
     return parsed
 
 

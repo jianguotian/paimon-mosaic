@@ -104,6 +104,42 @@ def record_bytes(contents, record_path, mutate_record=None):
     return output.getvalue().encode()
 
 
+def test_expand_tag_rejects_oversized_cartesian_product():
+    compressed_component = ".".join(f"x{index}" for index in range(5))
+
+    with pytest.raises(ValueError, match="expands to more than 64 tags"):
+        verifier.expand_tag(
+            compressed_component,
+            compressed_component,
+            compressed_component,
+        )
+
+
+def test_expand_tag_accepts_the_cartesian_product_limit():
+    compressed_component = ".".join(f"x{index}" for index in range(4))
+
+    assert len(
+        verifier.expand_tag(
+            compressed_component,
+            compressed_component,
+            compressed_component,
+        )
+    ) == verifier.MAX_EXPANDED_WHEEL_TAGS
+
+
+def test_wheel_metadata_rejects_too_many_distinct_tags():
+    tags = [f"py{index}-none-any" for index in range(65)]
+
+    with pytest.raises(ValueError, match="expands to more than 64 tags"):
+        verifier.parse_wheel_metadata_tags(tags)
+
+
+def test_wheel_metadata_accepts_the_distinct_tag_limit():
+    tags = [f"py{index}-none-any" for index in range(64)]
+
+    assert len(verifier.parse_wheel_metadata_tags(tags)) == 64
+
+
 def build_wheel(
     tmp_path,
     target="aarch64-unknown-linux-gnu",

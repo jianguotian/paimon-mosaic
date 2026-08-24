@@ -135,8 +135,10 @@ def skip_java_members(data: bytes, offset: int) -> int | None:
     return offset
 
 
-def java_class_internal_name(data: bytes) -> str | None:
-    """Return a complete class file's declared internal name."""
+def java_class_provenance(
+    data: bytes,
+) -> tuple[str, frozenset[str]] | None:
+    """Return a complete class file's name and declared enclosing classes."""
     if len(data) < 10 or not data.startswith(JAVA_CLASS_MAGIC):
         return None
     major_version = int.from_bytes(data[6:8], "big")
@@ -185,15 +187,21 @@ def java_class_internal_name(data: bytes) -> str | None:
     if offset > len(data) - 8:
         return None
     this_class = int.from_bytes(data[offset + 2 : offset + 4], "big")
-    name_index = class_entries.get(this_class)
-    name_bytes = utf8_entries.get(name_index) if name_index is not None else None
-    if name_bytes is None:
-        return None
-    try:
-        internal_name = name_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    if not internal_name:
+    def class_name(class_index: int) -> str | None:
+        name_index = class_entries.get(class_index)
+        name_bytes = (
+            utf8_entries.get(name_index) if name_index is not None else None
+        )
+        if name_bytes is None:
+            return None
+        try:
+            name = name_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return name or None
+
+    internal_name = class_name(this_class)
+    if internal_name is None:
         return None
 
     interfaces_count = int.from_bytes(data[offset + 6 : offset + 8], "big")
@@ -212,10 +220,52 @@ def java_class_internal_name(data: bytes) -> str | None:
     if result is None:
         return None
     attributes_count, offset = result
-    offset = skip_java_attributes(data, offset, attributes_count)
+    enclosing_classes = set()
+    for _ in range(attributes_count):
+        if offset > len(data) - 6:
+            return None
+        name_index = int.from_bytes(data[offset : offset + 2], "big")
+        length = int.from_bytes(data[offset + 2 : offset + 6], "big")
+        offset += 6
+        if length > len(data) - offset:
+            return None
+        attribute = data[offset : offset + length]
+        offset += length
+        attribute_name = utf8_entries.get(name_index)
+        if attribute_name == b"InnerClasses":
+            if length < 2:
+                return None
+            classes_count = int.from_bytes(attribute[:2], "big")
+            if length != 2 + 8 * classes_count:
+                return None
+            for entry_offset in range(2, length, 8):
+                inner_class = int.from_bytes(
+                    attribute[entry_offset : entry_offset + 2], "big"
+                )
+                outer_class = int.from_bytes(
+                    attribute[entry_offset + 2 : entry_offset + 4], "big"
+                )
+                if inner_class == this_class and outer_class:
+                    owner = class_name(outer_class)
+                    if owner is None:
+                        return None
+                    enclosing_classes.add(owner)
+        elif attribute_name == b"EnclosingMethod":
+            if length != 4:
+                return None
+            owner = class_name(int.from_bytes(attribute[:2], "big"))
+            if owner is None:
+                return None
+            enclosing_classes.add(owner)
     if offset != len(data):
         return None
-    return internal_name
+    return internal_name, frozenset(enclosing_classes)
+
+
+def java_class_internal_name(data: bytes) -> str | None:
+    """Return a complete class file's declared internal name."""
+    provenance = java_class_provenance(data)
+    return provenance[0] if provenance is not None else None
 
 
 def is_java_class(data: bytes) -> bool:
@@ -276,6 +326,7 @@ MAVEN_POM_NAMESPACE = "{http://maven.apache.org/POM/4.0.0}"
 BUILD_METADATA_ENTRIES = frozenset(
     {"META-INF/MANIFEST.MF", "META-INF/DEPENDENCIES"}
 )
+CLASSIFIER_LEGAL_ENTRIES = frozenset({"META-INF/LICENSE", "META-INF/NOTICE"})
 
 
 def maven_descriptor_entries(root: Path) -> set[str]:
@@ -303,6 +354,37 @@ def maven_descriptor_entries(root: Path) -> set[str]:
     return {f"{prefix}/pom.xml", f"{prefix}/pom.properties"}
 
 
+def generated_javadoc_files(root: Path) -> dict[str, Path]:
+    javadoc_root = root / "java/target/apidocs"
+    if not javadoc_root.is_dir():
+        raise ValueError("generated Javadoc directory does not exist")
+    return {
+        path.relative_to(javadoc_root).as_posix(): path
+        for path in javadoc_root.rglob("*")
+        if path.is_file()
+    }
+
+
+def verify_classifier_payload_entries(
+    entries: dict[str, ZipInfo],
+    expected_payload: set[str],
+    required_metadata: set[str],
+    noun: str,
+) -> None:
+    actual_payload = {
+        name for name, info in entries.items() if not info.is_dir()
+    }
+    expected_entries = (
+        expected_payload | CLASSIFIER_LEGAL_ENTRIES | required_metadata
+    )
+    missing = sorted(expected_entries - actual_payload)
+    if missing:
+        raise ValueError(f"{noun} is missing expected entries: {missing}")
+    unexpected = sorted(actual_payload - expected_entries)
+    if unexpected:
+        raise ValueError(f"{noun} contains unexpected entries: {unexpected}")
+
+
 def verify_compiled_java_classes(
     archive: ZipFile, entries: dict[str, ZipInfo], root: Path
 ) -> set[str]:
@@ -318,26 +400,9 @@ def verify_compiled_java_classes(
     if missing:
         raise ValueError(f"main JAR is missing compiled Java classes: {missing}")
 
-    # javac also emits nested and anonymous classes as Outer$Inner.class, which
-    # have no source file of their own. Map each one back to its outermost name
-    # rather than trusting the package prefix.
     class_entries = {name for name in entries if name.endswith(".class")}
+    class_owners: dict[str, frozenset[str]] = {}
     for name in sorted(class_entries):
-        stem = name.removesuffix(".class")
-        outer, _, nested = stem.partition("$")
-        # javac emits Outer$Inner in the owner's directory, so a '/' after the
-        # '$' means the entry is not a nested class of that owner at all: for
-        # `package p.Outer$x.evil` it emits p/Outer$x/evil/C.class, which would
-        # otherwise map back to p/Outer.java.
-        if "/" in nested:
-            raise ValueError(
-                f"main JAR class {name!r} is not a nested class of "
-                f"{outer + '.class'!r}"
-            )
-        if outer + ".class" not in required_classes:
-            raise ValueError(
-                f"main JAR class {name!r} has no matching repository source"
-            )
         class_file = entries[name]
         if class_file.file_size > MAX_JAVA_CLASS_SIZE:
             raise ValueError(
@@ -346,13 +411,40 @@ def verify_compiled_java_classes(
             )
         with archive.open(class_file) as class_stream:
             class_bytes = class_stream.read(MAX_JAVA_CLASS_SIZE + 1)
-        internal_name = java_class_internal_name(class_bytes)
-        if internal_name is None:
+        provenance = java_class_provenance(class_bytes)
+        if provenance is None:
             raise ValueError(f"invalid compiled Java class: {name}")
+        internal_name, owners = provenance
         expected_name = name.removesuffix(".class")
         if internal_name != expected_name:
             raise ValueError(
                 f"compiled Java class {name!r} declares {internal_name!r}"
+            )
+        class_owners[internal_name] = owners
+
+    source_classes = {
+        name.removesuffix(".class") for name in required_classes
+    }
+
+    def has_source_provenance(
+        class_name: str, visiting: frozenset[str] = frozenset()
+    ) -> bool:
+        if class_name in source_classes:
+            return True
+        if class_name in visiting:
+            return False
+        return any(
+            class_name.startswith(owner + "$")
+            and owner in class_owners
+            and has_source_provenance(owner, visiting | {class_name})
+            for owner in class_owners.get(class_name, ())
+        )
+
+    for class_name in sorted(class_owners):
+        if not has_source_provenance(class_name):
+            raise ValueError(
+                f"main JAR class {class_name + '.class'!r} has no matching "
+                "repository source or declared enclosing class"
             )
     return class_entries
 
@@ -422,10 +514,16 @@ def verify_main_jar(path: Path, root: Path, require_all_natives: bool) -> None:
             | class_entries
             | packaged_natives
         )
+        actual_payload = {
+            name for name, info in entries.items() if not info.is_dir()
+        }
+        missing_payload = sorted(expected_payload - actual_payload)
+        if missing_payload:
+            raise ValueError(
+                f"main JAR is missing expected entries: {missing_payload}"
+            )
         unexpected_payload = sorted(
-            name
-            for name, info in entries.items()
-            if not info.is_dir() and name not in expected_payload
+            actual_payload - expected_payload
         )
         if unexpected_payload:
             raise ValueError(
@@ -493,6 +591,12 @@ def verify_sources_jar(path: Path, root: Path | None = None) -> None:
                 "sources JAR Java files differ from the repository sources: "
                 f"missing {missing}, unexpected {unexpected}"
             )
+        verify_classifier_payload_entries(
+            entries,
+            set(expected),
+            set(BUILD_METADATA_ENTRIES) | maven_descriptor_entries(root),
+            "sources JAR",
+        )
         for archive_path, source_path in expected.items():
             if archive.read(entries[archive_path]) != source_path.read_bytes():
                 raise ValueError(
@@ -512,6 +616,9 @@ def verify_javadoc_jar(path: Path, root: Path | None = None) -> None:
         sources = java_source_files(root)
         if not sources:
             raise ValueError("repository contains no Java sources")
+        expected = generated_javadoc_files(root)
+        if not expected:
+            raise ValueError("generated Javadoc directory contains no files")
         documented_sources = {
             source_path
             for source_path, source in sources.items()
@@ -536,6 +643,18 @@ def verify_javadoc_jar(path: Path, root: Path | None = None) -> None:
         )
         if empty:
             raise ValueError(f"javadoc JAR contains empty documentation pages: {empty}")
+        verify_classifier_payload_entries(
+            entries,
+            set(expected),
+            set(BUILD_METADATA_ENTRIES),
+            "javadoc JAR",
+        )
+        for archive_path, generated_path in expected.items():
+            if archive.read(entries[archive_path]) != generated_path.read_bytes():
+                raise ValueError(
+                    f"javadoc JAR entry {archive_path} differs from "
+                    f"{generated_path.as_posix()}"
+                )
     print(f"verified javadoc JAR payload: {path}")
 
 
