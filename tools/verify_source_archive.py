@@ -150,6 +150,69 @@ def reject_repository_archive_attributes(repository: Path) -> None:
         )
 
 
+def tracked_source_entries(repository: Path, commit: str) -> set[str]:
+    empty_tree = subprocess.run(
+        ["git", "-C", str(repository), "hash-object", "-t", "tree", "--stdin"],
+        check=True,
+        input=b"",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_environment(),
+    ).stdout.strip()
+    tracked = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-renames",
+            empty_tree,
+            commit,
+            "--",
+            *SOURCE_PATHSPECS,
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_environment(),
+    ).stdout
+    return {
+        os.fsdecode(path)
+        for path in tracked.split(b"\0")
+        if path
+    }
+
+
+def reject_omitted_tracked_source_entries(
+    repository: Path,
+    commit: str,
+    prefix: str,
+    archive_path: Path,
+) -> None:
+    expected = tracked_source_entries(repository, commit)
+    try:
+        with tarfile.open(archive_path, mode="r:") as archive:
+            archived = {
+                member.name.removesuffix("/")
+                for member in archive
+            }
+    except (tarfile.TarError, EOFError) as error:
+        raise ValueError(
+            f"cannot inspect generated Git archive {archive_path}: {error}"
+        ) from error
+    missing = sorted(
+        path for path in expected if prefix + path not in archived
+    )
+    if missing:
+        raise ValueError(
+            "Git archive omits tracked source entries, possibly due to "
+            f"committed export-ignore attributes: {missing}"
+        )
+
+
 def validated_prefix(prefix: str) -> str:
     if (
         not prefix
@@ -354,6 +417,12 @@ def write_git_archive(
             stderr=subprocess.PIPE,
             env=git_environment(),
         )
+    reject_omitted_tracked_source_entries(
+        repository,
+        commit,
+        prefix,
+        output,
+    )
 
 
 def expected_entries(

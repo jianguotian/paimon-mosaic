@@ -15,12 +15,16 @@
 
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
+import xml.etree.ElementTree as ElementTree
 
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
+MAVEN_NAMESPACE = {"m": "http://maven.apache.org/POM/4.0.0"}
 
 
 def load_workflow(name: str) -> dict:
@@ -39,6 +43,25 @@ def normalize_condition(value: str) -> str:
     if condition.startswith("${{") and condition.endswith("}}"):
         condition = condition[3:-2]
     return "".join(condition.split())
+
+
+def shell_commands(script: str) -> list[str]:
+    joined = re.sub(r"\\\s*\n\s*", " ", script)
+    return [line.strip() for line in joined.splitlines() if line.strip()]
+
+
+def activated_maven_profiles(command: str) -> set[str]:
+    tokens = shlex.split(command)
+    profiles: set[str] = set()
+    for index, token in enumerate(tokens):
+        if token == "-P":
+            value = tokens[index + 1]
+        elif token.startswith("-P"):
+            value = token[2:]
+        else:
+            continue
+        profiles.update(profile for profile in value.split(",") if profile)
+    return profiles
 
 
 def test_release_jobs_are_blocked_by_tag_and_version_preflight() -> None:
@@ -92,6 +115,74 @@ def test_release_jobs_are_blocked_by_tag_and_version_preflight() -> None:
         assert "if" not in job
     for name in ("rust", "java"):
         assert jobs[name]["with"]["preflight_completed"] == "true"
+
+
+def test_python_publish_waits_for_every_release_artifact_job() -> None:
+    jobs = load_workflow("release.yml")["jobs"]
+    required_dependencies = {"rust", "java", "python-wheels"}
+    actual_dependencies = needs(jobs["python-publish"])
+
+    assert required_dependencies <= actual_dependencies
+    assert actual_dependencies <= set(jobs)
+
+
+def test_java_deploy_activates_the_profile_that_runs_the_jar_verifier() -> None:
+    workflow = load_workflow("release-java.yml")
+    deploy_step = next(
+        step
+        for step in workflow["jobs"]["deploy-staging"]["steps"]
+        if step.get("name") == "Deploy to Apache Nexus staging"
+    )
+    deploy_commands = [
+        command
+        for command in shell_commands(deploy_step["run"])
+        if command.startswith("mvn clean deploy")
+    ]
+    assert len(deploy_commands) == 1
+    assert "release" in activated_maven_profiles(deploy_commands[0])
+
+    pom = ElementTree.parse(ROOT / "java" / "pom.xml").getroot()
+    release_profile = next(
+        profile
+        for profile in pom.findall("m:profiles/m:profile", MAVEN_NAMESPACE)
+        if profile.findtext("m:id", namespaces=MAVEN_NAMESPACE) == "release"
+    )
+    required_arguments = {
+        "tools/verify_java_jars.py",
+        "--main",
+        "--sources",
+        "--javadoc",
+        "--require-all-natives",
+    }
+    verifier_routes = []
+    for execution in release_profile.findall(
+        ".//m:execution", MAVEN_NAMESPACE
+    ):
+        goals = {
+            goal.text
+            for goal in execution.findall("m:goals/m:goal", MAVEN_NAMESPACE)
+        }
+        arguments = {
+            argument.text
+            for argument in execution.findall(
+                "m:configuration/m:arguments/m:argument",
+                MAVEN_NAMESPACE,
+            )
+        }
+        if (
+            execution.findtext("m:phase", namespaces=MAVEN_NAMESPACE)
+            == "verify"
+            and "exec" in goals
+            and execution.findtext(
+                "m:configuration/m:executable",
+                namespaces=MAVEN_NAMESPACE,
+            )
+            == "python3"
+            and required_arguments <= arguments
+        ):
+            verifier_routes.append(execution)
+
+    assert verifier_routes
 
 
 def test_direct_release_dispatch_cannot_bypass_preflight() -> None:

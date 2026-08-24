@@ -85,6 +85,68 @@ def minimal_valid_class_bytes(internal_name: str) -> bytes:
     )
 
 
+def minimal_nested_class_bytes(
+    internal_name: str, owner_name: str, *, anonymous: bool = False
+) -> bytes:
+    """Build a minimal classfile with javac-style nested-class provenance."""
+    encoded_name = internal_name.encode()
+    encoded_owner = owner_name.encode()
+    constant_pool = (
+        b"\x01"
+        + len(encoded_name).to_bytes(2, "big")
+        + encoded_name
+        + b"\x07\x00\x01"
+        b"\x01\x00\x10java/lang/Object"
+        b"\x07\x00\x03"
+        b"\x01\x00\x0cInnerClasses"
+    )
+    if anonymous:
+        constant_pool += (
+            b"\x01\x00\x0fEnclosingMethod"
+            b"\x01"
+            + len(encoded_owner).to_bytes(2, "big")
+            + encoded_owner
+            + b"\x07\x00\x07"
+        )
+        class_attributes = (
+            b"\x00\x02"
+            b"\x00\x05\x00\x00\x00\x0a"
+            b"\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00"
+            b"\x00\x06\x00\x00\x00\x04"
+            b"\x00\x08\x00\x00"
+        )
+    else:
+        inner_name = internal_name.rsplit("$", 1)[-1].encode()
+        constant_pool += (
+            b"\x01"
+            + len(encoded_owner).to_bytes(2, "big")
+            + encoded_owner
+            + b"\x07\x00\x06"
+            b"\x01"
+            + len(inner_name).to_bytes(2, "big")
+            + inner_name
+        )
+        class_attributes = (
+            b"\x00\x01"
+            b"\x00\x05\x00\x00\x00\x0a"
+            b"\x00\x01\x00\x02\x00\x07\x00\x08\x00\x00"
+        )
+    return (
+        b"\xca\xfe\xba\xbe"
+        b"\x00\x00"
+        b"\x00\x34"
+        b"\x00\x09"
+        + constant_pool
+        + b"\x00\x21"
+        b"\x00\x02"
+        b"\x00\x04"
+        b"\x00\x00"
+        b"\x00\x00"
+        b"\x00\x00"
+        + class_attributes
+    )
+
+
 class VerifyJavaJarsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -212,6 +274,16 @@ class VerifyJavaJarsTest(unittest.TestCase):
         entries = [
             ("META-INF/LICENSE", license_contents),
             ("META-INF/NOTICE", b"Apache Arrow\n"),
+            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+            ("META-INF/DEPENDENCIES", b"// generated\n"),
+            (
+                "META-INF/maven/org.apache.paimon/mosaic/pom.xml",
+                (self.root / "java/pom.xml").read_bytes(),
+            ),
+            (
+                "META-INF/maven/org.apache.paimon/mosaic/pom.properties",
+                b"artifactId=mosaic\n",
+            ),
             (
                 "org/apache/paimon/mosaic/Example.class",
                 minimal_valid_class_bytes(
@@ -1208,20 +1280,6 @@ class VerifyJavaJarsTest(unittest.TestCase):
 
     def test_accepts_the_entries_a_real_maven_build_adds(self) -> None:
         entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
-        entries.extend(
-            [
-                ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
-                ("META-INF/DEPENDENCIES", b"// generated\n"),
-                (
-                    "META-INF/maven/org.apache.paimon/mosaic/pom.xml",
-                    b"<project/>\n",
-                ),
-                (
-                    "META-INF/maven/org.apache.paimon/mosaic/pom.properties",
-                    b"artifactId=mosaic\n",
-                ),
-            ]
-        )
         # A real `mvn package` artifact carries 13 empty directory entries. The
         # fixture had none, which is why a directory entry carrying payload
         # passed every test while failing on the real JAR.
@@ -1239,6 +1297,29 @@ class VerifyJavaJarsTest(unittest.TestCase):
         )
 
         self.verify_main(entries)
+
+    def test_main_jar_requires_every_build_metadata_entry(self) -> None:
+        metadata_names = (
+            "META-INF/MANIFEST.MF",
+            "META-INF/DEPENDENCIES",
+            "META-INF/maven/org.apache.paimon/mosaic/pom.xml",
+            "META-INF/maven/org.apache.paimon/mosaic/pom.properties",
+        )
+
+        for missing_name in metadata_names:
+            with self.subTest(missing_name=missing_name):
+                entries = [
+                    entry
+                    for entry in self.prepare_main_jar_fixture(
+                        EXPECTED_NATIVE_ENTRIES
+                    )
+                    if entry[0] != missing_name
+                ]
+
+                with self.assertRaisesRegex(
+                    ValueError, "missing expected entries"
+                ):
+                    self.verify_main(entries)
 
     def test_rejects_a_directory_entry_carrying_payload(self) -> None:
         # A ZIP directory entry is only a trailing slash, and the JVM still reads
@@ -1265,17 +1346,91 @@ class VerifyJavaJarsTest(unittest.TestCase):
         smuggled = f"{outer}$x/evil/Backdoor"
         entries.append((f"{smuggled}.class", minimal_valid_class_bytes(smuggled)))
 
-        with self.assertRaisesRegex(ValueError, "is not a nested class of"):
+        with self.assertRaisesRegex(
+            ValueError, "no matching repository source"
+        ):
             self.verify_main(entries)
 
     def test_accepts_nested_and_anonymous_classes(self) -> None:
         entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
         outer = EXAMPLE_SOURCE_PATH.removesuffix(".java")
-        for suffix in ("$1", "$Inner"):
+        for suffix, anonymous in (("$1", True), ("$Inner", False)):
             nested = f"{outer}{suffix}"
-            entries.append((f"{nested}.class", minimal_valid_class_bytes(nested)))
+            entries.append(
+                (
+                    f"{nested}.class",
+                    minimal_nested_class_bytes(
+                        nested, outer, anonymous=anonymous
+                    ),
+                )
+            )
 
         self.verify_main(entries)
+
+    def test_accepts_nested_class_in_package_containing_dollar(self) -> None:
+        source = (
+            self.root
+            / "java/src/main/java/org/apache/paimon/mosaic$internal/Owner.java"
+        )
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "package org.apache.paimon.mosaic$internal;\n"
+            "class Owner { class Nested {} }\n",
+            encoding="utf-8",
+        )
+        outer = "org/apache/paimon/mosaic$internal/Owner"
+        nested = f"{outer}$Nested"
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        entries.extend(
+            [
+                (f"{outer}.class", minimal_valid_class_bytes(outer)),
+                (
+                    f"{nested}.class",
+                    minimal_nested_class_bytes(nested, outer),
+                ),
+            ]
+        )
+
+        self.verify_main(entries)
+
+    def test_accepts_top_level_dollar_class_with_exact_source(self) -> None:
+        source = (
+            self.root
+            / "java/src/main/java/org/apache/paimon/mosaic/Example$Payload.java"
+        )
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            "package org.apache.paimon.mosaic;\n"
+            "class Example$Payload {}\n",
+            encoding="utf-8",
+        )
+        top_level = "org/apache/paimon/mosaic/Example$Payload"
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        entries.append(
+            (
+                f"{top_level}.class",
+                minimal_valid_class_bytes(top_level),
+            )
+        )
+
+        self.verify_main(entries)
+
+    def test_rejects_top_level_dollar_class_without_source_or_owner(self) -> None:
+        entries = self.prepare_main_jar_fixture(EXPECTED_NATIVE_ENTRIES)
+        top_level = (
+            f"{EXAMPLE_SOURCE_PATH.removesuffix('.java')}$Payload"
+        )
+        entries.append(
+            (
+                f"{top_level}.class",
+                minimal_valid_class_bytes(top_level),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "no matching repository source"
+        ):
+            self.verify_main(entries)
 
     def test_rejects_payload_no_source_or_build_step_accounts_for(self) -> None:
         for entry, contents in (

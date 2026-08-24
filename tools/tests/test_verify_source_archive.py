@@ -433,6 +433,72 @@ def test_archive_creation_rejects_repository_local_attributes(tmp_path):
         verifier.create_archive(archive, repo, commit, PREFIX)
 
 
+def test_archive_creation_rejects_committed_export_ignored_source_directory(
+    tmp_path,
+):
+    repo, _ = initialize_repo(tmp_path)
+    protected = repo / "protected/module.py"
+    protected.parent.mkdir()
+    protected.write_text("protected = True\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        "protected/ export-ignore\n", encoding="utf-8"
+    )
+    run(["git", "add", ".gitattributes", "protected/module.py"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "hide protected source"], cwd=repo)
+    commit = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.decode().strip()
+    archive = tmp_path / "source.tgz"
+
+    with pytest.raises(ValueError, match="export-ignore"):
+        verifier.create_archive(archive, repo, commit, PREFIX)
+    assert not archive.exists()
+
+
+def test_archive_creation_rejects_committed_export_ignored_root_file(tmp_path):
+    repo, _ = initialize_repo(tmp_path)
+    (repo / "protected.py").write_text("protected = True\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        "protected.py export-ignore\n", encoding="utf-8"
+    )
+    run(["git", "add", ".gitattributes", "protected.py"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "hide root source"], cwd=repo)
+    commit = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.decode().strip()
+    archive = tmp_path / "source.tgz"
+
+    with pytest.raises(ValueError, match="export-ignore"):
+        verifier.create_archive(archive, repo, commit, PREFIX)
+    assert not archive.exists()
+
+
+def test_archive_verification_rejects_committed_export_ignored_source(tmp_path):
+    repo, _ = initialize_repo(tmp_path)
+    protected = repo / "protected/module.py"
+    protected.parent.mkdir()
+    protected.write_text("protected = True\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        "protected/ export-ignore\n", encoding="utf-8"
+    )
+    run(["git", "add", ".gitattributes", "protected/module.py"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "hide protected source"], cwd=repo)
+    commit = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.decode().strip()
+    raw_tar = run(
+        [
+            "git",
+            "archive",
+            "--format=tar",
+            f"--prefix={PREFIX}",
+            commit,
+            "--",
+            *verifier.SOURCE_PATHSPECS,
+        ],
+        cwd=repo,
+    ).stdout
+    archive = tmp_path / "source.tgz"
+    archive.write_bytes(gzip.compress(raw_tar, mtime=0))
+
+    with pytest.raises(ValueError, match="export-ignore"):
+        verifier.verify_archive(archive, repo, commit, PREFIX)
+
+
 def test_archive_verification_rejects_unsafe_entry_path(tmp_path):
     archive = tmp_path / "unsafe.tgz"
     write_tgz(archive, [regular_file("../escape")])
