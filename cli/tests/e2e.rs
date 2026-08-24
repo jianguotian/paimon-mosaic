@@ -83,6 +83,22 @@ fn run(args: &[&str]) -> (String, String, bool) {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn run_with_virtual_memory_limit(args: &[&str], limit_kib: usize) -> (String, String, bool) {
+    let out = Command::new("bash")
+        .args(["-c", r#"ulimit -v "$1"; shift; exec "$@""#, "mosaic-e2e"])
+        .arg(limit_kib.to_string())
+        .arg(env!("CARGO_BIN_EXE_mosaic"))
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+        out.status.success(),
+    )
+}
+
 #[test]
 fn schema_lists_columns() {
     let f = fixture("schema");
@@ -2464,6 +2480,59 @@ fn convert_json_projection_ignores_unselected_type_conflicts() {
     assert_eq!(rows.lines().count(), 2, "{rows}");
     assert!(rows.contains(r#"{"id":1}"#), "{rows}");
     assert!(rows.contains(r#"{"id":2}"#), "{rows}");
+}
+
+#[test]
+fn convert_json_projection_ignores_unselected_out_of_range_number() {
+    let dir = std::env::temp_dir();
+    let js = format!(
+        "{}/mosaic_e2e_json_project_out_of_range.json",
+        dir.display()
+    );
+    std::fs::write(&js, "{\"id\":1,\"drop\":1e400}\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_json_project_out_of_range.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&["convert", &js, "-o", &out, "-c", "id", "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows.trim(), r#"{"id":1}"#);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn convert_json_wide_schema_bounds_both_decoder_routes() {
+    let dir = std::env::temp_dir();
+    for (case, avro_type, value) in [("direct", "string", r#""x""#), ("validated", "long", "1")] {
+        let fields = (0..12_000)
+            .map(|i| format!(r#"{{"name":"f{i}","type":["null","{avro_type}"]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema = format!("{}/mosaic_e2e_wide_json_{case}.avsc", dir.display());
+        std::fs::write(
+            &schema,
+            format!(r#"{{"type":"record","name":"T","fields":[{fields}]}}"#),
+        )
+        .unwrap();
+        let json = format!("{}/mosaic_e2e_wide_json_{case}.jsonl", dir.display());
+        std::fs::write(&json, format!(r#"{{"f0":{value}}}"#) + "\n").unwrap();
+        let out = format!("{}/mosaic_e2e_wide_json_{case}.mosaic", dir.display());
+        let (stdout, stderr, ok) = run_with_virtual_memory_limit(
+            &[
+                "convert",
+                &json,
+                "-o",
+                &out,
+                "--schema",
+                &schema,
+                "--overwrite",
+            ],
+            256 * 1024,
+        );
+        assert!(ok, "{case}: stdout: {stdout}\nstderr: {stderr}");
+    }
 }
 
 #[test]

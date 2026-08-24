@@ -588,9 +588,7 @@ fn convert_with_json_record_limit(
             write_validated_json_input(open()?, &schema, writer, rows)
         });
     }
-    let reader = arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
-        .build(open()?)
-        .map_err(bad)?;
+    let reader = json_reader_builder(&schema).build(open()?).map_err(bad)?;
     write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
         for batch in reader {
             let batch = batch
@@ -616,6 +614,11 @@ fn write_validated_json_input<R: std::io::BufRead>(
 
 const DEFAULT_JSON_BATCH_SIZE: usize = 1024;
 const TARGET_CONVERT_BATCH_BYTES: usize = 16 * 1024 * 1024;
+// Arrow's JSON tape reserves roughly two elements and two offsets for every
+// flattened field in every row before decoding begins.
+const JSON_TAPE_BYTES_PER_FIELD_PER_ROW: usize =
+    2 * (std::mem::size_of::<u64>() + std::mem::size_of::<usize>());
+const TARGET_JSON_TAPE_BYTES: usize = TARGET_CONVERT_BATCH_BYTES;
 const JSON_INPUT_BUFFER_BYTES: usize = 1024 * 1024;
 // Hard ceiling on a single raw JSON root value. A streaming lexical reader
 // enforces it before serde_json or Arrow can materialize the value.
@@ -998,12 +1001,8 @@ where
     let bad = |e: arrow::error::ArrowError| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     };
-    let build_decoder = || {
-        arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
-            .with_batch_size(DEFAULT_JSON_BATCH_SIZE)
-            .build_decoder()
-            .map_err(bad)
-    };
+    let batch_size = json_batch_size(schema);
+    let build_decoder = || json_reader_builder(schema).build_decoder().map_err(bad);
     let fields = json_special_fields(schema);
     let decimal_plan =
         schema_has_decimal(schema).then(|| JsonDecimalStructPlan::from_fields(schema.fields()));
@@ -1024,7 +1023,7 @@ where
             raw_bytes
         };
         if !decoder.is_empty()
-            && (decoder.len() >= DEFAULT_JSON_BATCH_SIZE
+            && (decoder.len() >= batch_size
                 || batch_bytes.saturating_add(decode_bytes.len()) > byte_budget)
         {
             if let Some(batch) = decoder.flush().map_err(bad)? {
@@ -1041,7 +1040,7 @@ where
         }
         batch_bytes = batch_bytes.saturating_add(decode_bytes.len());
 
-        if decoder.len() >= DEFAULT_JSON_BATCH_SIZE || batch_bytes >= byte_budget {
+        if decoder.len() >= batch_size || batch_bytes >= byte_budget {
             if let Some(batch) = decoder.flush().map_err(bad)? {
                 write(batch)?;
             }
@@ -1056,6 +1055,20 @@ where
         write(batch)?;
     }
     Ok(())
+}
+
+fn json_reader_builder(schema: &Schema) -> arrow::json::ReaderBuilder {
+    arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
+        .with_batch_size(json_batch_size(schema))
+}
+
+fn json_batch_size(schema: &Schema) -> usize {
+    let flattened_fields = schema.flattened_fields().len();
+    if flattened_fields == 0 {
+        return DEFAULT_JSON_BATCH_SIZE;
+    }
+    let bytes_per_row = flattened_fields.saturating_mul(JSON_TAPE_BYTES_PER_FIELD_PER_ROW);
+    (TARGET_JSON_TAPE_BYTES / bytes_per_row.max(1)).clamp(1, DEFAULT_JSON_BATCH_SIZE)
 }
 
 fn schema_has_decimal(schema: &Schema) -> bool {
@@ -1990,22 +2003,63 @@ fn infer_projected_json_schema<R: std::io::Read>(
 ) -> Result<Schema, arrow::error::ArrowError> {
     use arrow::error::ArrowError;
 
+    let columns = columns.iter().map(String::as_str).collect();
+    // Keep each root value raw so unselected fields can be skipped before
+    // serde_json materializes values such as numbers outside its f64 range.
     let values = serde_json::Deserializer::from_reader(reader)
-        .into_iter::<Value>()
-        .map(|value| {
-            let value = value.map_err(|e| ArrowError::JsonError(e.to_string()))?;
-            Ok(match value {
-                Value::Object(mut object) => {
-                    let projected = columns
-                        .iter()
-                        .filter_map(|name| object.remove(name).map(|value| (name.clone(), value)))
-                        .collect();
-                    Value::Object(projected)
-                }
-                value => value,
-            })
+        .into_iter::<Box<RawValue>>()
+        .map(|raw| {
+            let raw = raw.map_err(|e| ArrowError::JsonError(e.to_string()))?;
+            let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+            ProjectedJsonRecordSeed { columns: &columns }
+                .deserialize(&mut deserializer)
+                .map_err(|e| ArrowError::JsonError(e.to_string()))
         });
     arrow::json::reader::infer_json_schema_from_iterator(values)
+}
+
+struct ProjectedJsonRecordSeed<'a> {
+    columns: &'a std::collections::HashSet<&'a str>,
+}
+
+impl<'de> DeserializeSeed<'de> for ProjectedJsonRecordSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ProjectedJsonRecordVisitor {
+            columns: self.columns,
+        })
+    }
+}
+
+struct ProjectedJsonRecordVisitor<'a> {
+    columns: &'a std::collections::HashSet<&'a str>,
+}
+
+impl<'de> Visitor<'de> for ProjectedJsonRecordVisitor<'_> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut projected = serde_json::Map::new();
+        while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            if self.columns.contains(name.as_ref()) {
+                projected.insert(name.into_owned(), map.next_value()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(Value::Object(projected))
+    }
 }
 
 /// Mosaic cannot store Arrow `Null` columns, and JSON inference produces
@@ -3923,15 +3977,19 @@ fn parse_avro_schema(spec: &str) -> std::io::Result<Schema> {
             fmt::safe(record_name)
         )));
     }
-    if let Some(namespace) = obj.get("namespace") {
-        let namespace = namespace
-            .as_str()
-            .ok_or_else(|| invalid_schema("Avro record namespace must be a string"))?;
-        if !namespace.is_empty() && !is_valid_avro_fullname(namespace) {
-            return Err(invalid_schema(format!(
-                "invalid Avro record namespace '{}'",
-                fmt::safe(namespace)
-            )));
+    // An Avro name containing a dot is already a fullname, so its namespace
+    // attribute is ignored rather than validated.
+    if !record_name.contains('.') {
+        if let Some(namespace) = obj.get("namespace") {
+            let namespace = namespace
+                .as_str()
+                .ok_or_else(|| invalid_schema("Avro record namespace must be a string"))?;
+            if !namespace.is_empty() && !is_valid_avro_fullname(namespace) {
+                return Err(invalid_schema(format!(
+                    "invalid Avro record namespace '{}'",
+                    fmt::safe(namespace)
+                )));
+            }
         }
     }
     let avro_fields = obj
@@ -4763,6 +4821,26 @@ mod tests {
     }
 
     #[test]
+    fn wide_json_batch_size_bounds_decoder_preallocation() {
+        let narrow = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        assert_eq!(json_batch_size(&narrow), DEFAULT_JSON_BATCH_SIZE);
+
+        let wide = Schema::new(
+            (0..50_000)
+                .map(|i| Field::new(format!("f{i}"), DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        );
+        let batch_size = json_batch_size(&wide);
+        assert!((1..DEFAULT_JSON_BATCH_SIZE).contains(&batch_size));
+        assert!(
+            batch_size
+                .saturating_mul(wide.flattened_fields().len())
+                .saturating_mul(JSON_TAPE_BYTES_PER_FIELD_PER_ROW)
+                <= TARGET_JSON_TAPE_BYTES
+        );
+    }
+
+    #[test]
     fn inferred_csv_batch_size_bounds_accumulated_record_payload() {
         assert_eq!(inferred_csv_batch_size(1, 0), DEFAULT_CSV_BATCH_SIZE);
         assert_eq!(
@@ -5588,6 +5666,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(schema.fields()[0].data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn parse_avro_schema_ignores_namespace_for_fullname() {
+        let schema = parse_avro_schema(
+            r#"{"type":"record","name":"com.example.T","namespace":"bad-name","fields":[{"name":"id","type":"long"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(schema.fields()[0].data_type(), &DataType::Int64);
+        assert!(
+            parse_avro_schema(
+                r#"{"type":"record","name":"T","namespace":"bad-name","fields":[{"name":"id","type":"long"}]}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
