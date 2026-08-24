@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Build helper: copies the pre-built native library into the package directory."""
+"""Build helper for an artifact-exact native wheel."""
 
 import os
 import platform
@@ -24,6 +24,50 @@ import shutil
 from setuptools import Distribution, setup
 from setuptools.command.build_py import build_py
 from wheel.bdist_wheel import bdist_wheel
+
+
+NATIVE_LIBRARY_NAMES = (
+    "libpaimon_mosaic_ffi.dylib",
+    "libpaimon_mosaic_ffi.so",
+    "paimon_mosaic_ffi.dll",
+)
+LEGAL_FILE_NAMES = ("LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.html")
+
+
+def _package_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "mosaic")
+
+
+def _detect_rust_target():
+    system = platform.system()
+    machine = platform.machine().lower()
+    return {
+        ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
+        ("Linux", "amd64"): "x86_64-unknown-linux-gnu",
+        ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
+        ("Linux", "arm64"): "aarch64-unknown-linux-gnu",
+        ("Darwin", "aarch64"): "aarch64-apple-darwin",
+        ("Darwin", "arm64"): "aarch64-apple-darwin",
+        ("Windows", "x86_64"): "x86_64-pc-windows-msvc",
+        ("Windows", "amd64"): "x86_64-pc-windows-msvc",
+    }.get((system, machine))
+
+
+def _rust_target():
+    target = _detect_rust_target()
+    if target is None:
+        raise RuntimeError(
+            "Unsupported wheel build platform: "
+            f"system={platform.system()}, machine={platform.machine().lower()}"
+        )
+    return target
+
+
+def _license_files():
+    target = _detect_rust_target()
+    if target is None:
+        return []
+    return [f"licenses/{target}/{name}" for name in LEGAL_FILE_NAMES]
 
 
 def _lib_name():
@@ -50,18 +94,40 @@ def _find_native_lib():
         if os.path.isfile(candidate):
             return candidate
 
+    packaged = os.path.join(_package_dir(), lib)
+    if os.path.isfile(packaged):
+        return packaged
+
     return None
 
 
 class BuildPyWithNativeLib(build_py):
     def run(self):
-        src = _find_native_lib()
-        if src:
-            dst = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "mosaic", _lib_name()
-            )
-            shutil.copy2(src, dst)
         super().run()
+        src = _find_native_lib()
+        if not src:
+            raise RuntimeError(
+                "The pre-built paimon-mosaic FFI native library was not found"
+            )
+
+        build_package = os.path.join(self.build_lib, "mosaic")
+        os.makedirs(build_package, exist_ok=True)
+        for stale_name in NATIVE_LIBRARY_NAMES + LEGAL_FILE_NAMES:
+            stale_path = os.path.join(build_package, stale_name)
+            if os.path.isfile(stale_path):
+                os.remove(stale_path)
+
+        shutil.copy2(src, os.path.join(build_package, _lib_name()))
+        license_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "licenses",
+            _rust_target(),
+        )
+        for name in LEGAL_FILE_NAMES:
+            shutil.copy2(
+                os.path.join(license_dir, name),
+                os.path.join(build_package, name),
+            )
 
 
 class PlatformWheel(bdist_wheel):
@@ -86,4 +152,5 @@ class BinaryDistribution(Distribution):
 setup(
     cmdclass={"build_py": BuildPyWithNativeLib, "bdist_wheel": PlatformWheel},
     distclass=BinaryDistribution,
+    license_files=_license_files(),
 )
