@@ -83,6 +83,22 @@ fn run(args: &[&str]) -> (String, String, bool) {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn run_with_virtual_memory_limit(args: &[&str], limit_kib: usize) -> (String, String, bool) {
+    let out = Command::new("bash")
+        .args(["-c", r#"ulimit -v "$1"; shift; exec "$@""#, "mosaic-e2e"])
+        .arg(limit_kib.to_string())
+        .arg(env!("CARGO_BIN_EXE_mosaic"))
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+        out.status.success(),
+    )
+}
+
 #[test]
 fn schema_lists_columns() {
     let f = fixture("schema");
@@ -758,6 +774,95 @@ fn convert_csv_explicit_schema_preserves_supported_scalar_types() {
             r#""id":"550e8400-e29b-41d4-a716-446655440000"}"#
         )
     );
+}
+
+#[test]
+fn convert_rejects_finite_avro_float_overflow() {
+    let dir = std::env::temp_dir();
+    for (case, format, avro_type, value) in [
+        ("json_number", "json", "float", "1e40"),
+        ("json_number", "json", "double", "1e400"),
+        ("json_string", "json", "float", r#""1e40""#),
+        ("json_string", "json", "double", r#""1e400""#),
+        ("csv", "csv", "float", "1e40"),
+        ("csv", "csv", "double", "1e400"),
+    ] {
+        let stem = format!("mosaic_e2e_{case}_{avro_type}_overflow");
+        let input = format!("{}/{stem}.{format}", dir.display());
+        let schema = format!("{}/{stem}.avsc", dir.display());
+        let out = format!("{}/{stem}.mosaic", dir.display());
+        let _ = std::fs::remove_file(&out);
+        std::fs::write(
+            &input,
+            if format == "json" {
+                format!(r#"{{"value":{value}}}"#)
+            } else {
+                format!("value\n{value}\n")
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            &schema,
+            format!(
+                r#"{{"type":"record","name":"T","fields":[{{"name":"value","type":"{avro_type}"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let command = if format == "json" {
+            "convert"
+        } else {
+            "convert-csv"
+        };
+        let (_, err, ok) = run(&[
+            command,
+            &input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--overwrite",
+        ]);
+        assert!(!ok, "{command} accepted {value} as Avro {avro_type}");
+        assert!(
+            err.contains("finite value") && err.contains(avro_type),
+            "{err}"
+        );
+        assert!(!std::path::Path::new(&out).exists());
+    }
+}
+
+#[test]
+fn convert_csv_accepts_explicit_non_finite_avro_floats() {
+    let dir = std::env::temp_dir();
+    let csv = format!(
+        "{}/mosaic_e2e_explicit_non_finite_floats.csv",
+        dir.display()
+    );
+    let schema = format!(
+        "{}/mosaic_e2e_explicit_non_finite_floats.avsc",
+        dir.display()
+    );
+    let out = format!(
+        "{}/mosaic_e2e_explicit_non_finite_floats.mosaic",
+        dir.display()
+    );
+    std::fs::write(&csv, "f32,f64\nNaN,infinity\n").unwrap();
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"f32","type":"float"},{"name":"f64","type":"double"}]}"#,
+    )
+    .unwrap();
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
 }
 
 #[test]
@@ -1565,6 +1670,169 @@ fn convert_csv_skip_lines_are_included_in_error_line_numbers() {
 }
 
 #[test]
+fn convert_csv_skip_lines_handles_cr_only_records() {
+    let dir = std::env::temp_dir();
+    let cr = format!("{}/mosaic_e2e_skip_lines_cr.csv", dir.display());
+    let lf = format!("{}/mosaic_e2e_skip_lines_lf.csv", dir.display());
+    let crlf = format!("{}/mosaic_e2e_skip_lines_crlf.csv", dir.display());
+    std::fs::write(&cr, b"metadata\rname\ralpha\r").unwrap();
+    std::fs::write(&lf, b"metadata\nname\nbeta\n").unwrap();
+    std::fs::write(&crlf, b"metadata\r\nname\r\ngamma\r\n").unwrap();
+
+    let out = format!(
+        "{}/mosaic_e2e_skip_lines_line_endings.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &cr,
+        &lf,
+        &crlf,
+        "-o",
+        &out,
+        "--skip-lines",
+        "1",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [
+            r#"{"name":"alpha"}"#,
+            r#"{"name":"beta"}"#,
+            r#"{"name":"gamma"}"#
+        ]
+    );
+}
+
+#[test]
+fn convert_csv_skip_lines_preserves_physical_error_lines() {
+    let dir = std::env::temp_dir();
+    let schema = format!(
+        "{}/mosaic_e2e_skip_lines_physical_errors.avsc",
+        dir.display()
+    );
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"value","type":"float"}]}"#,
+    )
+    .unwrap();
+
+    for (case, line_ending) in [("lf", "\n"), ("cr", "\r"), ("crlf", "\r\n")] {
+        let input = format!(
+            "{}/mosaic_e2e_skip_lines_physical_errors_{case}.csv",
+            dir.display()
+        );
+        std::fs::write(
+            &input,
+            ["metadata", "value", "", "1e40", ""].join(line_ending),
+        )
+        .unwrap();
+        let out = format!(
+            "{}/mosaic_e2e_skip_lines_physical_errors_{case}.mosaic",
+            dir.display()
+        );
+        let (_, err, ok) = run(&[
+            "convert-csv",
+            &input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--skip-lines",
+            "1",
+            "--overwrite",
+        ]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains("at line 4"), "{case}: {err}");
+    }
+}
+
+#[test]
+fn convert_csv_skip_lines_preserves_physical_read_error_lines() {
+    let dir = std::env::temp_dir();
+    let schema = format!(
+        "{}/mosaic_e2e_skip_lines_physical_read_errors.avsc",
+        dir.display()
+    );
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"value","type":"string"}]}"#,
+    )
+    .unwrap();
+
+    for (case, line_ending) in [
+        ("lf", b"\n".as_slice()),
+        ("cr", b"\r".as_slice()),
+        ("crlf", b"\r\n".as_slice()),
+    ] {
+        let input = format!(
+            "{}/mosaic_e2e_skip_lines_physical_read_errors_{case}.csv",
+            dir.display()
+        );
+        std::fs::write(
+            &input,
+            [
+                b"metadata".as_slice(),
+                b"value".as_slice(),
+                b"ok".as_slice(),
+                b"\xff".as_slice(),
+                b"".as_slice(),
+            ]
+            .join(line_ending),
+        )
+        .unwrap();
+        let out = format!(
+            "{}/mosaic_e2e_skip_lines_physical_read_errors_{case}.mosaic",
+            dir.display()
+        );
+        let (_, err, ok) = run(&[
+            "convert-csv",
+            &input,
+            "-o",
+            &out,
+            "--schema",
+            &schema,
+            "--skip-lines",
+            "1",
+            "--overwrite",
+        ]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains("line 4"), "{case}: {err}");
+    }
+}
+
+#[test]
+fn convert_csv_reports_physical_lines_after_bom_and_blank_line() {
+    let dir = std::env::temp_dir();
+    let input = format!("{}/mosaic_e2e_bom_physical_line.csv", dir.display());
+    std::fs::write(&input, b"\xef\xbb\xbf\n1e40\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_bom_physical_line.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{"type":"record","name":"T","fields":[{"name":"value","type":"float"}]}"#,
+    )
+    .unwrap();
+    let out = format!("{}/mosaic_e2e_bom_physical_line.mosaic", dir.display());
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        &input,
+        "-o",
+        &out,
+        "--schema",
+        &schema,
+        "--header",
+        "value",
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("at line 2"), "{err}");
+}
+
+#[test]
 fn convert_csv_multiple_inputs_merge_fields_by_name() {
     let dir = std::env::temp_dir();
     let first = format!("{}/mosaic_e2e_multi_order_first.csv", dir.display());
@@ -2212,6 +2480,59 @@ fn convert_json_projection_ignores_unselected_type_conflicts() {
     assert_eq!(rows.lines().count(), 2, "{rows}");
     assert!(rows.contains(r#"{"id":1}"#), "{rows}");
     assert!(rows.contains(r#"{"id":2}"#), "{rows}");
+}
+
+#[test]
+fn convert_json_projection_ignores_unselected_out_of_range_number() {
+    let dir = std::env::temp_dir();
+    let js = format!(
+        "{}/mosaic_e2e_json_project_out_of_range.json",
+        dir.display()
+    );
+    std::fs::write(&js, "{\"id\":1,\"drop\":1e400}\n").unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_json_project_out_of_range.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&["convert", &js, "-o", &out, "-c", "id", "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows.trim(), r#"{"id":1}"#);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn convert_json_wide_schema_bounds_both_decoder_routes() {
+    let dir = std::env::temp_dir();
+    for (case, avro_type, value) in [("direct", "string", r#""x""#), ("validated", "long", "1")] {
+        let fields = (0..12_000)
+            .map(|i| format!(r#"{{"name":"f{i}","type":["null","{avro_type}"]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema = format!("{}/mosaic_e2e_wide_json_{case}.avsc", dir.display());
+        std::fs::write(
+            &schema,
+            format!(r#"{{"type":"record","name":"T","fields":[{fields}]}}"#),
+        )
+        .unwrap();
+        let json = format!("{}/mosaic_e2e_wide_json_{case}.jsonl", dir.display());
+        std::fs::write(&json, format!(r#"{{"f0":{value}}}"#) + "\n").unwrap();
+        let out = format!("{}/mosaic_e2e_wide_json_{case}.mosaic", dir.display());
+        let (stdout, stderr, ok) = run_with_virtual_memory_limit(
+            &[
+                "convert",
+                &json,
+                "-o",
+                &out,
+                "--schema",
+                &schema,
+                "--overwrite",
+            ],
+            256 * 1024,
+        );
+        assert!(ok, "{case}: stdout: {stdout}\nstderr: {stderr}");
+    }
 }
 
 #[test]
@@ -2873,6 +3194,67 @@ fn convert_json_supports_avro_array_and_map_schema() {
     assert!(ok, "stdout: {rows}\nstderr: {err}");
     assert!(rows.contains(r#""tags":["a",null,"b"]"#), "{rows}");
     assert!(rows.contains(r#""props":{"x":[1,2],"y":[]}"#), "{rows}");
+}
+
+#[test]
+fn convert_json_enforces_avro_map_value_nullability() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_avro_required_map_value.json", dir.display());
+    std::fs::write(&js, "{\"props\":{\"x\":1,\"y\":null}}\n").unwrap();
+    let schema = format!("{}/mosaic_e2e_avro_required_map_value.avsc", dir.display());
+    std::fs::write(
+        &schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "props", "type": {"type": "map", "values": "long"}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let out = format!(
+        "{}/mosaic_e2e_avro_required_map_value.mosaic",
+        dir.display()
+    );
+    let _ = std::fs::remove_file(&out);
+
+    let (_, err, ok) = run(&["convert", &js, "-o", &out, "--schema", &schema]);
+    assert!(!ok, "conversion unexpectedly succeeded");
+    assert!(err.contains("props{}"), "{err}");
+    assert!(err.contains("cannot be null"), "{err}");
+    assert!(err.contains("record 1"), "{err}");
+    assert!(!std::path::Path::new(&out).exists());
+
+    let nullable_schema = format!("{}/mosaic_e2e_avro_nullable_map_value.avsc", dir.display());
+    std::fs::write(
+        &nullable_schema,
+        r#"{
+  "type": "record",
+  "name": "T",
+  "fields": [
+    {"name": "props", "type": {"type": "map", "values": ["null", "long"]}}
+  ]
+}"#,
+    )
+    .unwrap();
+    let nullable_out = format!(
+        "{}/mosaic_e2e_avro_nullable_map_value.mosaic",
+        dir.display()
+    );
+    let (msg, err, ok) = run(&[
+        "convert",
+        &js,
+        "-o",
+        &nullable_out,
+        "--schema",
+        &nullable_schema,
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &nullable_out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert!(rows.contains(r#""props":{"x":1,"y":null}"#), "{rows}");
 }
 
 #[test]
