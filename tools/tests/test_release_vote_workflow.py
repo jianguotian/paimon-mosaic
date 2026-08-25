@@ -74,7 +74,7 @@ def test_release_has_inline_tag_only_preflight() -> None:
     triggers = workflow["on"]
     assert "workflow_dispatch" in triggers
     version_step = release_version_step(workflow)
-    assert "github.event_name == 'push'" in version_step["if"]
+    assert version_step["if"] == "startsWith(github.ref, 'refs/tags/')"
     assert "github.ref_name" in version_step["run"]
 
 
@@ -115,6 +115,7 @@ def test_source_release_documentation_passes_rc_tag_explicitly() -> None:
     workflow = load_workflow(GATE_WORKFLOW)
     for event in ("pull_request", "push"):
         assert "docs/creating-a-release.html" in workflow["on"][event]["paths"]
+    assert "Cargo path dependency constraints and Cargo.lock" in source
 
 
 def test_release_vote_gate_runs_only_the_pr_a_checks() -> None:
@@ -129,12 +130,14 @@ def test_release_vote_gate_runs_only_the_pr_a_checks() -> None:
     for test_file in (
         "tools/tests/test_create_source_release.py",
         "tools/tests/test_release_vote_workflow.py",
+        "tools/tests/test_update_branch_version.py",
         "tools/tests/test_verify_release_versions.py",
         "tools/tests/test_verify_source_archive.py",
     ):
         assert test_file in combined_runs
     assert "compileall" in combined_runs
     assert "bash -n tools/create_source_release.sh" in combined_runs
+    assert "bash -n tools/update_branch_version.sh" in combined_runs
     assert "git diff --check" in combined_runs
     assert "GITHUB_BASE_REF" in combined_runs
     assert "HEAD^" in combined_runs

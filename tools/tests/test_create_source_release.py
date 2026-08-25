@@ -279,6 +279,32 @@ def test_rejects_dirty_worktree(
     assert "clean Git worktree" in output(result)
 
 
+def test_rejects_dirty_intended_worktree_with_foreign_git_environment(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    repo, env, _ = initialize_release_repo(
+        tmp_path / "intended",
+        signing_home,
+    )
+    foreign_repo, _, _ = initialize_release_repo(
+        tmp_path / "foreign",
+        signing_home,
+    )
+    write(repo / "README.md", "dirty intended worktree\n")
+    env.update(
+        {
+            "GIT_DIR": str(foreign_repo / ".git"),
+            "GIT_WORK_TREE": str(foreign_repo),
+        }
+    )
+
+    result = run_script(repo, env)
+
+    assert result.returncode != 0
+    assert "clean Git worktree" in output(result)
+
+
 def test_existing_artifact_is_not_overwritten(
     tmp_path: Path,
     signing_home: tuple[Path, str],
@@ -347,14 +373,24 @@ def test_signed_tag_with_cross_component_version_mismatch_is_rejected(
     assert not (repo / "tools/release").exists()
 
 
-def test_unsigned_tag_is_rejected(
+def test_unsigned_tag_with_pgp_armor_text_is_rejected(
     tmp_path: Path,
     signing_home: tuple[Path, str],
 ) -> None:
     repo, env, _ = initialize_release_repo(tmp_path, signing_home)
     env["RC_TAG"] = f"v{VERSION}-rc2"
     run(
-        ["git", "tag", "-a", "-m", "unsigned release candidate", env["RC_TAG"]],
+        [
+            "git",
+            "tag",
+            "-a",
+            "-m",
+            "unsigned release candidate\n\n"
+            "-----BEGIN PGP SIGNATURE-----\n"
+            "not a signature\n"
+            "-----END PGP SIGNATURE-----",
+            env["RC_TAG"],
+        ],
         cwd=repo,
     )
 

@@ -38,10 +38,16 @@ import verify_source_archive as verifier  # noqa: E402
 PREFIX = "paimon-mosaic-0.3.0/"
 
 
-def run(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[bytes]:
+def run(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         command,
         cwd=cwd,
+        env=env,
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -161,6 +167,45 @@ def test_create_and_verify_uses_one_git_archive_and_raw_git_objects(
     assert f"{PREFIX}nested/project.iml" not in names
     assert f"{PREFIX}nested/.DS_Store" not in names
     assert f"{PREFIX}deploysettings.xml" not in names
+
+
+def test_repository_argument_overrides_foreign_git_environment(
+    tmp_path: Path,
+) -> None:
+    intended_root = tmp_path / "intended"
+    intended_root.mkdir()
+    intended_repo, intended_commit = initialize_repo(intended_root)
+    foreign_root = tmp_path / "foreign"
+    foreign_root.mkdir()
+    foreign_repo, _ = initialize_repo(foreign_root)
+    write(intended_repo / "README.md", "intended repository contents\n")
+    intended_commit = commit(intended_repo, "distinguish intended repository")
+    archive = tmp_path / "source.tgz"
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_DIR": str(foreign_repo / ".git"),
+            "GIT_WORK_TREE": str(foreign_repo),
+        }
+    )
+    command = [
+        sys.executable,
+        str(TOOLS / "verify_source_archive.py"),
+        "create",
+        "--repository",
+        str(intended_repo),
+        "--commit",
+        intended_commit,
+        "--prefix",
+        PREFIX,
+        "--output",
+        str(archive),
+    ]
+
+    run(command, cwd=tmp_path, env=env)
+    command[2] = "verify"
+    command[-2:] = ["--archive", str(archive)]
+    run(command, cwd=tmp_path, env=env)
 
 
 def test_committed_export_ignore_is_reported_as_missing(tmp_path: Path) -> None:
