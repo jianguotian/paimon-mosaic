@@ -63,7 +63,9 @@ jobs:
 
       - name: Verify tag and component versions
         if: startsWith(github.ref, 'refs/tags/')
-        run: python3 tools/verify_release_versions.py "${{ github.ref_name }}" --verify-signature
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: python3 tools/verify_release_versions.py "${TAG_NAME}" --verify-signature
 
       - name: Verify source archive
         if: startsWith(github.ref, 'refs/tags/')

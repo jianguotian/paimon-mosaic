@@ -27,10 +27,36 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 GATE_WORKFLOW = ROOT / ".github/workflows/release-vote-gate.yml"
+RUST_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-rust.yml"
+JAVA_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-java.yml"
+PYTHON_PUBLISH_WORKFLOW = ROOT / ".github/workflows/release-python-publish.yml"
 RELEASE_DOCUMENTATION = ROOT / "docs/creating-a-release.html"
 TAG_CONDITION = "startsWith(github.ref, 'refs/tags/')"
+RUST_PUBLISH_CONDITION = (
+    "github.event_name != 'workflow_dispatch' && "
+    "github.repository == 'apache/paimon-mosaic' && "
+    "startsWith(github.ref, 'refs/tags/') && "
+    "!contains(github.ref_name, '-')"
+)
+JAVA_DEPLOY_CONDITION = (
+    "github.event_name != 'workflow_dispatch' && "
+    "github.repository == 'apache/paimon-mosaic' && "
+    "startsWith(github.ref, 'refs/tags/') && "
+    "contains(github.ref_name, '-rc')"
+)
+PYTHON_TEST_PUBLISH_CONDITION = (
+    "github.event_name != 'workflow_dispatch' && "
+    "contains(github.ref_name, '-rc')"
+)
+PYTHON_PUBLISH_CONDITION = (
+    "github.event_name != 'workflow_dispatch' && "
+    "!contains(github.ref_name, '-')"
+)
 REQUIRED_GATE_PATHS = {
     ".github/workflows/release-vote-gate.yml",
+    ".github/workflows/release-java.yml",
+    ".github/workflows/release-python-publish.yml",
+    ".github/workflows/release-rust.yml",
     ".github/workflows/release.yml",
     "docs/creating-a-release.html",
     "tools/create_source_release.sh",
@@ -57,7 +83,7 @@ fi
 printf '%s' "${GPG_SECRET_KEY}" | gpg --batch --import
 """
 VERIFY_RELEASE_COMMAND = (
-    'python3 tools/verify_release_versions.py "${{ github.ref_name }}" '
+    'python3 tools/verify_release_versions.py "${TAG_NAME}" '
     "--verify-signature"
 )
 VERIFY_SOURCE_ARCHIVE_COMMAND = """set -euo pipefail
@@ -190,6 +216,9 @@ def assert_release_contract(workflow: dict) -> None:
 
     version_step = release_version_step(workflow)
     assert version_step["if"] == TAG_CONDITION
+    assert version_step["env"] == {
+        "TAG_NAME": "${{ github.ref_name }}",
+    }
     assert version_step["run"] == VERIFY_RELEASE_COMMAND
 
     source_step = named_step(workflow, "Verify source archive")
@@ -223,7 +252,69 @@ def test_release_has_signed_exact_tag_preflight() -> None:
     assert "workflow_dispatch" in triggers
     version_step = release_version_step(workflow)
     assert version_step["if"] == TAG_CONDITION
-    assert "github.ref_name" in version_step["run"]
+    assert "github.ref_name" in version_step["env"]["TAG_NAME"]
+    assert "github.ref_name" not in version_step["run"]
+
+
+def test_release_tag_context_is_not_interpolated_into_shell() -> None:
+    workflow = load_workflow(RELEASE_WORKFLOW)
+    version_step = release_version_step(workflow)
+
+    assert version_step["env"] == {
+        "TAG_NAME": "${{ github.ref_name }}",
+    }
+    assert version_step["run"] == VERIFY_RELEASE_COMMAND
+    assert "${{ github.ref_name }}" not in version_step["run"]
+
+
+def test_manual_rust_dispatch_cannot_publish() -> None:
+    workflow = load_workflow(RUST_RELEASE_WORKFLOW)
+    publish_steps = [
+        step
+        for step in workflow["jobs"]["publish"]["steps"]
+        if step.get("name") == "Publish paimon-mosaic-core to crates.io"
+    ]
+
+    assert len(publish_steps) == 1
+    assert publish_steps[0]["if"] == RUST_PUBLISH_CONDITION
+
+
+def test_manual_java_dispatch_cannot_deploy_staging() -> None:
+    workflow = load_workflow(JAVA_RELEASE_WORKFLOW)
+    deploy_job = workflow["jobs"]["deploy-staging"]
+
+    assert deploy_job["if"] == JAVA_DEPLOY_CONDITION
+
+
+def test_manual_release_dispatch_cannot_publish_python() -> None:
+    workflow = load_workflow(PYTHON_PUBLISH_WORKFLOW)
+    steps = workflow["jobs"]["publish"]["steps"]
+    test_publish = [
+        step for step in steps if step.get("name") == "Publish to TestPyPI"
+    ]
+    final_publish = [
+        step for step in steps if step.get("name") == "Publish to PyPI"
+    ]
+
+    assert len(test_publish) == 1
+    assert len(final_publish) == 1
+    assert test_publish[0]["if"] == PYTHON_TEST_PUBLISH_CONDITION
+    assert final_publish[0]["if"] == PYTHON_PUBLISH_CONDITION
+
+
+def test_java_release_tag_context_is_not_interpolated_into_shell() -> None:
+    workflow = load_workflow(JAVA_RELEASE_WORKFLOW)
+    deploy_steps = [
+        step
+        for step in workflow["jobs"]["deploy-staging"]["steps"]
+        if step.get("name") == "Deploy to Apache Nexus staging"
+    ]
+
+    assert len(deploy_steps) == 1
+    deploy_step = deploy_steps[0]
+    assert deploy_step["env"]["TAG_NAME"] == "${{ github.ref_name }}"
+    assert 'REF="${TAG_NAME}"' in deploy_step["run"]
+    assert "${{ github.ref_name }}" not in deploy_step["run"]
 
 
 @pytest.mark.parametrize("job_name", ("rust", "java", "python-wheels"))
@@ -331,7 +422,7 @@ def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
         checkout["with"]["ref"] = "main"
     elif mutation == "missing-signature-verification":
         release_version_step(workflow)["run"] = (
-            'python3 tools/verify_release_versions.py "${{ github.ref_name }}"'
+            'python3 tools/verify_release_versions.py "${TAG_NAME}"'
         )
     elif mutation == "masked-key-import":
         named_step(workflow, "Import release signing key")["run"] += " || true"

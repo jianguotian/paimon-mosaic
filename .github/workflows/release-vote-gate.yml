@@ -22,6 +22,9 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/release-vote-gate.yml"
+      - ".github/workflows/release-java.yml"
+      - ".github/workflows/release-python-publish.yml"
+      - ".github/workflows/release-rust.yml"
       - ".github/workflows/release.yml"
       - "docs/creating-a-release.html"
       - "tools/create_source_release.sh"
@@ -37,6 +40,9 @@ on:
     branches: [main, "release-*"]
     paths:
       - ".github/workflows/release-vote-gate.yml"
+      - ".github/workflows/release-java.yml"
+      - ".github/workflows/release-python-publish.yml"
+      - ".github/workflows/release-rust.yml"
       - ".github/workflows/release.yml"
       - "docs/creating-a-release.html"
       - "tools/create_source_release.sh"

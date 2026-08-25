@@ -32,8 +32,10 @@ import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parent.parent
+CANONICAL_NUMBER = r"(?:0|[1-9][0-9]*)"
 RELEASE_TAG = re.compile(
-    r"^v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)(?:-rc[0-9]+)?$"
+    rf"^v(?P<version>{CANONICAL_NUMBER}\.{CANONICAL_NUMBER}\."
+    rf"{CANONICAL_NUMBER})(?:-rc{CANONICAL_NUMBER})?$"
 )
 
 

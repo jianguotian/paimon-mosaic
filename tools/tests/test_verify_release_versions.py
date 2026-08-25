@@ -543,6 +543,20 @@ def test_rejects_non_release_tag(tag: str, tmp_path: Path) -> None:
         verifier.verify_release_versions(root, tag)
 
 
+@pytest.mark.parametrize(
+    "tag",
+    (
+        "v01.2.3",
+        "v1.02.3",
+        "v1.2.03",
+        "v1.2.3-rc01",
+    ),
+)
+def test_rejects_noncanonical_release_tag_numbers(tag: str) -> None:
+    with pytest.raises(ValueError, match="invalid release tag"):
+        verifier.release_version(tag)
+
+
 def test_cli_is_read_only_and_reports_mismatches(tmp_path: Path) -> None:
     root = initialize_versions(tmp_path)
     pom = root / "java/pom.xml"
