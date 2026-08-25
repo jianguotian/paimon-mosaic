@@ -138,7 +138,7 @@ enum Cmd {
         /// Input JSON data file (.json/.ndjson/.jsonl).
         input: PathBuf,
         /// Output .mosaic path.
-        #[arg(short = 'o', long = "output")]
+        #[arg(short = 'o', long = "output", visible_alias = "out")]
         out: PathBuf,
         /// Columns to keep; each occurrence accepts a comma-separated list.
         #[arg(short = 'c', long = "column")]

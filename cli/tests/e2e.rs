@@ -683,6 +683,13 @@ fn convert_csv_stats_enables_where_pushdown() {
         "--overwrite",
     ]);
     assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (meta, err, ok) = run(&["meta", &out, "--json"]);
+    assert!(ok, "stdout: {meta}\nstderr: {err}");
+    let meta: serde_json::Value = serde_json::from_str(meta.trim()).unwrap();
+    let stats = &meta["row_groups"][0]["stats"][0];
+    assert_eq!(stats["column"], "id");
+    assert_eq!(stats["min"], "1");
+    assert_eq!(stats["max"], "3");
     let (none, _, _) = run(&["cat", &out, "--where", "id>100"]);
     assert!(none.contains("(no rows)"), "{none}");
     let (keep, _, _) = run(&["cat", &out, "--where", "id>=3", "--json"]);
@@ -697,6 +704,13 @@ fn convert_json_supports_stats() {
     let out = format!("{}/mosaic_e2e_json_stats.mosaic", dir.display());
     let (msg, err, ok) = run(&["convert", &js, "-o", &out, "--stats", "id", "--overwrite"]);
     assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (meta, err, ok) = run(&["meta", &out, "--json"]);
+    assert!(ok, "stdout: {meta}\nstderr: {err}");
+    let meta: serde_json::Value = serde_json::from_str(meta.trim()).unwrap();
+    let stats = &meta["row_groups"][0]["stats"][0];
+    assert_eq!(stats["column"], "id");
+    assert_eq!(stats["min"], "1");
+    assert_eq!(stats["max"], "2");
     let (none, _, _) = run(&["cat", &out, "--where", "id>100"]);
     assert!(none.contains("(no rows)"), "{none}");
 }
@@ -903,6 +917,20 @@ fn convert_rejects_csv_input() {
     let (_, err, ok) = run(&["convert", &csv, "-o", &out, "--overwrite"]);
     assert!(!ok);
     assert!(err.contains("use convert-csv for CSV data"), "{err}");
+}
+
+#[test]
+fn convert_keeps_out_long_option_alias() {
+    let dir = std::env::temp_dir();
+    let js = format!("{}/mosaic_e2e_convert_out_alias.json", dir.display());
+    std::fs::write(&js, "{\"id\":1}\n").unwrap();
+    let out = format!("{}/mosaic_e2e_convert_out_alias.mosaic", dir.display());
+    let _ = std::fs::remove_file(&out);
+    let (msg, err, ok) = run(&["convert", &js, "--out", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (count, err, ok) = run(&["count", &out]);
+    assert!(ok, "stdout: {count}\nstderr: {err}");
+    assert_eq!(count.trim(), "1");
 }
 
 #[test]
