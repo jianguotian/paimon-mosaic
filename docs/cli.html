@@ -174,7 +174,7 @@ row group 0: 3 entries
 200</code></pre>
 
             <h2>convert</h2>
-            <p>Import a JSON data file (<code>.json</code>/<code>.ndjson</code>/<code>.jsonl</code>, one object per line) into a new Mosaic file with a schema inferred from the complete input. <code>-c</code>/<code>--column</code> projects top-level fields before inference; each occurrence accepts a comma-separated list. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
+            <p>Import a regular JSON data file (<code>.json</code>/<code>.ndjson</code>/<code>.jsonl</code>, one object per line) into a new Mosaic file with a schema inferred from the complete input. FIFOs and devices are rejected because inference and conversion read the input separately. <code>-c</code>/<code>--column</code> projects top-level fields before inference; each occurrence accepts a comma-separated list. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
 <pre><code><span class="cmt">$ mosaic convert data.ndjson -o data.mosaic --stats id</span>
 wrote data.mosaic (200 rows, 5 columns)
 <span class="cmt">$ mosaic convert data.json -o projected.mosaic -c id,kind</span>

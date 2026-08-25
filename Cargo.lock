@@ -886,6 +886,7 @@ dependencies = [
  "arrow",
  "clap",
  "csv",
+ "libc",
  "paimon-mosaic-core",
  "serde",
  "serde_json",

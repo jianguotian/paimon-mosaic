@@ -101,6 +101,8 @@ $ mosaic head data.mosaic --json
 Import a JSON data file (`.json`/`.ndjson`/`.jsonl`, one object per line) into
 a new Mosaic file; the schema is inferred from the complete input. A field
 with no non-null value cannot be inferred and is reported as an error.
+Inferred conversion requires a regular file because schema inference and
+conversion read the input separately; FIFOs and devices are rejected.
 An existing output is kept unless `--overwrite` is given.
 Use `-c`/`--column` to project top-level fields; each occurrence accepts a
 comma-separated list, and unselected fields do not participate in inference.

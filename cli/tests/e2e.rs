@@ -679,6 +679,41 @@ fn convert_csv_rejects_non_regular_inferred_input_without_opening_it() {
     assert!(!std::path::Path::new(&out).exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn convert_json_projection_rejects_non_regular_input_without_opening_it() {
+    let dir = unique_temp_dir("json_projection_fifo");
+    let fifo = dir.join("input.jsonl");
+    let out = dir.join("out.mosaic");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let output = std::process::Command::new("timeout")
+        .args([
+            "5",
+            env!("CARGO_BIN_EXE_mosaic"),
+            "convert",
+            fifo.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "-c",
+            "id",
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "conversion blocked on FIFO"
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("requires a regular file"), "{err}");
+    assert!(!out.exists());
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
+}
+
 #[test]
 fn convert_csv_all_null_column_falls_back_to_utf8() {
     let csv = format!(
@@ -1289,6 +1324,98 @@ fn convert_json_projection_ignores_unselected_out_of_range_number() {
     let (rows, err, ok) = run(&["cat", &out, "--json"]);
     assert!(ok, "stdout: {rows}\nstderr: {err}");
     assert_eq!(rows.trim(), r#"{"id":1}"#);
+}
+
+#[test]
+fn convert_json_projection_rejects_lossy_integer_float_promotion() {
+    let dir = unique_temp_dir("json_project_lossy_float");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\"v\":1.5}\n{\"v\":9007199254740993}\n").unwrap();
+    let out = dir.join("out.mosaic");
+    let (_, err, ok) = run(&[
+        "convert",
+        js.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-c",
+        "v",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("'v'"), "{err}");
+    assert!(
+        err.contains("cannot be represented exactly as Float64"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
+}
+
+#[test]
+fn convert_json_projection_rejects_out_of_u64_lossy_integer_float_promotion() {
+    let dir = unique_temp_dir("json_project_out_of_u64_lossy_float");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\"v\":1.5}\n{\"v\":18446744073709551617}\n").unwrap();
+    let out = dir.join("out.mosaic");
+    let (_, err, ok) = run(&[
+        "convert",
+        js.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-c",
+        "v",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("'v'"), "{err}");
+    assert!(
+        err.contains("cannot be represented exactly as Float64"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
+}
+
+#[test]
+fn convert_json_projection_allows_exact_out_of_i64_integer_float_promotion() {
+    let dir = unique_temp_dir("json_project_exact_out_of_i64_float");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\"v\":1.5}\n{\"v\":18446744073709551616}\n").unwrap();
+    let out = dir.join("out.mosaic");
+    let (msg, err, ok) = run(&[
+        "convert",
+        js.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-c",
+        "v",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", out.to_str().unwrap(), "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows, "{\"v\":1.5}\n{\"v\":1.8446744073709552e19}\n");
+}
+
+#[test]
+fn convert_json_projection_rejects_nested_lossy_integer_float_promotion() {
+    let dir = unique_temp_dir("json_project_nested_lossy_float");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\"v\":[1.5,9007199254740993]}\n").unwrap();
+    let out = dir.join("out.mosaic");
+    let (_, err, ok) = run(&[
+        "convert",
+        js.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-c",
+        "v",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("'v[]'"), "{err}");
+    assert!(
+        err.contains("cannot be represented exactly as Float64"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
 }
 
 #[test]

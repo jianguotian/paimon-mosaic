@@ -525,6 +525,7 @@ fn convert(
     }
     let columns = parse_convert_columns(columns)?;
     ensure_can_write(out, overwrite)?;
+    ensure_regular_inferred_input(input, "JSON")?;
     let open =
         || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
     let schema = if columns.is_empty() {
@@ -575,13 +576,7 @@ fn convert_csv(
     }
     ensure_can_write(out, overwrite)?;
     for input in inputs {
-        let metadata = std::fs::metadata(input)?;
-        if !metadata.file_type().is_file() {
-            return Err(invalid_schema(format!(
-                "CSV schema inference requires a regular file: {}",
-                input.display()
-            )));
-        }
+        ensure_regular_inferred_input(input, "CSV")?;
     }
     use arrow::error::ArrowError;
     let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
@@ -704,18 +699,104 @@ fn install_mosaic_output(tmp: &Path, out: &Path, overwrite: bool) -> std::io::Re
         }
         return std::fs::rename(tmp, out);
     }
+    install_mosaic_output_no_replace(
+        tmp,
+        out,
+        |from, to| std::fs::hard_link(from, to),
+        rename_no_replace,
+    )
+}
 
-    // Both paths are siblings, so a hard link provides an atomic no-replace
-    // install on the same filesystem. Removing the temporary name afterwards
-    // leaves the completed output visible under only its requested path.
-    std::fs::hard_link(tmp, out).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            output_exists_error(out)
-        } else {
-            error
+fn install_mosaic_output_no_replace<H, R>(
+    tmp: &Path,
+    out: &Path,
+    hard_link: H,
+    rename_no_replace: R,
+) -> std::io::Result<()>
+where
+    H: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    // Both paths are siblings. Prefer a hard link for a portable atomic
+    // no-replace install, but filesystems such as VFAT do not support links;
+    // use the platform's no-replace rename there.
+    match hard_link(tmp, out) {
+        Ok(()) => std::fs::remove_file(tmp),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(output_exists_error(out))
         }
-    })?;
-    std::fs::remove_file(tmp)
+        Err(hard_link_error) => match rename_no_replace(tmp, out) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(output_exists_error(out))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Err(hard_link_error),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both CStrings are NUL-terminated and remain alive for the
+    // duration of the syscall; renameat2 does not retain their pointers.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both CStrings are NUL-terminated and remain alive for the
+    // duration of renamex_np, which does not retain their pointers.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    // std::fs::rename does not replace an existing destination on Windows.
+    std::fs::rename(from, to)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
+fn rename_no_replace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 fn project_convert_schema(schema: Schema, columns: &[String]) -> std::io::Result<Schema> {
@@ -766,6 +847,7 @@ fn infer_projected_json_schema<R: std::io::Read>(
     use arrow::error::ArrowError;
 
     let columns = columns.iter().map(String::as_str).collect();
+    let mut inexact_f64_integer_paths = std::collections::BTreeSet::new();
     // Keep each root value raw so unselected fields are skipped before
     // serde_json materializes values that cannot be represented as f64.
     let values = serde_json::Deserializer::from_reader(reader)
@@ -773,11 +855,137 @@ fn infer_projected_json_schema<R: std::io::Read>(
         .map(|raw| {
             let raw = raw.map_err(|e| ArrowError::JsonError(e.to_string()))?;
             let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-            ProjectedJsonRecordSeed { columns: &columns }
+            let projected = ProjectedJsonRecordSeed { columns: &columns }
                 .deserialize(&mut deserializer)
-                .map_err(|e| ArrowError::JsonError(e.to_string()))
+                .map_err(|e| ArrowError::JsonError(e.to_string()))?;
+            collect_inexact_f64_integer_paths(
+                &projected,
+                &mut Vec::new(),
+                &mut inexact_f64_integer_paths,
+            );
+            Ok(projected)
         });
-    arrow::json::reader::infer_json_schema_from_iterator(values)
+    let schema = arrow::json::reader::infer_json_schema_from_iterator(values)?;
+    // Integer tokens are only lossy when inference promotes their exact path
+    // to Float64; sibling struct fields can retain independent Int64 types.
+    if let Some(path) = inexact_f64_integer_paths
+        .iter()
+        .find(|path| matches!(json_path_data_type(&schema, path), Some(DataType::Float64)))
+    {
+        return Err(ArrowError::JsonError(format!(
+            "numeric value in JSON field '{}' cannot be represented exactly as Float64",
+            fmt::safe(&format_json_number_path(path))
+        )));
+    }
+    Ok(schema)
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+enum JsonNumberPathSegment {
+    Field(String),
+    Element,
+}
+
+fn collect_inexact_f64_integer_paths(
+    value: &Value,
+    path: &mut Vec<JsonNumberPathSegment>,
+    inexact: &mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+) {
+    match value {
+        Value::Object(record) => {
+            for (name, value) in record {
+                path.push(JsonNumberPathSegment::Field(name.clone()));
+                collect_inexact_f64_integer_paths(value, path, inexact);
+                path.pop();
+            }
+        }
+        Value::Array(values) => {
+            path.push(JsonNumberPathSegment::Element);
+            for value in values {
+                collect_inexact_f64_integer_paths(value, path, inexact);
+            }
+            path.pop();
+        }
+        Value::Number(number) if is_inexact_f64_integer(number) => {
+            inexact.insert(path.clone());
+        }
+        _ => {}
+    }
+}
+
+fn is_inexact_f64_integer(number: &serde_json::Number) -> bool {
+    if let Some(exact) = number.as_i128() {
+        return number
+            .as_f64()
+            .and_then(exact_i128_from_f64)
+            .is_none_or(|promoted| promoted != exact);
+    }
+
+    // arbitrary_precision keeps integer tokens outside i128 as decimal text.
+    // Fixed-point formatting recovers the exact integer represented by f64,
+    // including large powers of two, without conservatively rejecting them.
+    let literal = number.as_str();
+    if literal
+        .bytes()
+        .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
+    {
+        return false;
+    }
+    number
+        .as_f64()
+        .is_none_or(|promoted| format!("{promoted:.0}") != literal)
+}
+
+fn json_path_data_type<'a>(
+    schema: &'a Schema,
+    path: &[JsonNumberPathSegment],
+) -> Option<&'a DataType> {
+    let (JsonNumberPathSegment::Field(name), rest) = path.split_first()? else {
+        return None;
+    };
+    let field = schema.fields().iter().find(|field| field.name() == name)?;
+    nested_json_path_data_type(field.data_type(), rest)
+}
+
+fn nested_json_path_data_type<'a>(
+    data_type: &'a DataType,
+    path: &[JsonNumberPathSegment],
+) -> Option<&'a DataType> {
+    let Some((segment, rest)) = path.split_first() else {
+        return Some(data_type);
+    };
+    let nested = match (segment, data_type) {
+        (JsonNumberPathSegment::Field(name), DataType::Struct(fields)) => fields
+            .iter()
+            .find(|field| field.name() == name)?
+            .data_type(),
+        (
+            JsonNumberPathSegment::Element,
+            DataType::List(field)
+            | DataType::ListView(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::LargeList(field)
+            | DataType::LargeListView(field),
+        ) => field.data_type(),
+        _ => return None,
+    };
+    nested_json_path_data_type(nested, rest)
+}
+
+fn format_json_number_path(path: &[JsonNumberPathSegment]) -> String {
+    let mut formatted = String::new();
+    for segment in path {
+        match segment {
+            JsonNumberPathSegment::Field(name) => {
+                if !formatted.is_empty() {
+                    formatted.push('.');
+                }
+                formatted.push_str(name);
+            }
+            JsonNumberPathSegment::Element => formatted.push_str("[]"),
+        }
+    }
+    formatted
 }
 
 struct ProjectedJsonRecordSeed<'a> {
@@ -849,6 +1057,18 @@ fn is_json_input(input: &Path) -> bool {
                 "json" | "ndjson" | "jsonl"
             )
         })
+}
+
+fn ensure_regular_inferred_input(input: &Path, format: &str) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(input)?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(invalid_schema(format!(
+            "{format} schema inference requires a regular file: {}",
+            input.display()
+        )))
+    }
 }
 
 fn ensure_can_write(out: &Path, overwrite: bool) -> std::io::Result<()> {
@@ -1849,4 +2069,84 @@ fn buckets(file: &Path, json: bool) -> std::io::Result<()> {
         println!("{}", jsonout::line(&jsonout::Buckets { row_groups: rgs }));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    #[test]
+    fn no_replace_install_falls_back_when_hard_links_are_unsupported() {
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_install_fallback_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let tmp = dir.join("out.tmp");
+        let out = dir.join("out.mosaic");
+        std::fs::write(&tmp, b"complete").unwrap();
+
+        install_mosaic_output_no_replace(
+            &tmp,
+            &out,
+            |_, _| {
+                // Linux VFAT reports EPERM (PermissionDenied) for hard links.
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "hard links unsupported",
+                ))
+            },
+            rename_no_replace,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&out).unwrap(), b"complete");
+        assert!(!tmp.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[test]
+    fn no_replace_fallback_preserves_an_existing_output() {
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_install_no_clobber_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let tmp = dir.join("out.tmp");
+        let out = dir.join("out.mosaic");
+        std::fs::write(&tmp, b"complete").unwrap();
+        std::fs::write(&out, b"sentinel").unwrap();
+
+        let error = install_mosaic_output_no_replace(
+            &tmp,
+            &out,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "hard links unsupported",
+                ))
+            },
+            rename_no_replace,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&out).unwrap(), b"sentinel");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"complete");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
