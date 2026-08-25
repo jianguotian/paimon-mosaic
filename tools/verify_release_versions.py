@@ -71,15 +71,31 @@ def verify_release_tag(root: Path, tag: str) -> str:
     if run_git(root, "cat-file", "-t", tag) != "tag":
         raise ValueError(f"{tag} is not an annotated release tag")
 
+    tag_object = run_git(root, "rev-parse", "--verify", f"{tag}^{{tag}}")
+    tag_headers = run_git(root, "cat-file", "tag", tag_object).partition("\n\n")[0]
+    embedded_names = [
+        line.removeprefix("tag ")
+        for line in tag_headers.splitlines()
+        if line.startswith("tag ")
+    ]
+    if embedded_names != [tag]:
+        found = ", ".join(embedded_names) if embedded_names else "<missing>"
+        raise ValueError(f"signed tag object names {found}, not {tag}")
+
     head_commit = run_git(root, "rev-parse", "--verify", "HEAD^{commit}")
-    tag_commit = run_git(root, "rev-parse", "--verify", f"{tag}^{{commit}}")
+    tag_commit = run_git(
+        root,
+        "rev-parse",
+        "--verify",
+        f"{tag_object}^{{commit}}",
+    )
     if tag_commit != head_commit:
         raise ValueError(
             f"{tag} resolves to {tag_commit}, not current HEAD {head_commit}"
         )
 
     result = subprocess.run(
-        ["git", "-C", str(root), "verify-tag", tag],
+        ["git", "-C", str(root), "verify-tag", tag_object],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -92,13 +108,7 @@ def verify_release_tag(root: Path, tag: str) -> str:
     return tag_commit
 
 
-def workspace_manifests(root: Path, workspace: dict) -> list[Path]:
-    members = workspace.get("members")
-    if not isinstance(members, list) or not all(
-        isinstance(member, str) for member in members
-    ):
-        raise ValueError("Cargo.toml [workspace].members must be a string list")
-
+def excluded_workspace_manifests(root: Path, workspace: dict) -> set[Path]:
     excluded = set()
     for pattern in workspace.get("exclude", []):
         if not isinstance(pattern, str):
@@ -107,6 +117,17 @@ def workspace_manifests(root: Path, workspace: dict) -> list[Path]:
             path = Path(match)
             manifest = path if path.name == "Cargo.toml" else path / "Cargo.toml"
             excluded.add(manifest.resolve())
+    return excluded
+
+
+def workspace_manifests(root: Path, workspace: dict) -> list[Path]:
+    members = workspace.get("members")
+    if not isinstance(members, list) or not all(
+        isinstance(member, str) for member in members
+    ):
+        raise ValueError("Cargo.toml [workspace].members must be a string list")
+
+    excluded = excluded_workspace_manifests(root, workspace)
     manifests = []
     for pattern in members:
         matches = [Path(path) for path in glob.glob(str(root / pattern))]
@@ -150,7 +171,7 @@ def rust_workspace_packages(root: Path) -> dict[str, tuple[str, Path]]:
         else None
     )
 
-    manifests = workspace_manifests(root, workspace)
+    manifests = discovered_workspace_manifests(root, workspace)
     if isinstance(root_manifest.get("package"), dict):
         manifests.append(root / "Cargo.toml")
 
@@ -180,6 +201,113 @@ def rust_workspace_packages(root: Path) -> dict[str, tuple[str, Path]]:
     return packages
 
 
+def dependency_tables(manifest: dict) -> list[dict]:
+    tables = []
+    for name in ("dependencies", "dev-dependencies", "build-dependencies"):
+        table = manifest.get(name)
+        if isinstance(table, dict):
+            tables.append(table)
+
+    targets = manifest.get("target")
+    if isinstance(targets, dict):
+        for target in targets.values():
+            if not isinstance(target, dict):
+                continue
+            for name in ("dependencies", "dev-dependencies", "build-dependencies"):
+                table = target.get(name)
+                if isinstance(table, dict):
+                    tables.append(table)
+
+    workspace = manifest.get("workspace")
+    if isinstance(workspace, dict):
+        table = workspace.get("dependencies")
+        if isinstance(table, dict):
+            tables.append(table)
+    return tables
+
+
+def discovered_workspace_manifests(root: Path, workspace: dict) -> list[Path]:
+    root = root.resolve()
+    excluded = excluded_workspace_manifests(root, workspace)
+    manifests = {manifest.resolve() for manifest in workspace_manifests(root, workspace)}
+    pending = [root / "Cargo.toml", *sorted(manifests)]
+    scanned = set()
+    while pending:
+        manifest = pending.pop()
+        if manifest in scanned:
+            continue
+        scanned.add(manifest)
+        for table in dependency_tables(load_toml(manifest)):
+            for dependency in table.values():
+                if not isinstance(dependency, dict):
+                    continue
+                path = dependency.get("path")
+                if not isinstance(path, str):
+                    continue
+                dependency_manifest = (manifest.parent / path).resolve()
+                if dependency_manifest.name != "Cargo.toml":
+                    dependency_manifest /= "Cargo.toml"
+                try:
+                    dependency_manifest.relative_to(root)
+                except ValueError:
+                    continue
+                if (
+                    dependency_manifest in excluded
+                    or not dependency_manifest.is_file()
+                    or dependency_manifest in manifests
+                ):
+                    continue
+                manifests.add(dependency_manifest)
+                pending.append(dependency_manifest)
+    return sorted(manifests)
+
+
+def workspace_path_dependency_failures(
+    root: Path,
+    packages: dict[str, tuple[str, Path]],
+) -> list[str]:
+    packages_by_manifest = {
+        (root / manifest).resolve(): (name, version)
+        for name, (version, manifest) in packages.items()
+    }
+    root_manifest = load_toml(root / "Cargo.toml")
+    workspace = root_manifest.get("workspace")
+    if not isinstance(workspace, dict):
+        raise ValueError("Cargo.toml has no [workspace] table")
+    manifests = {root / "Cargo.toml"}
+    manifests.update(discovered_workspace_manifests(root, workspace))
+
+    failures = []
+    for manifest in sorted(manifests):
+        source = load_toml(manifest)
+        for table in dependency_tables(source):
+            for dependency_name, dependency in table.items():
+                if not isinstance(dependency, dict):
+                    continue
+                path = dependency.get("path")
+                declared_version = dependency.get("version")
+                if not isinstance(path, str) or not isinstance(
+                    declared_version, str
+                ):
+                    continue
+                dependency_manifest = (manifest.parent / path).resolve()
+                if dependency_manifest.name != "Cargo.toml":
+                    dependency_manifest /= "Cargo.toml"
+                target = packages_by_manifest.get(dependency_manifest)
+                if target is None:
+                    continue
+                target_name, target_version = target
+                # The release updater rewrites canonical exact pins, so a
+                # merely compatible semver requirement is not sufficient.
+                if declared_version != target_version:
+                    failures.append(
+                        f"{manifest.relative_to(root)}: {dependency_name} "
+                        f"path dependency version is {declared_version!r}, "
+                        f"expected {target_version!r} for {target_name}"
+                    )
+    return failures
+
+
 def direct_java_version(root: Path) -> str:
     project = ET.parse(root / "java/pom.xml").getroot()
     namespace = ""
@@ -202,6 +330,7 @@ def verify_release_versions(root: Path, tag: str) -> str:
             failures.append(
                 f"{manifest}: {name} version is {version!r}, expected {expected!r}"
             )
+    failures.extend(workspace_path_dependency_failures(root, rust_packages))
 
     lock = load_toml(root / "Cargo.lock")
     locked_packages = lock.get("package")

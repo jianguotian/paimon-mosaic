@@ -81,16 +81,38 @@ if [[ -n $(git status --porcelain --untracked-files=all) ]]; then
 fi
 
 HEAD_COMMIT=$(git rev-parse --verify 'HEAD^{commit}')
-TAG_COMMIT=$(git rev-parse --verify "${RC_TAG}^{commit}")
+TAG_OBJECT_ID=$(git rev-parse --verify "${RC_TAG}^{tag}")
+TAG_OBJECT=$(git cat-file tag "${TAG_OBJECT_ID}")
+TAG_OBJECT_NAMES=$(
+  awk '
+    BEGIN { separator = "" }
+    /^$/ { exit }
+    /^tag / {
+      printf "%s%s", separator, substr($0, 5)
+      separator = ", "
+    }
+    END {
+      if (separator == "") {
+        printf "<missing>"
+      }
+    }
+  ' <<< "${TAG_OBJECT}"
+)
+if [[ "${TAG_OBJECT_NAMES}" != "${RC_TAG}" ]]; then
+  echo \
+    "signed tag object names ${TAG_OBJECT_NAMES}, not ${RC_TAG}" \
+    >&2
+  exit 1
+fi
+TAG_COMMIT=$(git rev-parse --verify "${TAG_OBJECT_ID}^{commit}")
 if [[ "${TAG_COMMIT}" != "${HEAD_COMMIT}" ]]; then
   echo \
     "RC_TAG ${RC_TAG} does not resolve to current HEAD ${HEAD_COMMIT}" \
     >&2
   exit 1
 fi
-TAG_OBJECT=$(git cat-file tag "${RC_TAG}" 2>/dev/null || true)
 if ! grep -q '^-----BEGIN PGP SIGNATURE-----$' <<< "${TAG_OBJECT}" ||
-  ! git verify-tag "${RC_TAG}"
+  ! git verify-tag "${TAG_OBJECT_ID}"
 then
   echo \
     "RC_TAG ${RC_TAG} is not a locally verifiable GPG-signed tag" \
@@ -122,16 +144,23 @@ trap cleanup EXIT
 echo "Creating source package from signed tag ${RC_TAG}"
 python3 tools/verify_source_archive.py create \
   --repository "${REPOSITORY}" \
-  --commit "${RC_TAG}" \
+  --commit "${TAG_COMMIT}" \
   --prefix "${ARCHIVE_ROOT}/" \
   --output "${ARTIFACT_DIR}/${ARCHIVE}"
 
 mkdir "${STAGING_DIR}/extracted"
 tar xzf "${ARTIFACT_DIR}/${ARCHIVE}" -C "${STAGING_DIR}/extracted"
-(
-  cd "${STAGING_DIR}/extracted/${ARCHIVE_ROOT}"
-  python3 tools/verify_release_versions.py "${RC_TAG}"
-)
+# Bash 3.2 does not reliably propagate errexit through subshells, so preserve
+# the explicit status checks in both verification blocks.
+if (
+  cd "${STAGING_DIR}/extracted/${ARCHIVE_ROOT}" &&
+    python3 tools/verify_release_versions.py "${RC_TAG}"
+); then
+  :
+else
+  status=$?
+  exit "${status}"
+fi
 
 gpg \
   --armor \
@@ -139,21 +168,26 @@ gpg \
   --output "${ARTIFACT_DIR}/${SIGNATURE}" \
   "${ARTIFACT_DIR}/${ARCHIVE}"
 
-(
-  cd "${ARTIFACT_DIR}"
+if (
+  cd "${ARTIFACT_DIR}" &&
   if [[ $(uname) == "Darwin" ]]; then
-    shasum -a 512 "${ARCHIVE}" > "${CHECKSUM}"
+    shasum -a 512 "${ARCHIVE}" > "${CHECKSUM}" &&
     shasum -a 512 -c "${CHECKSUM}"
   else
-    sha512sum "${ARCHIVE}" > "${CHECKSUM}"
+    sha512sum "${ARCHIVE}" > "${CHECKSUM}" &&
     sha512sum -c "${CHECKSUM}"
-  fi
-  gpg --verify "${SIGNATURE}" "${ARCHIVE}"
-)
+  fi &&
+    gpg --verify "${SIGNATURE}" "${ARCHIVE}"
+); then
+  :
+else
+  status=$?
+  exit "${status}"
+fi
 
 python3 tools/verify_source_archive.py verify \
   --repository "${REPOSITORY}" \
-  --commit "${RC_TAG}" \
+  --commit "${TAG_COMMIT}" \
   --prefix "${ARCHIVE_ROOT}/" \
   --archive "${ARTIFACT_DIR}/${ARCHIVE}"
 

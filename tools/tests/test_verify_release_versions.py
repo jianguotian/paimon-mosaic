@@ -182,12 +182,13 @@ def run_verifier(
     root: Path,
     *,
     env: dict[str, str] | None = None,
+    tag: str = TAG,
     verify_signature: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
         str(TOOLS / "verify_release_versions.py"),
-        TAG,
+        tag,
         "--root",
         str(root),
     ]
@@ -256,6 +257,118 @@ def test_cli_verify_signature_rejects_tag_not_at_head(
     assert "not current HEAD" in result.stderr
 
 
+def test_cli_verify_signature_rejects_alias_for_different_tag_name(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    root = initialize_versions(tmp_path)
+    initialize_git_repository(root)
+    env = sign_release_tag(root, signing_home)
+    tag_object = subprocess.run(
+        ["git", "rev-parse", TAG],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    alias = f"v{VERSION}"
+    subprocess.run(
+        ["git", "update-ref", f"refs/tags/{alias}", tag_object],
+        cwd=root,
+        check=True,
+    )
+
+    result = run_verifier(
+        root,
+        env=env,
+        tag=alias,
+        verify_signature=True,
+    )
+
+    assert result.returncode == 1
+    assert f"signed tag object names {TAG}, not {alias}" in result.stderr
+
+
+def test_cli_verifies_the_frozen_tag_object(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    root = initialize_versions(tmp_path)
+    initialize_git_repository(root)
+    env = sign_release_tag(root, signing_home)
+    signed_tag_object = subprocess.run(
+        ["git", "rev-parse", f"{TAG}^{{tag}}"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    forged_tag_object = subprocess.run(
+        ["git", "hash-object", "-t", "tag", "-w", "--stdin"],
+        cwd=root,
+        check=True,
+        input=(
+            f"object {commit}\n"
+            "type commit\n"
+            f"tag {TAG}\n"
+            "tagger Release Test <release-test@example.invalid> 0 +0000\n\n"
+            "forged release tag\n\n"
+            "-----BEGIN PGP SIGNATURE-----\n"
+            "invalid\n"
+            "-----END PGP SIGNATURE-----\n"
+        ),
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", f"refs/tags/{TAG}", forged_tag_object],
+        cwd=root,
+        check=True,
+    )
+
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "git"
+    write(
+        wrapper,
+        "#!/bin/sh\n"
+        'for argument in "$@"; do\n'
+        '  if [ "$argument" = "verify-tag" ] && [ ! -e "$MOVE_MARKER" ]; then\n'
+        '    : > "$MOVE_MARKER"\n'
+        '    "$REAL_GIT" -C "$RELEASE_REPO" update-ref '
+        '"refs/tags/$RELEASE_TAG" "$SIGNED_TAG_OBJECT"\n'
+        "    break\n"
+        "  fi\n"
+        "done\n"
+        'exec "$REAL_GIT" "$@"\n',
+    )
+    wrapper.chmod(0o755)
+    move_marker = tmp_path / "tag-moved-before-verification"
+    env.update(
+        {
+            "MOVE_MARKER": str(move_marker),
+            "PATH": f"{wrapper_dir}{os.pathsep}{env['PATH']}",
+            "REAL_GIT": shutil.which("git") or "git",
+            "RELEASE_REPO": str(root),
+            "RELEASE_TAG": TAG,
+            "SIGNED_TAG_OBJECT": signed_tag_object,
+        }
+    )
+
+    result = run_verifier(root, env=env, verify_signature=True)
+
+    assert move_marker.is_file()
+    assert result.returncode == 1
+    assert "not a verifiable signed tag" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("relative_path", "old", "new", "expected"),
     (
@@ -312,6 +425,104 @@ def test_rejects_missing_workspace_package_in_cargo_lock(tmp_path: Path) -> None
     lock.write_text(source, encoding="utf-8")
 
     with pytest.raises(ValueError, match="Cargo.lock.*paimon-mosaic-ffi"):
+        verifier.verify_release_versions(root, TAG)
+
+
+@pytest.mark.parametrize(
+    "dependency_table",
+    (
+        "[dependencies]",
+        "[target.'cfg(unix)'.dev-dependencies]",
+    ),
+)
+def test_rejects_mismatched_versioned_workspace_path_dependency(
+    tmp_path: Path,
+    dependency_table: str,
+) -> None:
+    root = initialize_versions(tmp_path)
+    write(
+        root / "ffi/Cargo.toml",
+        f'[package]\nname = "paimon-mosaic-ffi"\nversion = "{VERSION}"\n\n'
+        f"{dependency_table}\n"
+        'paimon-mosaic-core = { path = "../core", version = "0.2.0" }\n',
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "ffi/Cargo.toml.*paimon-mosaic-core path dependency version "
+            "is '0.2.0', expected '0.3.0'"
+        ),
+    ):
+        verifier.verify_release_versions(root, TAG)
+
+
+def test_checks_path_dependencies_from_non_release_workspace_members(
+    tmp_path: Path,
+) -> None:
+    root = initialize_versions(tmp_path)
+    write(
+        root / "helper/Cargo.toml",
+        '[package]\nname = "fixture-helper"\nversion = "9.9.9"\n\n'
+        "[build-dependencies]\n"
+        'core-under-test = { package = "paimon-mosaic-core", '
+        'path = "../core", version = "0.2.0" }\n',
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "helper/Cargo.toml.*core-under-test path dependency version "
+            "is '0.2.0', expected '0.3.0'"
+        ),
+    ):
+        verifier.verify_release_versions(root, TAG)
+
+
+def test_checks_automatically_included_path_workspace_members(
+    tmp_path: Path,
+) -> None:
+    root = initialize_versions(tmp_path)
+    replace(
+        root / "Cargo.toml",
+        'members = ["core", "ffi", "helper"]',
+        'members = ["ffi", "helper"]',
+    )
+    write(
+        root / "ffi/Cargo.toml",
+        f'[package]\nname = "paimon-mosaic-ffi"\nversion = "{VERSION}"\n\n'
+        "[dependencies]\n"
+        'paimon-mosaic-core = { path = "../core", version = "0.2.0" }\n',
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "ffi/Cargo.toml.*paimon-mosaic-core path dependency version "
+            "is '0.2.0', expected '0.3.0'"
+        ),
+    ):
+        verifier.verify_release_versions(root, TAG)
+
+
+def test_rejects_noncanonical_compatible_path_dependency_requirement(
+    tmp_path: Path,
+) -> None:
+    root = initialize_versions(tmp_path)
+    write(
+        root / "ffi/Cargo.toml",
+        f'[package]\nname = "paimon-mosaic-ffi"\nversion = "{VERSION}"\n\n'
+        "[dependencies]\n"
+        'paimon-mosaic-core = { path = "../core", version = "^0.3.0" }\n',
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "ffi/Cargo.toml.*paimon-mosaic-core path dependency version "
+            r"is '\^0\.3\.0', expected '0\.3\.0'"
+        ),
+    ):
         verifier.verify_release_versions(root, TAG)
 
 

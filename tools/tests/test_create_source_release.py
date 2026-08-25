@@ -23,6 +23,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 
 import pytest
 
@@ -95,11 +96,16 @@ def signing_home(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
 def initialize_release_repo(
     tmp_path: Path,
     signing_home: tuple[Path, str],
+    *,
+    python_version: str = VERSION,
+    source_script: str | None = None,
 ) -> tuple[Path, dict[str, str], str]:
     repo = tmp_path / "repo"
     tools = repo / "tools"
     tools.mkdir(parents=True)
     shutil.copy2(SOURCE_SCRIPT, tools / SOURCE_SCRIPT.name)
+    if source_script is not None:
+        write(tools / SOURCE_SCRIPT.name, source_script)
     shutil.copy2(SOURCE_VERIFIER, tools / SOURCE_VERIFIER.name)
     shutil.copy2(VERSION_VERIFIER, tools / VERSION_VERIFIER.name)
 
@@ -131,7 +137,7 @@ def initialize_release_repo(
     write(
         repo / "python/pyproject.toml",
         '[project]\nname = "paimon-mosaic"\n'
-        f'version = "{VERSION}"\n',
+        f'version = "{python_version}"\n',
     )
     write(repo / "README.md", "source release fixture\n")
     write(repo / ".gitignore", "tools/release/\ntools/.source-release.*\n")
@@ -398,3 +404,211 @@ def test_unsigned_tag_with_pgp_armor_text_is_rejected(
 
     assert result.returncode != 0
     assert "not a locally verifiable GPG-signed tag" in output(result)
+
+
+def test_rejects_alias_for_different_signed_tag_name(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    repo, env, _ = initialize_release_repo(tmp_path, signing_home)
+    tag_object = run(
+        ["git", "rev-parse", f"{RC_TAG}^{{tag}}"],
+        cwd=repo,
+    ).stdout.decode().strip()
+    alias = f"v{VERSION}-rc2"
+    run(
+        ["git", "update-ref", f"refs/tags/{alias}", tag_object],
+        cwd=repo,
+    )
+    env["RC_TAG"] = alias
+
+    result = run_script(repo, env)
+
+    assert result.returncode != 0
+    assert f"signed tag object names {RC_TAG}, not {alias}" in output(result)
+
+
+def test_verifies_the_frozen_tag_object(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    repo, env, commit = initialize_release_repo(tmp_path, signing_home)
+    signed_tag_object = run(
+        ["git", "rev-parse", f"{RC_TAG}^{{tag}}"],
+        cwd=repo,
+    ).stdout.decode().strip()
+    forged_tag_object = subprocess.run(
+        ["git", "hash-object", "-t", "tag", "-w", "--stdin"],
+        cwd=repo,
+        check=True,
+        input=(
+            f"object {commit}\n"
+            "type commit\n"
+            f"tag {RC_TAG}\n"
+            "tagger Release Test <release-test@example.invalid> 0 +0000\n\n"
+            "forged release tag\n\n"
+            "-----BEGIN PGP SIGNATURE-----\n"
+            "invalid\n"
+            "-----END PGP SIGNATURE-----\n"
+        ).encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout.decode().strip()
+    run(
+        ["git", "update-ref", f"refs/tags/{RC_TAG}", forged_tag_object],
+        cwd=repo,
+    )
+
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "git"
+    write(
+        wrapper,
+        "#!/bin/sh\n"
+        'for argument in "$@"; do\n'
+        '  if [ "$argument" = "verify-tag" ] && [ ! -e "$MOVE_MARKER" ]; then\n'
+        '    : > "$MOVE_MARKER"\n'
+        '    "$REAL_GIT" -C "$RELEASE_REPO" update-ref '
+        '"refs/tags/$RC_TAG" "$SIGNED_TAG_OBJECT"\n'
+        "    break\n"
+        "  fi\n"
+        "done\n"
+        'exec "$REAL_GIT" "$@"\n',
+    )
+    wrapper.chmod(0o755)
+    move_marker = tmp_path / "tag-moved-before-verification"
+    env.update(
+        {
+            "MOVE_MARKER": str(move_marker),
+            "PATH": f"{wrapper_dir}{os.pathsep}{env['PATH']}",
+            "REAL_GIT": shutil.which("git") or "git",
+            "RELEASE_REPO": str(repo),
+            "SIGNED_TAG_OBJECT": signed_tag_object,
+        }
+    )
+
+    result = run_script(repo, env)
+
+    assert move_marker.is_file()
+    assert result.returncode != 0
+    assert "not a locally verifiable GPG-signed tag" in output(result)
+    assert not (repo / "tools/release").exists()
+
+
+def test_tag_ref_move_after_verification_does_not_change_archive(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    repo, env, signed_commit = initialize_release_repo(tmp_path, signing_home)
+    write(repo / "README.md", "alternate commit\n")
+    run(["git", "add", "README.md"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "alternate commit"], cwd=repo)
+    alternate_commit = run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+    ).stdout.decode().strip()
+    run(["git", "reset", "--hard", signed_commit], cwd=repo)
+
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "python3"
+    write(
+        wrapper,
+        "#!/bin/sh\n"
+        'if [ "$1" = "tools/verify_source_archive.py" ] &&\n'
+        '  [ "$2" = "create" ] && [ ! -e "$MOVE_MARKER" ]; then\n'
+        '  : > "$MOVE_MARKER"\n'
+        '  git -C "$RELEASE_REPO" update-ref "refs/tags/$RC_TAG" '
+        '"$ALTERNATE_COMMIT"\n'
+        "fi\n"
+        'exec "$REAL_PYTHON" "$@"\n',
+    )
+    wrapper.chmod(0o755)
+    move_marker = tmp_path / "tag-moved"
+    env.update(
+        {
+            "ALTERNATE_COMMIT": alternate_commit,
+            "MOVE_MARKER": str(move_marker),
+            "PATH": f"{wrapper_dir}{os.pathsep}{env['PATH']}",
+            "REAL_PYTHON": sys.executable,
+            "RELEASE_REPO": str(repo),
+        }
+    )
+
+    result = run_script(repo, env)
+
+    assert result.returncode == 0, output(result)
+    assert move_marker.is_file()
+    archive, _, _ = artifact_paths(repo)
+    with tarfile.open(archive, "r:gz") as source:
+        assert source.pax_headers["comment"] == signed_commit
+        readme = source.extractfile(f"paimon-mosaic-{VERSION}/README.md")
+        assert readme is not None
+        assert readme.read() == b"source release fixture\n"
+
+
+@pytest.mark.parametrize(
+    ("platform", "checksum_command"),
+    (("Linux", "sha512sum"), ("Darwin", "shasum")),
+)
+def test_checksum_failure_is_not_swallowed_without_errexit(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+    platform: str,
+    checksum_command: str,
+) -> None:
+    production_script = SOURCE_SCRIPT.read_text(encoding="utf-8")
+    assert "set -o errexit\n" in production_script
+    source_script = production_script.replace(
+        "set -o errexit\n",
+        "",
+        1,
+    )
+    repo, env, _ = initialize_release_repo(
+        tmp_path,
+        signing_home,
+        source_script=source_script,
+    )
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir()
+    checksum_marker = tmp_path / "checksum-failed"
+    wrapper = wrapper_dir / checksum_command
+    write(wrapper, '#!/bin/sh\n: > "$CHECKSUM_MARKER"\nexit 42\n')
+    wrapper.chmod(0o755)
+    uname = wrapper_dir / "uname"
+    write(uname, '#!/bin/sh\nprintf "%s\\n" "$TEST_UNAME"\n')
+    uname.chmod(0o755)
+    env["PATH"] = f"{wrapper_dir}{os.pathsep}{env['PATH']}"
+    env["CHECKSUM_MARKER"] = str(checksum_marker)
+    env["TEST_UNAME"] = platform
+
+    result = run_script(repo, env)
+
+    assert checksum_marker.is_file()
+    assert result.returncode != 0
+    assert not (repo / "tools/release").exists()
+
+
+def test_version_failure_is_not_swallowed_without_errexit(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    production_script = SOURCE_SCRIPT.read_text(encoding="utf-8")
+    assert "set -o errexit\n" in production_script
+    source_script = production_script.replace(
+        "set -o errexit\n",
+        "",
+        1,
+    )
+    repo, env, _ = initialize_release_repo(
+        tmp_path,
+        signing_home,
+        python_version="0.3.1",
+        source_script=source_script,
+    )
+
+    result = run_script(repo, env)
+
+    assert result.returncode != 0
+    assert "python/pyproject.toml" in output(result)
+    assert not (repo / "tools/release").exists()
