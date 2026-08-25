@@ -154,9 +154,10 @@ enum Cmd {
     /// Create a Mosaic file from CSV data.
     ConvertCsv {
         /// Input CSV path(s).
+        #[arg(required = true)]
         inputs: Vec<PathBuf>,
         /// Output .mosaic path.
-        #[arg(short = 'o', long = "output")]
+        #[arg(short = 'o', long = "output", visible_alias = "out")]
         out: PathBuf,
         /// Do not allow null values for inferred fields; repeat for multiple fields.
         #[arg(long)]
@@ -872,11 +873,18 @@ fn parse_optional_csv_byte(value: Option<&str>, name: &str) -> std::io::Result<O
 fn open_csv(path: &Path, skip_lines: usize) -> std::io::Result<std::io::BufReader<std::fs::File>> {
     use std::io::BufRead;
     let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
-    let mut line = String::new();
     for _ in 0..skip_lines {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
+        loop {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(reader);
+            }
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(buffer.len(), |index| index + 1);
+            reader.consume(consumed);
+            if newline.is_some() {
+                break;
+            }
         }
     }
     Ok(reader)

@@ -367,6 +367,28 @@ fn convert_csv_then_inspect() {
 }
 
 #[test]
+fn convert_csv_keeps_out_long_option_alias() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_convert_csv_out_alias.csv", dir.display());
+    std::fs::write(&csv, "id\n1\n").unwrap();
+    let out = format!("{}/mosaic_e2e_convert_csv_out_alias.mosaic", dir.display());
+    let _ = std::fs::remove_file(&out);
+    let (msg, err, ok) = run(&["convert-csv", &csv, "--out", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (count, err, ok) = run(&["count", &out]);
+    assert!(ok, "stdout: {count}\nstderr: {err}");
+    assert_eq!(count.trim(), "1");
+}
+
+#[test]
+fn convert_csv_help_requires_at_least_one_input() {
+    let (help, err, ok) = run(&["convert-csv", "--help"]);
+    assert!(ok, "stdout: {help}\nstderr: {err}");
+    assert!(help.contains("<INPUTS>..."), "{help}");
+    assert!(!help.contains("[INPUTS]..."), "{help}");
+}
+
+#[test]
 fn convert_csv_applies_dialect_flags() {
     let dir = std::env::temp_dir();
     let csv = format!("{}/mosaic_e2e_csv_dialect.csv", dir.display());
@@ -391,6 +413,27 @@ fn convert_csv_applies_dialect_flags() {
     let (rows, err, ok) = run(&["cat", &out, "--json"]);
     assert!(ok, "stdout: {rows}\nstderr: {err}");
     assert_eq!(rows, "{\"id\":1,\"name\":\"a'b\"}\n");
+}
+
+#[test]
+fn convert_csv_skip_lines_discards_non_utf8_preamble() {
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_csv_non_utf8_preamble.csv", dir.display());
+    std::fs::write(&csv, b"\xff\nid,name\n1,ok\n").unwrap();
+    let out = format!("{}/mosaic_e2e_csv_non_utf8_preamble.mosaic", dir.display());
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        &csv,
+        "-o",
+        &out,
+        "--skip-lines",
+        "1",
+        "--overwrite",
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows, "{\"id\":1,\"name\":\"ok\"}\n");
 }
 
 #[test]
