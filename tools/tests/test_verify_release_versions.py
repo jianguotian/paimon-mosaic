@@ -505,7 +505,7 @@ def test_checks_automatically_included_path_workspace_members(
         verifier.verify_release_versions(root, TAG)
 
 
-def test_rejects_noncanonical_compatible_path_dependency_requirement(
+def test_rejects_noncanonical_path_dependency_requirement(
     tmp_path: Path,
 ) -> None:
     root = initialize_versions(tmp_path)

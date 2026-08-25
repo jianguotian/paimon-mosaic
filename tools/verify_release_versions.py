@@ -297,8 +297,8 @@ def workspace_path_dependency_failures(
                 if target is None:
                     continue
                 target_name, target_version = target
-                # The release updater rewrites canonical exact pins, so a
-                # merely compatible semver requirement is not sufficient.
+                # The release updater rewrites only the canonical plain
+                # version form, not alternative semver requirement syntax.
                 if declared_version != target_version:
                     failures.append(
                         f"{manifest.relative_to(root)}: {dependency_name} "

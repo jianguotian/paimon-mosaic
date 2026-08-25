@@ -573,7 +573,15 @@ def test_checksum_failure_is_not_swallowed_without_errexit(
     wrapper_dir.mkdir()
     checksum_marker = tmp_path / "checksum-failed"
     wrapper = wrapper_dir / checksum_command
-    write(wrapper, '#!/bin/sh\n: > "$CHECKSUM_MARKER"\nexit 42\n')
+    write(
+        wrapper,
+        "#!/bin/sh\n"
+        'if [ ! -e "$CHECKSUM_MARKER" ]; then\n'
+        '  : > "$CHECKSUM_MARKER"\n'
+        "  exit 42\n"
+        "fi\n"
+        "exit 0\n",
+    )
     wrapper.chmod(0o755)
     uname = wrapper_dir / "uname"
     write(uname, '#!/bin/sh\nprintf "%s\\n" "$TEST_UNAME"\n')
