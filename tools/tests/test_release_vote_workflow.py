@@ -28,6 +28,17 @@ ROOT = Path(__file__).resolve().parents[2]
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 GATE_WORKFLOW = ROOT / ".github/workflows/release-vote-gate.yml"
 RELEASE_DOCUMENTATION = ROOT / "docs/creating-a-release.html"
+IMPORT_SIGNING_KEY_COMMAND = """set -euo pipefail
+if [[ -z "${GPG_SECRET_KEY}" ]]; then
+  echo "GPG_SECRET_KEY is unset" >&2
+  exit 1
+fi
+printf '%s' "${GPG_SECRET_KEY}" | gpg --batch --import
+"""
+VERIFY_RELEASE_COMMAND = (
+    'python3 tools/verify_release_versions.py "${{ github.ref_name }}" '
+    "--verify-signature"
+)
 
 
 def load_workflow(path: Path) -> dict:
@@ -50,6 +61,13 @@ def release_version_step(workflow: dict) -> dict:
     return version_steps[0]
 
 
+def named_step(workflow: dict, name: str) -> dict:
+    steps = workflow["jobs"]["release-preflight"]["steps"]
+    matches = [step for step in steps if step.get("name") == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def assert_release_contract(workflow: dict) -> None:
     assert workflow["concurrency"]["cancel-in-progress"] == "false"
 
@@ -60,6 +78,27 @@ def assert_release_contract(workflow: dict) -> None:
     assert "continue-on-error" not in preflight
     assert "continue-on-error" not in release_version_step(workflow)
 
+    checkout = next(
+        step
+        for step in preflight["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    )
+    checkout_options = checkout.get("with", {})
+    assert checkout_options.get("fetch-depth") == "0"
+    assert "ref" not in checkout_options
+
+    import_step = named_step(workflow, "Import release signing key")
+    assert import_step["if"] == "startsWith(github.ref, 'refs/tags/')"
+    assert import_step["env"] == {
+        "GPG_SECRET_KEY": "${{ secrets.GPG_SECRET_KEY }}"
+    }
+    assert "continue-on-error" not in import_step
+    assert import_step["run"] == IMPORT_SIGNING_KEY_COMMAND
+
+    version_step = release_version_step(workflow)
+    assert version_step["if"] == "startsWith(github.ref, 'refs/tags/')"
+    assert version_step["run"] == VERIFY_RELEASE_COMMAND
+
     for job_name in ("rust", "java", "python-wheels"):
         assert "release-preflight" in needs(jobs[job_name])
 
@@ -67,7 +106,7 @@ def assert_release_contract(workflow: dict) -> None:
     assert "always()" not in source
 
 
-def test_release_has_inline_tag_only_preflight() -> None:
+def test_release_has_signed_exact_tag_preflight() -> None:
     workflow = load_workflow(RELEASE_WORKFLOW)
     assert_release_contract(workflow)
 
@@ -82,6 +121,47 @@ def test_release_has_inline_tag_only_preflight() -> None:
 def test_contract_rejects_deleted_preflight_need(job_name: str) -> None:
     workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
     workflow["jobs"][job_name].pop("needs")
+
+    with pytest.raises(AssertionError):
+        assert_release_contract(workflow)
+
+
+def test_contract_rejects_masked_release_verifier_failure() -> None:
+    workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
+    release_version_step(workflow)["run"] += " || true"
+
+    with pytest.raises(AssertionError):
+        assert_release_contract(workflow)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong-checkout-ref",
+        "missing-signature-verification",
+        "masked-key-import",
+        "key-import-continue",
+    ),
+)
+def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
+    workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
+    if mutation == "wrong-checkout-ref":
+        checkout = next(
+            step
+            for step in workflow["jobs"]["release-preflight"]["steps"]
+            if step.get("uses") == "actions/checkout@v6"
+        )
+        checkout["with"]["ref"] = "main"
+    elif mutation == "missing-signature-verification":
+        release_version_step(workflow)["run"] = (
+            'python3 tools/verify_release_versions.py "${{ github.ref_name }}"'
+        )
+    elif mutation == "masked-key-import":
+        named_step(workflow, "Import release signing key")["run"] += " || true"
+    else:
+        named_step(workflow, "Import release signing key")[
+            "continue-on-error"
+        ] = "true"
 
     with pytest.raises(AssertionError):
         assert_release_contract(workflow)
@@ -116,6 +196,7 @@ def test_source_release_documentation_passes_rc_tag_explicitly() -> None:
     for event in ("pull_request", "push"):
         assert "docs/creating-a-release.html" in workflow["on"][event]["paths"]
     assert "Cargo path dependency constraints and Cargo.lock" in source
+    assert "RC tag verification and Java artifact signing" in source
 
 
 def test_release_vote_gate_runs_only_the_pr_a_checks() -> None:

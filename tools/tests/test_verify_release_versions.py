@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -94,10 +96,164 @@ def replace(path: Path, old: str, new: str) -> None:
     path.write_text(source.replace(old, new, 1), encoding="utf-8")
 
 
+def initialize_git_repository(root: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Release Test"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "release-test@example.invalid"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+
+
+@pytest.fixture(scope="session")
+def signing_home(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
+    if shutil.which("gpg") is None:
+        pytest.skip("gpg is required for release tag tests")
+    home = tmp_path_factory.mktemp("release-tag-gnupg")
+    home.chmod(0o700)
+    env = os.environ.copy()
+    env["GNUPGHOME"] = str(home)
+    subprocess.run(
+        [
+            "gpg",
+            "--batch",
+            "--passphrase",
+            "",
+            "--quick-gen-key",
+            "Release Tag Test <release-tag-test@example.invalid>",
+            "rsa1024",
+            "sign",
+            "0",
+        ],
+        cwd=home,
+        env=env,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    listing = subprocess.run(
+        ["gpg", "--batch", "--with-colons", "--list-secret-keys"],
+        cwd=home,
+        env=env,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout
+    fingerprint = next(
+        line.split(":")[9]
+        for line in listing.splitlines()
+        if line.startswith("fpr:")
+    )
+    return home, fingerprint
+
+
+def sign_release_tag(
+    root: Path,
+    signing_home: tuple[Path, str],
+) -> dict[str, str]:
+    home, fingerprint = signing_home
+    env = os.environ.copy()
+    env["GNUPGHOME"] = str(home)
+    subprocess.run(
+        ["git", "config", "user.signingkey", fingerprint],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "tag", "-s", "-u", fingerprint, TAG, "-m", "signed release tag"],
+        cwd=root,
+        env=env,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return env
+
+
+def run_verifier(
+    root: Path,
+    *,
+    env: dict[str, str] | None = None,
+    verify_signature: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        str(TOOLS / "verify_release_versions.py"),
+        TAG,
+        "--root",
+        str(root),
+    ]
+    if verify_signature:
+        command.append("--verify-signature")
+    return subprocess.run(
+        command,
+        cwd=root,
+        env=env,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
 def test_all_release_versions_match_tag(tmp_path: Path) -> None:
     root = initialize_versions(tmp_path)
 
     assert verifier.verify_release_versions(root, TAG) == VERSION
+
+
+def test_cli_verify_signature_rejects_unsigned_tag(tmp_path: Path) -> None:
+    root = initialize_versions(tmp_path)
+    initialize_git_repository(root)
+    subprocess.run(
+        ["git", "tag", "-a", TAG, "-m", "unsigned release tag"],
+        cwd=root,
+        check=True,
+    )
+
+    result = run_verifier(root, verify_signature=True)
+
+    assert result.returncode == 1
+    assert "not a verifiable signed tag" in result.stderr
+
+
+def test_cli_verify_signature_accepts_signed_tag(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    root = initialize_versions(tmp_path)
+    initialize_git_repository(root)
+    env = sign_release_tag(root, signing_home)
+
+    result = run_verifier(root, env=env, verify_signature=True)
+
+    assert result.returncode == 0, result.stderr
+    assert f"verified release tag {TAG}" in result.stdout
+
+
+def test_cli_verify_signature_rejects_tag_not_at_head(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    root = initialize_versions(tmp_path)
+    initialize_git_repository(root)
+    env = sign_release_tag(root, signing_home)
+    write(root / "after-tag.txt", "new commit\n")
+    subprocess.run(["git", "add", "after-tag.txt"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "after tag"], cwd=root, check=True)
+
+    result = run_verifier(root, env=env, verify_signature=True)
+
+    assert result.returncode == 1
+    assert "not current HEAD" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -182,19 +338,7 @@ def test_cli_is_read_only_and_reports_mismatches(tmp_path: Path) -> None:
     replace(pom, "<version>0.3.0</version>", "<version>0.3.1</version>")
     before = pom.read_bytes()
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(TOOLS / "verify_release_versions.py"),
-            TAG,
-            "--root",
-            str(root),
-        ],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    result = run_verifier(root)
 
     assert result.returncode == 1
     assert "java/pom.xml" in result.stderr

@@ -25,6 +25,7 @@ import argparse
 import glob
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tomllib
 import xml.etree.ElementTree as ET
@@ -48,6 +49,47 @@ def release_version(tag: str) -> str:
             f"invalid release tag {tag!r}; expected vX.Y.Z or vX.Y.Z-rcN"
         )
     return match.group("version")
+
+
+def run_git(root: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ValueError(detail or f"git {' '.join(arguments)} failed")
+    return result.stdout.strip()
+
+
+def verify_release_tag(root: Path, tag: str) -> str:
+    root = root.resolve()
+    release_version(tag)
+    if run_git(root, "cat-file", "-t", tag) != "tag":
+        raise ValueError(f"{tag} is not an annotated release tag")
+
+    head_commit = run_git(root, "rev-parse", "--verify", "HEAD^{commit}")
+    tag_commit = run_git(root, "rev-parse", "--verify", f"{tag}^{{commit}}")
+    if tag_commit != head_commit:
+        raise ValueError(
+            f"{tag} resolves to {tag_commit}, not current HEAD {head_commit}"
+        )
+
+    result = subprocess.run(
+        ["git", "-C", str(root), "verify-tag", tag],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        suffix = f": {detail}" if detail else ""
+        raise ValueError(f"{tag} is not a verifiable signed tag{suffix}")
+    return tag_commit
 
 
 def workspace_manifests(root: Path, workspace: dict) -> list[Path]:
@@ -204,12 +246,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tag", help="release tag: vX.Y.Z or vX.Y.Z-rcN")
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument(
+        "--verify-signature",
+        action="store_true",
+        help="require an annotated signed tag bound to the current HEAD",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
+        if args.verify_signature:
+            verify_release_tag(args.root, args.tag)
         version = verify_release_versions(args.root, args.tag)
     except (OSError, ET.ParseError, tomllib.TOMLDecodeError, ValueError) as error:
         print(error, file=sys.stderr)
