@@ -290,10 +290,12 @@ def test_tree_identity_mutations_are_rejected(
             if info.name == f"{PREFIX}README.md":
                 assert content is not None
                 info.size = len(content)
-    else:
+    elif mutation == "symlink":
         for info, _ in members:
             if info.name == f"{PREFIX}bin/README-link":
                 info.linkname = "tool.sh"
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
 
     write_tgz(archive, members, pax_headers=headers)
 
@@ -318,7 +320,19 @@ def test_rejects_unsafe_and_duplicate_paths(tmp_path: Path) -> None:
         verifier.read_source_archive(archive, PREFIX)
 
 
-def test_rejects_escaping_symlink(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    (
+        ("../outside", "escapes the archive root"),
+        ("C:../outside", "unsafe symbolic-link target"),
+        ("..\\outside", "unsafe symbolic-link target"),
+    ),
+)
+def test_rejects_unsafe_symlink_targets(
+    tmp_path: Path,
+    target: str,
+    expected: str,
+) -> None:
     archive = tmp_path / "symlink.tgz"
     root = tarfile.TarInfo(PREFIX.rstrip("/"))
     root.type = tarfile.DIRTYPE
@@ -326,10 +340,10 @@ def test_rejects_escaping_symlink(tmp_path: Path) -> None:
     link = tarfile.TarInfo(f"{PREFIX}link")
     link.type = tarfile.SYMTYPE
     link.mode = 0o777
-    link.linkname = "../outside"
+    link.linkname = target
     write_tgz(archive, [(root, None), (link, None)])
 
-    with pytest.raises(ValueError, match="escapes the archive root"):
+    with pytest.raises(ValueError, match=expected):
         verifier.read_source_archive(archive, PREFIX)
 
 

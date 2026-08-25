@@ -69,7 +69,7 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install pytest PyYAML
 
-      - name: Run PR A tests
+      - name: Run release vote tests
         run: |
           python -m pytest -q \
             tools/tests/test_create_source_release.py \

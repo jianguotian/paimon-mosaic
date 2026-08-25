@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   release-preflight:
-    name: Validate release versions
+    name: Validate release tag, versions, and source archive
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -64,6 +64,26 @@ jobs:
       - name: Verify tag and component versions
         if: startsWith(github.ref, 'refs/tags/')
         run: python3 tools/verify_release_versions.py "${{ github.ref_name }}" --verify-signature
+
+      - name: Verify source archive
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          release_version="${release_version%-rc*}"
+          archive="${RUNNER_TEMP}/apache-paimon-mosaic-${release_version}-src.tgz"
+          prefix="paimon-mosaic-${release_version}/"
+          commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          python3 tools/verify_source_archive.py create \
+            --repository "${GITHUB_WORKSPACE}" \
+            --commit "${commit}" \
+            --prefix "${prefix}" \
+            --output "${archive}"
+          python3 tools/verify_source_archive.py verify \
+            --repository "${GITHUB_WORKSPACE}" \
+            --commit "${commit}" \
+            --prefix "${prefix}" \
+            --archive "${archive}"
 
   rust:
     name: Rust release

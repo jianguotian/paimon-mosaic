@@ -217,6 +217,7 @@ git tag -v ${RC_TAG}
 git push origin ${RELEASE_BRANCH}
 git push origin ${RC_TAG}</code></pre>
             <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that the <code>Release</code> workflow succeeds:</p>
+            <p>The release preflight validates the signed tag and component versions, then creates and verifies a temporary source archive before any language release job starts.</p>
             <ul>
                 <li><strong>Rust release</strong> &mdash; dry-run check (does not publish for RC tags)</li>
                 <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
