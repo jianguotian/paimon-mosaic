@@ -657,7 +657,7 @@ where
         stats_columns: stats.map(parse_comma_list).unwrap_or_default(),
         ..Default::default()
     };
-    // Write to a unique sibling temp file and rename on success, so a mid-stream
+    // Write to a unique sibling temp file and install it on success, so a mid-stream
     // failure never leaves a truncated .mosaic — and a process-unique suffix
     // avoids clobbering an unrelated `out.mosaic.tmp` the user may already have.
     let uniq = std::time::SystemTime::now()
@@ -676,11 +676,10 @@ where
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    #[cfg(windows)]
-    if out.exists() {
-        std::fs::remove_file(out)?;
+    if let Err(e) = install_mosaic_output(&tmp, out, overwrite) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, out)?;
     let plural = |n: usize, w: &str| {
         if n == 1 {
             format!("1 {w}")
@@ -695,6 +694,28 @@ where
         plural(schema.fields().len(), "column")
     );
     Ok(())
+}
+
+fn install_mosaic_output(tmp: &Path, out: &Path, overwrite: bool) -> std::io::Result<()> {
+    if overwrite {
+        #[cfg(windows)]
+        if std::fs::symlink_metadata(out).is_ok() {
+            std::fs::remove_file(out)?;
+        }
+        return std::fs::rename(tmp, out);
+    }
+
+    // Both paths are siblings, so a hard link provides an atomic no-replace
+    // install on the same filesystem. Removing the temporary name afterwards
+    // leaves the completed output visible under only its requested path.
+    std::fs::hard_link(tmp, out).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            output_exists_error(out)
+        } else {
+            error
+        }
+    })?;
+    std::fs::remove_file(tmp)
 }
 
 fn project_convert_schema(schema: Schema, columns: &[String]) -> std::io::Result<Schema> {
@@ -831,13 +852,21 @@ fn is_json_input(input: &Path) -> bool {
 }
 
 fn ensure_can_write(out: &Path, overwrite: bool) -> std::io::Result<()> {
-    if out.exists() && !overwrite {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} exists (use --overwrite to replace)", out.display()),
-        ));
+    if overwrite {
+        return Ok(());
     }
-    Ok(())
+    match std::fs::symlink_metadata(out) {
+        Ok(_) => Err(output_exists_error(out)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn output_exists_error(out: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("{} exists (use --overwrite to replace)", out.display()),
+    )
 }
 
 fn csv_format(options: &CsvConvertOptions) -> std::io::Result<arrow::csv::reader::Format> {
@@ -1213,21 +1242,26 @@ fn parse_inferred_csv_float64(
             };
             let promoted = Float64Type::parse(value)
                 .ok_or_else(|| csv_inferred_float_parse_error(value, field, input))?;
+            if !promoted.is_finite() {
+                return Err(if is_non_finite_float_literal(value) {
+                    csv_non_finite_float_error(value, field, input)
+                } else {
+                    csv_inferred_float_parse_error(value, field, input)
+                });
+            }
             let unsigned = value
                 .strip_prefix('+')
                 .or_else(|| value.strip_prefix('-'))
                 .unwrap_or(value);
             let integer_token =
                 !unsigned.is_empty() && unsigned.bytes().all(|byte| byte.is_ascii_digit());
-            if promoted.is_finite() && integer_token {
+            if integer_token {
                 let exact = value
                     .parse::<i128>()
                     .map_err(|_| csv_inferred_float_parse_error(value, field, input))?;
                 if exact_i128_from_f64(promoted) != Some(exact) {
                     return Err(csv_inferred_float_parse_error(value, field, input));
                 }
-            } else if !promoted.is_finite() && !is_non_finite_float_literal(value) {
-                return Err(csv_inferred_float_parse_error(value, field, input));
             }
             Ok(Some(promoted))
         })
@@ -1256,6 +1290,15 @@ fn is_non_finite_float_literal(value: &str) -> bool {
 fn csv_inferred_float_parse_error(value: &str, field: &Field, input: &Path) -> std::io::Error {
     invalid_schema(format!(
         "numeric value '{}' in CSV field '{}' of {} cannot be represented exactly as Float64",
+        fmt::safe(value),
+        fmt::safe(field.name()),
+        input.display()
+    ))
+}
+
+fn csv_non_finite_float_error(value: &str, field: &Field, input: &Path) -> std::io::Error {
+    invalid_schema(format!(
+        "non-finite Float64 value '{}' in CSV field '{}' of {} is not supported",
         fmt::safe(value),
         fmt::safe(field.name()),
         input.display()

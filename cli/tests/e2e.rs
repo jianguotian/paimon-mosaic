@@ -83,6 +83,31 @@ fn run(args: &[&str]) -> (String, String, bool) {
     )
 }
 
+fn sibling_temp_exists(dir: &std::path::Path, output_name: &str) -> bool {
+    let prefix = format!("{output_name}.");
+    std::fs::read_dir(dir).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(&prefix) && name.ends_with(".tmp")
+    })
+}
+
+fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "mosaic_e2e_{name}_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    dir
+}
+
 #[test]
 fn schema_lists_columns() {
     let f = fixture("schema");
@@ -525,6 +550,21 @@ fn convert_csv_rejects_finite_float_overflow() {
 }
 
 #[test]
+fn convert_csv_rejects_non_finite_float_values() {
+    let dir = std::env::temp_dir();
+    for (case, value) in [("nan", "NaN"), ("infinity", "inf")] {
+        let csv = format!("{}/mosaic_e2e_non_finite_{case}.csv", dir.display());
+        std::fs::write(&csv, format!("value\n{value}\n1.5\n")).unwrap();
+        let out = format!("{}/mosaic_e2e_non_finite_{case}.mosaic", dir.display());
+        let _ = std::fs::remove_file(&out);
+        let (_, err, ok) = run(&["convert-csv", &csv, "-o", &out]);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains("non-finite Float64"), "{case}: {err}");
+        assert!(!std::path::Path::new(&out).exists(), "{case}");
+    }
+}
+
+#[test]
 fn convert_csv_preserves_inferred_timestamp_precision() {
     let dir = std::env::temp_dir();
     let seconds = format!("{}/mosaic_e2e_timestamp_seconds.csv", dir.display());
@@ -915,6 +955,142 @@ fn convert_refuses_existing_output_without_overwrite() {
     assert!(!ok);
     assert!(err.contains("use --overwrite"), "{err}");
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "keep me");
+}
+
+#[cfg(unix)]
+#[test]
+fn convert_refuses_dangling_symlink_output_without_overwrite() {
+    use std::os::unix::fs::symlink;
+
+    let dir = std::env::temp_dir();
+    let csv = format!("{}/mosaic_e2e_dangling_output.csv", dir.display());
+    std::fs::write(&csv, "id\n1\n").unwrap();
+    let target = dir.join("mosaic_e2e_dangling_output_missing_target");
+    let out = dir.join("mosaic_e2e_dangling_output.mosaic");
+    let _ = std::fs::remove_file(&out);
+    symlink(&target, &out).unwrap();
+
+    let (_, err, ok) = run(&["convert-csv", &csv, "-o", out.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(err.contains("use --overwrite"), "{err}");
+    assert_eq!(std::fs::read_link(&out).unwrap(), target);
+}
+
+#[cfg(unix)]
+fn run_output_creation_race_attempt() -> bool {
+    use std::fmt::Write;
+    use std::time::{Duration, Instant};
+
+    const RACE_WINDOW_ROWS: usize = 50_000;
+    const RACE_WINDOW_PAYLOAD_BYTES: usize = 64;
+
+    let dir = unique_temp_dir("concurrent_output");
+    let csv = dir.join("input.csv");
+    let mut contents = String::from("id,payload\n");
+    let payload = "x".repeat(RACE_WINDOW_PAYLOAD_BYTES);
+    for id in 0..RACE_WINDOW_ROWS {
+        writeln!(&mut contents, "{id},{payload}").unwrap();
+    }
+    std::fs::write(&csv, contents).unwrap();
+    let out = dir.join("out.mosaic");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .args([
+            "convert-csv",
+            csv.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if sibling_temp_exists(&dir, "out.mosaic") {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)
+            {
+                Ok(mut sentinel) => {
+                    std::io::Write::write_all(&mut sentinel, b"keep me").unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "stdout: {}\nstderr: {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    std::fs::remove_dir_all(&dir).unwrap();
+                    return false;
+                }
+                Err(error) => panic!("cannot create competing output: {error}"),
+            }
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "conversion exited before creating its sibling temp"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for sibling temp"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("use --overwrite"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "keep me");
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
+    std::fs::remove_dir_all(&dir).unwrap();
+    true
+}
+
+#[cfg(unix)]
+#[test]
+fn convert_refuses_output_created_during_conversion() {
+    assert!(
+        (0..3).any(|_| run_output_creation_race_attempt()),
+        "conversion won all attempts before the competing output could be created"
+    );
+}
+
+#[test]
+fn convert_cleans_temp_when_output_install_fails() {
+    let dir = unique_temp_dir("install_failure");
+    let csv = dir.join("input.csv");
+    std::fs::write(&csv, "id\n1\n").unwrap();
+    let out = dir.join("out.mosaic");
+    std::fs::create_dir(&out).unwrap();
+
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        csv.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--overwrite",
+    ]);
+    assert!(!ok);
+    assert!(
+        err.contains("Is a directory") || err.contains("Access is denied"),
+        "{err}"
+    );
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
