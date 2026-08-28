@@ -601,7 +601,7 @@ fn convert_csv(
         let inspected = inspect_csv_input(open_csv(input)?, &options, &format)?;
         if let Some(schema) = inspected {
             inferred = Some(match inferred.take() {
-                Some(prev) => merge_csv_inferred_schema(prev, schema, input)?,
+                Some(prev) => merge_csv_inferred_schema(prev, schema, input, !options.no_header)?,
                 None => schema,
             });
         }
@@ -2310,8 +2310,13 @@ fn promote_second_precision_csv_timestamps(schema: Schema) -> Schema {
     Schema::new_with_metadata(fields, schema.metadata().clone())
 }
 
-fn merge_csv_inferred_schema(prev: Schema, next: Schema, input: &Path) -> std::io::Result<Schema> {
-    if prev.fields().len() != next.fields().len() {
+fn merge_csv_inferred_schema(
+    prev: Schema,
+    next: Schema,
+    input: &Path,
+    merge_by_name: bool,
+) -> std::io::Result<Schema> {
+    if !merge_by_name && prev.fields().len() != next.fields().len() {
         return Err(csv_schema_mismatch(input));
     }
     let next_fields: std::collections::HashMap<&str, &Field> = next
@@ -2319,17 +2324,30 @@ fn merge_csv_inferred_schema(prev: Schema, next: Schema, input: &Path) -> std::i
         .iter()
         .map(|field| (field.name().as_str(), field.as_ref()))
         .collect();
-    let fields: Vec<Field> = prev
+    let prev_names: std::collections::HashSet<&str> = prev
         .fields()
         .iter()
-        .map(|left| {
-            let right = next_fields
-                .get(left.name().as_str())
-                .copied()
-                .ok_or_else(|| csv_schema_mismatch(input))?;
-            merge_csv_inferred_field(left.as_ref(), right, input)
-        })
+        .map(|field| field.name().as_str())
+        .collect();
+    let mut fields: Vec<Field> = prev
+        .fields()
+        .iter()
+        .map(
+            |left| match next_fields.get(left.name().as_str()).copied() {
+                Some(right) => merge_csv_inferred_field(left.as_ref(), right, input),
+                None if merge_by_name => Ok(left.as_ref().clone().with_nullable(true)),
+                None => Err(csv_schema_mismatch(input)),
+            },
+        )
         .collect::<std::io::Result<_>>()?;
+    if merge_by_name {
+        fields.extend(
+            next.fields()
+                .iter()
+                .filter(|field| !prev_names.contains(field.name().as_str()))
+                .map(|field| field.as_ref().clone().with_nullable(true)),
+        );
+    }
     Ok(Schema::new_with_metadata(fields, prev.metadata().clone()))
 }
 

@@ -120,9 +120,10 @@ $ mosaic convert data.json -o data.mosaic --stats id
 ## Convert CSV
 
 Import one or more regular CSV files with an inferred schema. Header fields are
-matched by name across inputs, and compatible integer/float and timestamp
-precisions are promoted. Lossy bare-integer-to-`Float64` promotion and explicit
-timezones in inferred local timestamps are rejected. Empty files are skipped.
+matched by name across inputs; fields missing from a shard are nullable and
+written as null, and compatible integer/float and timestamp precisions are
+promoted. Lossy bare-integer-to-`Float64` promotion and explicit timezones in
+inferred local timestamps are rejected. Empty files are skipped.
 CSV cannot say what type an all-empty column is, so columns inferred as Arrow
 `Null` fall back to nullable `Utf8`. `--require col` marks an inferred field as
 not null (repeat it for multiple fields). Backslash escaping is disabled by

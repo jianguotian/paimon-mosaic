@@ -642,6 +642,35 @@ fn convert_csv_matches_multi_input_fields_by_name() {
 }
 
 #[test]
+fn convert_csv_unions_missing_fields_by_name() {
+    let dir = unique_temp_dir("csv_union_missing_fields");
+    let first = dir.join("first.csv");
+    let second = dir.join("second.csv");
+    let out = dir.join("out.mosaic");
+    std::fs::write(&first, "id,left\n1,a\n").unwrap();
+    std::fs::write(&second, "id,right\n2,b\n").unwrap();
+
+    let (msg, err, ok) = run(&[
+        "convert-csv",
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+
+    let (rows, err, ok) = run(&["cat", out.to_str().unwrap(), "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        [
+            r#"{"id":1,"left":"a","right":null}"#,
+            r#"{"id":2,"left":null,"right":"b"}"#
+        ]
+    );
+}
+
+#[test]
 fn convert_csv_custom_header_preserves_first_data_row() {
     let dir = std::env::temp_dir();
     let csv = format!("{}/mosaic_e2e_custom_header.csv", dir.display());
