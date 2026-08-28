@@ -32,9 +32,13 @@ permissions:
   contents: read
 
 jobs:
+  release-preflight:
+    uses: ./.github/workflows/release-preflight.yml
+
   publish:
     name: Publish to PyPI
     if: github.repository == 'apache/paimon-mosaic' && startsWith(github.ref, 'refs/tags/')
+    needs: [release-preflight]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5

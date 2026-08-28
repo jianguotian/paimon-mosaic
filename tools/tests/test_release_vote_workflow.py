@@ -26,11 +26,17 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
+RELEASE_PREFLIGHT_WORKFLOW = ROOT / ".github/workflows/release-preflight.yml"
 GATE_WORKFLOW = ROOT / ".github/workflows/release-vote-gate.yml"
 RUST_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-rust.yml"
 JAVA_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-java.yml"
 PYTHON_PUBLISH_WORKFLOW = ROOT / ".github/workflows/release-python-publish.yml"
 RELEASE_DOCUMENTATION = ROOT / "docs/creating-a-release.html"
+CREDENTIALED_RELEASE_WORKFLOWS = (
+    (RUST_RELEASE_WORKFLOW, "publish"),
+    (JAVA_RELEASE_WORKFLOW, "deploy-staging"),
+    (PYTHON_PUBLISH_WORKFLOW, "publish"),
+)
 TAG_CONDITION = "startsWith(github.ref, 'refs/tags/')"
 RUST_PUBLISH_CONDITION = (
     "github.event_name != 'workflow_dispatch' && "
@@ -53,12 +59,8 @@ PYTHON_PUBLISH_CONDITION = (
     "!contains(github.ref_name, '-')"
 )
 REQUIRED_GATE_PATHS = {
-    ".github/workflows/release-vote-gate.yml",
-    ".github/workflows/release-java.yml",
-    ".github/workflows/release-python-publish.yml",
-    ".github/workflows/release-python.yml",
-    ".github/workflows/release-rust.yml",
-    ".github/workflows/release.yml",
+    ".gitattributes",
+    ".github/workflows/**",
     "docs/creating-a-release.html",
     "tools/create_source_release.sh",
     "tools/update_branch_version.sh",
@@ -110,6 +112,22 @@ GATE_TEST_COMMAND = """python -m pytest -q \\
   tools/tests/test_update_branch_version.py \\
   tools/tests/test_verify_release_versions.py \\
   tools/tests/test_verify_source_archive.py
+"""
+GATE_SOURCE_TREE_COMMAND = """set -euo pipefail
+output_dir="$(mktemp -d "${RUNNER_TEMP}/source-tree.XXXXXX")"
+archive="${output_dir}/source.tgz"
+commit="$(git rev-parse --verify 'HEAD^{commit}')"
+prefix="paimon-mosaic-source-tree/"
+python3 tools/verify_source_archive.py create \\
+  --repository "${GITHUB_WORKSPACE}" \\
+  --commit "${commit}" \\
+  --prefix "${prefix}" \\
+  --output "${archive}"
+python3 tools/verify_source_archive.py verify \\
+  --repository "${GITHUB_WORKSPACE}" \\
+  --commit "${commit}" \\
+  --prefix "${prefix}" \\
+  --archive "${archive}"
 """
 GATE_STATIC_COMMAND = """set -euo pipefail
 python -m compileall -q \\
@@ -179,13 +197,16 @@ def assert_gate_contract(workflow: dict) -> None:
 
     install_step = gate_step(workflow, "Install test dependencies")
     test_step = gate_step(workflow, "Run release vote tests")
+    source_tree_step = gate_step(workflow, "Verify current source tree")
     static_step = gate_step(workflow, "Run static checks")
-    for step in (install_step, test_step, static_step):
+    for step in (install_step, test_step, source_tree_step, static_step):
         assert "if" not in step
         assert "continue-on-error" not in step
 
     assert install_step["run"] == "python -m pip install pytest PyYAML"
     assert test_step["run"] == GATE_TEST_COMMAND
+    assert source_tree_step["shell"] == "bash"
+    assert source_tree_step["run"] == GATE_SOURCE_TREE_COMMAND
     assert static_step["shell"] == "bash"
     assert static_step["run"] == GATE_STATIC_COMMAND
 
@@ -195,6 +216,36 @@ def assert_release_contract(workflow: dict) -> None:
 
     jobs = workflow["jobs"]
     preflight = jobs["release-preflight"]
+    assert preflight["uses"] == "./.github/workflows/release-preflight.yml"
+    assert "runs-on" not in preflight
+    assert "continue-on-error" not in preflight
+
+    for job_name in ("rust", "java", "python-wheels", "python-publish"):
+        assert jobs[job_name].get("secrets") == "inherit"
+
+    for job_name in ("rust", "java", "python-wheels"):
+        release_job = jobs[job_name]
+        assert "release-preflight" in needs(release_job)
+        assert "if" not in release_job
+        assert "continue-on-error" not in release_job
+
+    publish_job = jobs["python-publish"]
+    assert needs(publish_job) == {"rust", "java", "python-wheels"}
+    assert publish_job["if"] == TAG_CONDITION
+    assert "continue-on-error" not in publish_job
+
+    for job_name, reusable_workflow in RELEASE_WORKFLOW_BY_JOB.items():
+        assert jobs[job_name]["uses"] == reusable_workflow
+
+    source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    assert "always()" not in source
+
+
+def assert_release_preflight_contract(workflow: dict) -> None:
+    assert "workflow_call" in workflow["on"]
+    assert workflow["permissions"]["contents"] == "read"
+
+    preflight = workflow["jobs"]["release-preflight"]
     assert "runs-on" in preflight
     assert "uses" not in preflight
     assert "continue-on-error" not in preflight
@@ -227,42 +278,53 @@ def assert_release_contract(workflow: dict) -> None:
     assert "continue-on-error" not in source_step
     assert source_step["run"] == VERIFY_SOURCE_ARCHIVE_COMMAND
 
-    for job_name in ("rust", "java", "python-wheels"):
-        release_job = jobs[job_name]
-        assert "release-preflight" in needs(release_job)
-        assert "if" not in release_job
-        assert "continue-on-error" not in release_job
 
-    publish_job = jobs["python-publish"]
-    assert needs(publish_job) == {"rust", "java", "python-wheels"}
-    assert publish_job["if"] == TAG_CONDITION
-    assert "continue-on-error" not in publish_job
-
-    for job_name, reusable_workflow in RELEASE_WORKFLOW_BY_JOB.items():
-        assert jobs[job_name]["uses"] == reusable_workflow
-
-    source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-    assert "always()" not in source
+def assert_leaf_release_contract(
+    workflow: dict,
+    required_job: str,
+) -> None:
+    assert "workflow_call" in workflow["on"]
+    assert workflow["jobs"]["release-preflight"]["uses"] == (
+        "./.github/workflows/release-preflight.yml"
+    )
+    for job_name, job in workflow["jobs"].items():
+        if job_name != "release-preflight":
+            assert "release-preflight" in needs(job)
+    assert required_job in workflow["jobs"]
 
 
 def test_release_has_signed_exact_tag_preflight() -> None:
-    workflow = load_workflow(RELEASE_WORKFLOW)
-    assert_release_contract(workflow)
+    release = load_workflow(RELEASE_WORKFLOW)
+    preflight = load_workflow(RELEASE_PREFLIGHT_WORKFLOW)
+    assert_release_contract(release)
+    assert_release_preflight_contract(preflight)
 
-    triggers = workflow["on"]
+    triggers = release["on"]
     assert "workflow_dispatch" in triggers
-    version_step = release_version_step(workflow)
+    version_step = release_version_step(preflight)
     assert version_step["if"] == TAG_CONDITION
     assert "github.ref_name" in version_step["env"]["TAG_NAME"]
     assert "github.ref_name" not in version_step["run"]
 
 
+def test_release_preflight_is_reusable_and_called_by_orchestrator() -> None:
+    preflight = load_workflow(RELEASE_PREFLIGHT_WORKFLOW)
+    release = load_workflow(RELEASE_WORKFLOW)
+
+    assert "workflow_call" in preflight["on"]
+    assert release["jobs"]["release-preflight"]["uses"] == (
+        "./.github/workflows/release-preflight.yml"
+    )
+
+
 def test_release_preflight_does_not_use_private_key_secret() -> None:
-    assert "GPG_SECRET_KEY" not in RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    assert "GPG_SECRET_KEY" not in RELEASE_PREFLIGHT_WORKFLOW.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_release_tag_context_is_not_interpolated_into_shell() -> None:
-    workflow = load_workflow(RELEASE_WORKFLOW)
+    workflow = load_workflow(RELEASE_PREFLIGHT_WORKFLOW)
     version_step = release_version_step(workflow)
 
     assert version_step["env"] == {
@@ -305,6 +367,19 @@ def test_manual_release_dispatch_cannot_publish_python() -> None:
     assert len(final_publish) == 1
     assert test_publish[0]["if"] == PYTHON_TEST_PUBLISH_CONDITION
     assert final_publish[0]["if"] == PYTHON_PUBLISH_CONDITION
+
+
+@pytest.mark.parametrize(
+    ("workflow_path", "credentialed_job"),
+    CREDENTIALED_RELEASE_WORKFLOWS,
+)
+def test_credentialed_release_jobs_require_reusable_preflight(
+    workflow_path: Path,
+    credentialed_job: str,
+) -> None:
+    workflow = load_workflow(workflow_path)
+
+    assert_leaf_release_contract(workflow, credentialed_job)
 
 
 def test_java_release_tag_context_is_not_interpolated_into_shell() -> None:
@@ -369,12 +444,56 @@ def test_contract_rejects_wrong_reusable_workflow(job_name: str) -> None:
         assert_release_contract(workflow)
 
 
-def test_contract_rejects_masked_release_verifier_failure() -> None:
+@pytest.mark.parametrize("job_name", RELEASE_WORKFLOW_BY_JOB)
+def test_contract_rejects_missing_secret_inheritance(job_name: str) -> None:
     workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
-    release_version_step(workflow)["run"] += " || true"
+    workflow["jobs"][job_name].pop("secrets")
 
     with pytest.raises(AssertionError):
         assert_release_contract(workflow)
+
+
+@pytest.mark.parametrize(
+    ("workflow_path", "credentialed_job"),
+    CREDENTIALED_RELEASE_WORKFLOWS,
+)
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing-workflow-call", "missing-dependency", "unguarded-extra-job"),
+)
+def test_credentialed_release_contract_rejects_preflight_bypass(
+    workflow_path: Path,
+    credentialed_job: str,
+    mutation: str,
+) -> None:
+    workflow = copy.deepcopy(load_workflow(workflow_path))
+    if mutation == "missing-workflow-call":
+        workflow["on"].pop("workflow_call")
+    elif mutation == "missing-dependency":
+        job = workflow["jobs"][credentialed_job]
+        job["needs"] = [
+            dependency
+            for dependency in job.get("needs", [])
+            if dependency != "release-preflight"
+        ]
+    elif mutation == "unguarded-extra-job":
+        workflow["jobs"]["alternate-publish"] = {
+            "runs-on": "ubuntu-latest",
+            "steps": [{"run": "echo publish"}],
+        }
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    with pytest.raises(AssertionError):
+        assert_leaf_release_contract(workflow, credentialed_job)
+
+
+def test_contract_rejects_masked_release_verifier_failure() -> None:
+    workflow = copy.deepcopy(load_workflow(RELEASE_PREFLIGHT_WORKFLOW))
+    release_version_step(workflow)["run"] += " || true"
+
+    with pytest.raises(AssertionError):
+        assert_release_preflight_contract(workflow)
 
 
 @pytest.mark.parametrize(
@@ -384,7 +503,7 @@ def test_contract_rejects_masked_release_verifier_failure() -> None:
 def test_contract_rejects_source_archive_preflight_mutations(
     mutation: str,
 ) -> None:
-    workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
+    workflow = copy.deepcopy(load_workflow(RELEASE_PREFLIGHT_WORKFLOW))
     if mutation == "missing-step":
         steps = workflow["jobs"]["release-preflight"]["steps"]
         steps.remove(named_step(workflow, "Verify source archive"))
@@ -404,7 +523,7 @@ def test_contract_rejects_source_archive_preflight_mutations(
         raise AssertionError(f"unknown mutation: {mutation}")
 
     with pytest.raises(AssertionError):
-        assert_release_contract(workflow)
+        assert_release_preflight_contract(workflow)
 
 
 @pytest.mark.parametrize(
@@ -418,7 +537,7 @@ def test_contract_rejects_source_archive_preflight_mutations(
     ),
 )
 def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
-    workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
+    workflow = copy.deepcopy(load_workflow(RELEASE_PREFLIGHT_WORKFLOW))
     if mutation == "wrong-checkout-ref":
         checkout = next(
             step
@@ -450,7 +569,7 @@ def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
         raise AssertionError(f"unknown mutation: {mutation}")
 
     with pytest.raises(AssertionError):
-        assert_release_contract(workflow)
+        assert_release_preflight_contract(workflow)
 
 
 @pytest.mark.parametrize(
@@ -458,18 +577,23 @@ def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
     ("cancel-in-progress", "preflight-continue", "version-step-continue"),
 )
 def test_contract_rejects_non_blocking_preflight_mutations(mutation: str) -> None:
-    workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
     if mutation == "cancel-in-progress":
+        workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
         workflow["concurrency"]["cancel-in-progress"] = "true"
+        contract = assert_release_contract
     elif mutation == "preflight-continue":
+        workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
         workflow["jobs"]["release-preflight"]["continue-on-error"] = "true"
+        contract = assert_release_contract
     elif mutation == "version-step-continue":
+        workflow = copy.deepcopy(load_workflow(RELEASE_PREFLIGHT_WORKFLOW))
         release_version_step(workflow)["continue-on-error"] = "true"
+        contract = assert_release_preflight_contract
     else:
         raise AssertionError(f"unknown mutation: {mutation}")
 
     with pytest.raises(AssertionError):
-        assert_release_contract(workflow)
+        contract(workflow)
 
 
 def test_source_release_documentation_passes_rc_tag_explicitly() -> None:
@@ -513,22 +637,34 @@ def test_release_vote_gate_matches_blocking_contract() -> None:
 
 
 @pytest.mark.parametrize("event", ("pull_request", "push"))
-@pytest.mark.parametrize(
-    "workflow_path",
-    (
-        ".github/workflows/release.yml",
-        *(
-            path.removeprefix("./")
-            for path in RELEASE_WORKFLOW_BY_JOB.values()
-        ),
-    ),
-)
-def test_gate_contract_rejects_missing_release_workflow_path(
+def test_release_vote_gate_covers_all_workflows_and_archive_attributes(
     event: str,
-    workflow_path: str,
+) -> None:
+    workflow = load_workflow(GATE_WORKFLOW)
+    paths = set(workflow["on"][event]["paths"])
+
+    assert ".github/workflows/**" in paths
+    assert ".gitattributes" in paths
+
+
+def test_release_vote_gate_verifies_current_source_tree() -> None:
+    workflow = load_workflow(GATE_WORKFLOW)
+    step = gate_step(workflow, "Verify current source tree")
+
+    assert "if" not in step
+    assert "continue-on-error" not in step
+    assert step["shell"] == "bash"
+    assert step["run"] == GATE_SOURCE_TREE_COMMAND
+
+
+@pytest.mark.parametrize("event", ("pull_request", "push"))
+@pytest.mark.parametrize("required_path", (".github/workflows/**", ".gitattributes"))
+def test_gate_contract_rejects_missing_release_input_path(
+    event: str,
+    required_path: str,
 ) -> None:
     workflow = copy.deepcopy(load_workflow(GATE_WORKFLOW))
-    workflow["on"][event]["paths"].remove(workflow_path)
+    workflow["on"][event]["paths"].remove(required_path)
 
     with pytest.raises(AssertionError):
         assert_gate_contract(workflow)
@@ -559,6 +695,33 @@ def test_gate_contract_rejects_non_blocking_test_mutations(mutation: str) -> Non
         gate_step(workflow, "Run release vote tests")["if"] = "failure()"
     elif mutation == "job-continue":
         workflow["jobs"]["release-vote-gate"]["continue-on-error"] = "true"
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    with pytest.raises(AssertionError):
+        assert_gate_contract(workflow)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("masked-command", "step-continue", "step-condition", "wrong-commit"),
+)
+def test_gate_contract_rejects_source_tree_check_mutations(
+    mutation: str,
+) -> None:
+    workflow = copy.deepcopy(load_workflow(GATE_WORKFLOW))
+    source_step = gate_step(workflow, "Verify current source tree")
+    if mutation == "masked-command":
+        source_step["run"] += " || true"
+    elif mutation == "step-continue":
+        source_step["continue-on-error"] = "true"
+    elif mutation == "step-condition":
+        source_step["if"] = "failure()"
+    elif mutation == "wrong-commit":
+        source_step["run"] = source_step["run"].replace(
+            '--commit "${commit}"',
+            "--commit HEAD^",
+        )
     else:
         raise AssertionError(f"unknown mutation: {mutation}")
 

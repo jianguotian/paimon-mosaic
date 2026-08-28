@@ -33,7 +33,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-preflight:
+    uses: ./.github/workflows/release-preflight.yml
+
   publish:
+    needs: [release-preflight]
     runs-on: ubuntu-latest
     permissions:
       contents: read

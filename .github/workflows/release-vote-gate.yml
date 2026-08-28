@@ -21,12 +21,8 @@ on:
   pull_request:
     branches: [main, "release-*"]
     paths:
-      - ".github/workflows/release-vote-gate.yml"
-      - ".github/workflows/release-java.yml"
-      - ".github/workflows/release-python-publish.yml"
-      - ".github/workflows/release-python.yml"
-      - ".github/workflows/release-rust.yml"
-      - ".github/workflows/release.yml"
+      - ".gitattributes"
+      - ".github/workflows/**"
       - "docs/creating-a-release.html"
       - "tools/create_source_release.sh"
       - "tools/update_branch_version.sh"
@@ -40,12 +36,8 @@ on:
   push:
     branches: [main, "release-*"]
     paths:
-      - ".github/workflows/release-vote-gate.yml"
-      - ".github/workflows/release-java.yml"
-      - ".github/workflows/release-python-publish.yml"
-      - ".github/workflows/release-python.yml"
-      - ".github/workflows/release-rust.yml"
-      - ".github/workflows/release.yml"
+      - ".gitattributes"
+      - ".github/workflows/**"
       - "docs/creating-a-release.html"
       - "tools/create_source_release.sh"
       - "tools/update_branch_version.sh"
@@ -85,6 +77,25 @@ jobs:
             tools/tests/test_update_branch_version.py \
             tools/tests/test_verify_release_versions.py \
             tools/tests/test_verify_source_archive.py
+
+      - name: Verify current source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir="$(mktemp -d "${RUNNER_TEMP}/source-tree.XXXXXX")"
+          archive="${output_dir}/source.tgz"
+          commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          prefix="paimon-mosaic-source-tree/"
+          python3 tools/verify_source_archive.py create \
+            --repository "${GITHUB_WORKSPACE}" \
+            --commit "${commit}" \
+            --prefix "${prefix}" \
+            --output "${archive}"
+          python3 tools/verify_source_archive.py verify \
+            --repository "${GITHUB_WORKSPACE}" \
+            --commit "${commit}" \
+            --prefix "${prefix}" \
+            --archive "${archive}"
 
       - name: Run static checks
         shell: bash
