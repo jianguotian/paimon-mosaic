@@ -258,6 +258,7 @@ fn main() -> ExitCode {
                 options,
                 stats.as_deref(),
                 overwrite,
+                false,
             )
         }
     };
@@ -538,6 +539,7 @@ fn convert(
             },
             stats,
             overwrite,
+            true,
         );
     }
     let columns = parse_convert_columns(columns)?;
@@ -579,6 +581,7 @@ fn convert_csv(
     options: CsvConvertOptions,
     stats: Option<&str>,
     overwrite: bool,
+    allow_empty_legacy_input: bool,
 ) -> std::io::Result<()> {
     if inputs.is_empty() {
         return Err(std::io::Error::new(
@@ -595,31 +598,30 @@ fn convert_csv(
     let format = csv_format(&options)?;
     let mut inferred: Option<Schema> = None;
     for input in inputs {
-        let layout = csv_input_layout(input, &options)?;
-        if !layout.has_records {
-            continue;
+        let inspected = inspect_csv_input(open_csv(input)?, &options, &format)?;
+        if let Some(schema) = inspected {
+            inferred = Some(match inferred.take() {
+                Some(prev) => merge_csv_inferred_schema(prev, schema, input)?,
+                None => schema,
+            });
         }
-        let (schema, rows) = format
-            .infer_schema(open_csv(input, options.skip_lines)?, None)
-            .map_err(bad)?;
-        // A shard with no data rows has nothing to infer from; it is skipped
-        // when reading too.
-        if rows == 0 || schema.fields().is_empty() {
-            continue;
-        }
-        let schema =
-            promote_second_precision_csv_timestamps(csv_schema_with_csv_names(schema, &options)?);
-        inferred = Some(match inferred.take() {
-            Some(prev) => merge_csv_inferred_schema(prev, schema, input)?,
-            None => schema,
-        });
     }
-    let schema = inferred.ok_or_else(|| invalid_schema("no CSV data to infer a schema from"))?;
+    let schema = match inferred {
+        Some(schema) => schema,
+        None if allow_empty_legacy_input
+            && inputs.len() == 1
+            && std::fs::metadata(&inputs[0])?.len() == 0 =>
+        {
+            Schema::empty()
+        }
+        None => return Err(invalid_schema("no CSV data to infer a schema from")),
+    };
     let schema = apply_required_fields(csv_schema_with_null_fallback(schema), required_fields)?;
     let schema_index = csv_schema_index(&schema);
     write_mosaic(out, overwrite, &schema, stats, |writer, rows| {
         for input in inputs {
-            let layout = csv_input_layout(input, &options)?;
+            let mut reader = open_csv(input)?;
+            let layout = inspect_csv_layout(&mut reader, &options)?;
             if !layout.has_records {
                 continue;
             }
@@ -627,13 +629,8 @@ fn convert_csv(
             let source_mapping = csv_output_mapping(&schema, &schema_index, &layout);
             validate_csv_mapping(&schema, &layout, &source_mapping, input)?;
             let (projection, mapping) = csv_projection(&source_mapping);
-            let reader = build_csv_replay_reader(
-                reader_schema,
-                format.clone(),
-                projection,
-                open_csv(input, options.skip_lines)?,
-            )
-            .map_err(bad)?;
+            let reader = build_csv_replay_reader(reader_schema, format.clone(), projection, reader)
+                .map_err(bad)?;
             for batch in reader {
                 let batch = batch.map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
@@ -893,6 +890,7 @@ fn infer_json_schema_lossless<R: std::io::BufRead>(
     let columns: Option<std::collections::HashSet<&str>> =
         columns.map(|columns| columns.iter().map(String::as_str).collect());
     let mut inexact_f64_integer_paths = std::collections::BTreeSet::new();
+    let mut inexact_f64_integer_path_index = JsonNumberPathTrie::default();
     let schema = {
         let mut line = String::new();
         let values = std::iter::from_fn(|| loop {
@@ -906,19 +904,59 @@ fn infer_json_schema_lossless<R: std::io::BufRead>(
                 }
                 Ok(_) if line.trim().is_empty() => continue,
                 Ok(_) => {
-                    // Parse one JSON value per line, matching Arrow's JSON reader,
-                    // while keeping retained values raw until numeric validation.
-                    let mut deserializer = serde_json::Deserializer::from_str(line.trim());
-                    let value = FilteredJsonRecordSeed {
-                        columns: columns.as_ref(),
-                        inexact_f64_integer_paths: &mut inexact_f64_integer_paths,
-                    }
-                    .deserialize(&mut deserializer)
-                    .and_then(|value| {
-                        deserializer.end()?;
-                        Ok(value)
-                    })
-                    .map_err(|error| ArrowError::JsonError(format!("Not valid JSON: {error}")));
+                    let record = line.trim();
+                    let value = if columns.is_some() {
+                        // Projection must not materialize or numerically validate
+                        // unselected values: a caller can deliberately exclude an
+                        // otherwise unsupported number.
+                        parse_json_record_lossless(
+                            record,
+                            columns.as_ref(),
+                            &mut inexact_f64_integer_paths,
+                        )
+                        .map_err(|error| ArrowError::JsonError(format!("Not valid JSON: {error}")))
+                    } else {
+                        match serde_json::from_str::<Value>(record) {
+                            Ok(value) if !json_value_might_need_lossless_numbers(&value) => {
+                                Ok(value)
+                            }
+                            Ok(value) => {
+                                match scan_json_numbers(
+                                    record,
+                                    &mut inexact_f64_integer_paths,
+                                    &mut inexact_f64_integer_path_index,
+                                ) {
+                                    Ok(()) => Ok(value),
+                                    Err(JsonNumberScanError::Syntax) => parse_json_record_lossless(
+                                        record,
+                                        None,
+                                        &mut inexact_f64_integer_paths,
+                                    )
+                                    .map_err(|error| {
+                                        ArrowError::JsonError(format!("Not valid JSON: {error}"))
+                                    }),
+                                }
+                            }
+                            Err(error) => match parse_json_record_lossless(
+                                record,
+                                None,
+                                &mut inexact_f64_integer_paths,
+                            ) {
+                                Err(lossless_error)
+                                    if lossless_error
+                                        .to_string()
+                                        .contains("out of range for Float64") =>
+                                {
+                                    Err(ArrowError::JsonError(format!(
+                                        "Not valid JSON: {lossless_error}"
+                                    )))
+                                }
+                                Ok(_) | Err(_) => {
+                                    Err(ArrowError::JsonError(format!("Not valid JSON: {error}")))
+                                }
+                            },
+                        }
+                    };
                     return Some(value);
                 }
             }
@@ -936,32 +974,49 @@ fn infer_json_schema_lossless<R: std::io::BufRead>(
     Ok(schema)
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum JsonNumberPathSegment {
     Field(String),
     Element,
 }
 
+const MAX_JSON_NESTING_DEPTH: usize = 128;
+
 fn collect_inexact_f64_integer_paths(
     raw: &RawValue,
     path: &mut Vec<JsonNumberPathSegment>,
     inexact: &mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+    parent_depth: usize,
 ) -> Result<(), String> {
     let literal = raw.get().trim();
     match literal.as_bytes().first().copied() {
         Some(b'{') => {
+            if parent_depth == MAX_JSON_NESTING_DEPTH {
+                return Err("recursion limit exceeded".to_string());
+            }
             let mut deserializer = serde_json::Deserializer::from_str(literal);
             serde::Deserializer::deserialize_map(
                 &mut deserializer,
-                RawJsonObjectVisitor { path, inexact },
+                RawJsonObjectVisitor {
+                    path,
+                    inexact,
+                    depth: parent_depth + 1,
+                },
             )
             .map_err(|error| error.to_string())?;
         }
         Some(b'[') => {
+            if parent_depth == MAX_JSON_NESTING_DEPTH {
+                return Err("recursion limit exceeded".to_string());
+            }
             let mut deserializer = serde_json::Deserializer::from_str(literal);
             serde::Deserializer::deserialize_seq(
                 &mut deserializer,
-                RawJsonArrayVisitor { path, inexact },
+                RawJsonArrayVisitor {
+                    path,
+                    inexact,
+                    depth: parent_depth + 1,
+                },
             )
             .map_err(|error| error.to_string())?;
         }
@@ -994,6 +1049,7 @@ fn collect_inexact_f64_integer_paths(
 struct RawJsonObjectVisitor<'path, 'inexact> {
     path: &'path mut Vec<JsonNumberPathSegment>,
     inexact: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+    depth: usize,
 }
 
 impl<'de> Visitor<'de> for RawJsonObjectVisitor<'_, '_> {
@@ -1011,7 +1067,7 @@ impl<'de> Visitor<'de> for RawJsonObjectVisitor<'_, '_> {
             let raw = map.next_value::<&RawValue>()?;
             self.path
                 .push(JsonNumberPathSegment::Field(name.into_owned()));
-            collect_inexact_f64_integer_paths(raw, self.path, self.inexact)
+            collect_inexact_f64_integer_paths(raw, self.path, self.inexact, self.depth)
                 .map_err(serde::de::Error::custom)?;
             self.path.pop();
         }
@@ -1022,6 +1078,7 @@ impl<'de> Visitor<'de> for RawJsonObjectVisitor<'_, '_> {
 struct RawJsonArrayVisitor<'path, 'inexact> {
     path: &'path mut Vec<JsonNumberPathSegment>,
     inexact: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+    depth: usize,
 }
 
 impl<'de> Visitor<'de> for RawJsonArrayVisitor<'_, '_> {
@@ -1037,11 +1094,373 @@ impl<'de> Visitor<'de> for RawJsonArrayVisitor<'_, '_> {
     {
         self.path.push(JsonNumberPathSegment::Element);
         while let Some(raw) = sequence.next_element::<&RawValue>()? {
-            collect_inexact_f64_integer_paths(raw, self.path, self.inexact)
+            collect_inexact_f64_integer_paths(raw, self.path, self.inexact, self.depth)
                 .map_err(serde::de::Error::custom)?;
         }
         self.path.pop();
         Ok(())
+    }
+}
+
+fn json_integer_exceeds_exact_f64_range(literal: &str) -> bool {
+    const MAX_EXACT_F64_INTEGER: &str = "9007199254740992";
+    let digits = literal
+        .strip_prefix('-')
+        .unwrap_or(literal)
+        .trim_start_matches('0');
+    digits.len() > MAX_EXACT_F64_INTEGER.len()
+        || (digits.len() == MAX_EXACT_F64_INTEGER.len() && digits > MAX_EXACT_F64_INTEGER)
+}
+
+fn json_value_might_need_lossless_numbers(value: &Value) -> bool {
+    const MAX_EXACT_F64_INTEGER: u64 = 9_007_199_254_740_992;
+    match value {
+        Value::Number(number) => match (number.as_i64(), number.as_u64()) {
+            (Some(value), _) => value.unsigned_abs() > MAX_EXACT_F64_INTEGER,
+            (_, Some(value)) => value > MAX_EXACT_F64_INTEGER,
+            (None, None) => number
+                .as_f64()
+                .is_some_and(|value| value.abs() > MAX_EXACT_F64_INTEGER as f64),
+        },
+        Value::Array(values) => values.iter().any(json_value_might_need_lossless_numbers),
+        Value::Object(record) => record.values().any(json_value_might_need_lossless_numbers),
+        Value::Null | Value::Bool(_) | Value::String(_) => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JsonScanPathSegment {
+    Field { start: usize, end: usize },
+    Element,
+}
+
+#[derive(Debug)]
+enum JsonNumberScanError {
+    Syntax,
+}
+
+fn scan_json_numbers(
+    record: &str,
+    inexact: &mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+    inexact_index: &mut JsonNumberPathTrie,
+) -> Result<(), JsonNumberScanError> {
+    let mut scanner = JsonNumberScanner {
+        bytes: record.as_bytes(),
+        position: 0,
+        path: Vec::new(),
+        inexact,
+        inexact_index,
+        depth: 0,
+    };
+    scanner.scan_value()?;
+    scanner.skip_whitespace();
+    if scanner.position == scanner.bytes.len() {
+        Ok(())
+    } else {
+        Err(JsonNumberScanError::Syntax)
+    }
+}
+
+struct JsonNumberScanner<'record, 'inexact, 'index> {
+    bytes: &'record [u8],
+    position: usize,
+    path: Vec<JsonScanPathSegment>,
+    inexact: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+    inexact_index: &'index mut JsonNumberPathTrie,
+    depth: usize,
+}
+
+impl JsonNumberScanner<'_, '_, '_> {
+    fn scan_value(&mut self) -> Result<(), JsonNumberScanError> {
+        self.skip_whitespace();
+        match self.bytes.get(self.position).copied() {
+            Some(b'{') => self.scan_object(),
+            Some(b'[') => self.scan_array(),
+            Some(b'"') => self.scan_string().map(|_| ()),
+            Some(b'-' | b'0'..=b'9') => self.scan_number(),
+            Some(b't') => self.scan_keyword(b"true"),
+            Some(b'f') => self.scan_keyword(b"false"),
+            Some(b'n') => self.scan_keyword(b"null"),
+            _ => Err(JsonNumberScanError::Syntax),
+        }
+    }
+
+    fn scan_object(&mut self) -> Result<(), JsonNumberScanError> {
+        self.enter_container()?;
+        let result = self.scan_object_contents();
+        self.depth -= 1;
+        result
+    }
+
+    fn scan_object_contents(&mut self) -> Result<(), JsonNumberScanError> {
+        self.position += 1;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Ok(());
+        }
+        loop {
+            self.skip_whitespace();
+            let (start, end) = self.scan_string()?;
+            self.skip_whitespace();
+            if !self.consume(b':') {
+                return Err(JsonNumberScanError::Syntax);
+            }
+            self.path.push(JsonScanPathSegment::Field { start, end });
+            self.scan_value()?;
+            self.path.pop();
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Ok(());
+            }
+            if !self.consume(b',') {
+                return Err(JsonNumberScanError::Syntax);
+            }
+        }
+    }
+
+    fn scan_array(&mut self) -> Result<(), JsonNumberScanError> {
+        self.enter_container()?;
+        let result = self.scan_array_contents();
+        self.depth -= 1;
+        result
+    }
+
+    fn scan_array_contents(&mut self) -> Result<(), JsonNumberScanError> {
+        self.position += 1;
+        self.skip_whitespace();
+        if self.consume(b']') {
+            return Ok(());
+        }
+        self.path.push(JsonScanPathSegment::Element);
+        loop {
+            self.scan_value()?;
+            self.skip_whitespace();
+            if self.consume(b']') {
+                self.path.pop();
+                return Ok(());
+            }
+            if !self.consume(b',') {
+                self.path.pop();
+                return Err(JsonNumberScanError::Syntax);
+            }
+        }
+    }
+
+    fn enter_container(&mut self) -> Result<(), JsonNumberScanError> {
+        if self.depth == MAX_JSON_NESTING_DEPTH {
+            return Err(JsonNumberScanError::Syntax);
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn scan_string(&mut self) -> Result<(usize, usize), JsonNumberScanError> {
+        let start = self.position;
+        if !self.consume(b'"') {
+            return Err(JsonNumberScanError::Syntax);
+        }
+        while let Some(byte) = self.bytes.get(self.position).copied() {
+            match byte {
+                b'"' => {
+                    self.position += 1;
+                    return Ok((start, self.position));
+                }
+                b'\\' => {
+                    self.position += 1;
+                    let escaped = self
+                        .bytes
+                        .get(self.position)
+                        .copied()
+                        .ok_or(JsonNumberScanError::Syntax)?;
+                    self.position += 1;
+                    if escaped == b'u' {
+                        if self.position + 4 > self.bytes.len() {
+                            return Err(JsonNumberScanError::Syntax);
+                        }
+                        self.position += 4;
+                    }
+                }
+                0..=0x1f => return Err(JsonNumberScanError::Syntax),
+                _ => self.position += 1,
+            }
+        }
+        Err(JsonNumberScanError::Syntax)
+    }
+
+    fn scan_number(&mut self) -> Result<(), JsonNumberScanError> {
+        let start = self.position;
+        self.consume(b'-');
+        match self.bytes.get(self.position).copied() {
+            Some(b'0') => self.position += 1,
+            Some(b'1'..=b'9') => {
+                self.position += 1;
+                while matches!(self.bytes.get(self.position), Some(b'0'..=b'9')) {
+                    self.position += 1;
+                }
+            }
+            _ => return Err(JsonNumberScanError::Syntax),
+        }
+        if self.consume(b'.') {
+            let fraction_start = self.position;
+            while matches!(self.bytes.get(self.position), Some(b'0'..=b'9')) {
+                self.position += 1;
+            }
+            if self.position == fraction_start {
+                return Err(JsonNumberScanError::Syntax);
+            }
+        }
+        if matches!(self.bytes.get(self.position), Some(b'e' | b'E')) {
+            self.position += 1;
+            if matches!(self.bytes.get(self.position), Some(b'+' | b'-')) {
+                self.position += 1;
+            }
+            let exponent_start = self.position;
+            while matches!(self.bytes.get(self.position), Some(b'0'..=b'9')) {
+                self.position += 1;
+            }
+            if self.position == exponent_start {
+                return Err(JsonNumberScanError::Syntax);
+            }
+        }
+        if !self
+            .bytes
+            .get(self.position)
+            .is_none_or(|byte| matches!(*byte, b' ' | b'\t' | b'\r' | b'\n' | b',' | b']' | b'}'))
+        {
+            return Err(JsonNumberScanError::Syntax);
+        }
+        let literal = std::str::from_utf8(&self.bytes[start..self.position])
+            .map_err(|_| JsonNumberScanError::Syntax)?;
+        let integer = !literal
+            .bytes()
+            .any(|byte| matches!(byte, b'.' | b'e' | b'E'));
+        if integer
+            && json_integer_exceeds_exact_f64_range(literal)
+            && !self
+                .inexact_index
+                .contains_scan_path(self.bytes, &self.path)?
+            && is_inexact_f64_integer(literal)
+        {
+            let path = materialize_json_scan_path(self.bytes, &self.path)?;
+            self.inexact_index.insert(&path);
+            self.inexact.insert(path);
+        }
+        Ok(())
+    }
+
+    fn scan_keyword(&mut self, keyword: &[u8]) -> Result<(), JsonNumberScanError> {
+        if self.bytes.get(self.position..self.position + keyword.len()) != Some(keyword) {
+            return Err(JsonNumberScanError::Syntax);
+        }
+        self.position += keyword.len();
+        if self
+            .bytes
+            .get(self.position)
+            .is_none_or(|byte| matches!(*byte, b' ' | b'\t' | b'\r' | b'\n' | b',' | b']' | b'}'))
+        {
+            Ok(())
+        } else {
+            Err(JsonNumberScanError::Syntax)
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(
+            self.bytes.get(self.position),
+            Some(b' ' | b'\t' | b'\r' | b'\n')
+        ) {
+            self.position += 1;
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.bytes.get(self.position) == Some(&expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn materialize_json_scan_path(
+    bytes: &[u8],
+    path: &[JsonScanPathSegment],
+) -> Result<Vec<JsonNumberPathSegment>, JsonNumberScanError> {
+    path.iter()
+        .map(|segment| match segment {
+            JsonScanPathSegment::Field { start, end } => json_scan_field_name(bytes, *start, *end)
+                .map(std::borrow::Cow::into_owned)
+                .map(JsonNumberPathSegment::Field),
+            JsonScanPathSegment::Element => Ok(JsonNumberPathSegment::Element),
+        })
+        .collect()
+}
+
+fn json_scan_field_name(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<std::borrow::Cow<'_, str>, JsonNumberScanError> {
+    let raw = bytes.get(start..end).ok_or(JsonNumberScanError::Syntax)?;
+    let inner = raw
+        .get(1..raw.len().saturating_sub(1))
+        .ok_or(JsonNumberScanError::Syntax)?;
+    if !inner.contains(&b'\\') {
+        return std::str::from_utf8(inner)
+            .map(std::borrow::Cow::Borrowed)
+            .map_err(|_| JsonNumberScanError::Syntax);
+    }
+    serde_json::from_slice::<String>(raw)
+        .map(std::borrow::Cow::Owned)
+        .map_err(|_| JsonNumberScanError::Syntax)
+}
+
+#[derive(Default)]
+struct JsonNumberPathTrie {
+    terminal: bool,
+    fields: std::collections::HashMap<String, JsonNumberPathTrie>,
+    element: Option<Box<JsonNumberPathTrie>>,
+}
+
+impl JsonNumberPathTrie {
+    fn contains_scan_path(
+        &self,
+        bytes: &[u8],
+        path: &[JsonScanPathSegment],
+    ) -> Result<bool, JsonNumberScanError> {
+        let mut node = self;
+        for segment in path {
+            node = match segment {
+                JsonScanPathSegment::Field { start, end } => {
+                    let name = json_scan_field_name(bytes, *start, *end)?;
+                    let Some(child) = node.fields.get(name.as_ref()) else {
+                        return Ok(false);
+                    };
+                    child
+                }
+                JsonScanPathSegment::Element => {
+                    let Some(child) = node.element.as_deref() else {
+                        return Ok(false);
+                    };
+                    child
+                }
+            };
+        }
+        Ok(node.terminal)
+    }
+
+    fn insert(&mut self, path: &[JsonNumberPathSegment]) {
+        let mut node = self;
+        for segment in path {
+            node = match segment {
+                JsonNumberPathSegment::Field(name) => node.fields.entry(name.clone()).or_default(),
+                JsonNumberPathSegment::Element => node
+                    .element
+                    .get_or_insert_with(|| Box::new(JsonNumberPathTrie::default())),
+            };
+        }
+        node.terminal = true;
     }
 }
 
@@ -1127,6 +1546,21 @@ fn format_json_number_path(path: &[JsonNumberPathSegment]) -> String {
     formatted
 }
 
+fn parse_json_record_lossless<'columns>(
+    record: &str,
+    columns: Option<&'columns std::collections::HashSet<&'columns str>>,
+    inexact_f64_integer_paths: &mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_str(record);
+    let value = FilteredJsonRecordSeed {
+        columns,
+        inexact_f64_integer_paths,
+    }
+    .deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
 struct FilteredJsonRecordSeed<'columns, 'inexact> {
     columns: Option<&'columns std::collections::HashSet<&'columns str>>,
     inexact_f64_integer_paths: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
@@ -1171,8 +1605,13 @@ impl<'de> Visitor<'de> for FilteredJsonRecordVisitor<'_, '_> {
                 let name = name.into_owned();
                 let raw = map.next_value::<&RawValue>()?;
                 let mut path = vec![JsonNumberPathSegment::Field(name.clone())];
-                collect_inexact_f64_integer_paths(raw, &mut path, self.inexact_f64_integer_paths)
-                    .map_err(serde::de::Error::custom)?;
+                collect_inexact_f64_integer_paths(
+                    raw,
+                    &mut path,
+                    self.inexact_f64_integer_paths,
+                    1,
+                )
+                .map_err(serde::de::Error::custom)?;
                 let value = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
                 projected.insert(name, value);
             } else {
@@ -1273,14 +1712,16 @@ fn parse_optional_csv_byte(value: Option<&str>, name: &str) -> std::io::Result<O
     value.map(|value| parse_csv_byte(value, name)).transpose()
 }
 
-fn open_csv(path: &Path, skip_lines: usize) -> std::io::Result<std::io::BufReader<std::fs::File>> {
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+fn open_csv(path: &Path) -> std::io::Result<std::io::BufReader<std::fs::File>> {
+    Ok(std::io::BufReader::new(std::fs::File::open(path)?))
+}
+
+fn skip_csv_lines<R: std::io::BufRead>(reader: &mut R, skip_lines: usize) -> std::io::Result<()> {
     for _ in 0..skip_lines {
         loop {
             let buffer = reader.fill_buf()?;
             if buffer.is_empty() {
-                return Ok(reader);
+                return Ok(());
             }
             let newline = buffer.iter().position(|byte| *byte == b'\n');
             let consumed = newline.map_or(buffer.len(), |index| index + 1);
@@ -1290,7 +1731,7 @@ fn open_csv(path: &Path, skip_lines: usize) -> std::io::Result<std::io::BufReade
             }
         }
     }
-    Ok(reader)
+    Ok(())
 }
 
 const DEFAULT_CSV_BATCH_SIZE: usize = 1024;
@@ -1323,7 +1764,44 @@ struct CsvInputLayout {
     has_records: bool,
 }
 
-fn csv_input_layout(path: &Path, options: &CsvConvertOptions) -> std::io::Result<CsvInputLayout> {
+fn inspect_csv_input<R: std::io::BufRead + std::io::Seek>(
+    mut reader: R,
+    options: &CsvConvertOptions,
+    format: &arrow::csv::reader::Format,
+) -> std::io::Result<Option<Schema>> {
+    let layout = inspect_csv_layout(&mut reader, options)?;
+    if !layout.has_records {
+        return Ok(None);
+    }
+
+    let (schema, rows) = format
+        .infer_schema(reader, None)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    // A shard with no data rows has nothing to infer from; it is skipped
+    // when reading too.
+    if rows == 0 || schema.fields().is_empty() {
+        return Ok(None);
+    }
+    let schema =
+        promote_second_precision_csv_timestamps(csv_schema_with_csv_names(schema, options)?);
+    Ok(Some(schema))
+}
+
+fn inspect_csv_layout<R: std::io::BufRead + std::io::Seek>(
+    reader: &mut R,
+    options: &CsvConvertOptions,
+) -> std::io::Result<CsvInputLayout> {
+    skip_csv_lines(reader, options.skip_lines)?;
+    let layout = csv_input_layout(&mut *reader, options)?;
+    reader.seek(std::io::SeekFrom::Start(0))?;
+    skip_csv_lines(reader, options.skip_lines)?;
+    Ok(layout)
+}
+
+fn csv_input_layout<R: std::io::Read>(
+    reader: R,
+    options: &CsvConvertOptions,
+) -> std::io::Result<CsvInputLayout> {
     let delimiter = parse_csv_byte(&options.delimiter, "delimiter")?;
     let escape = parse_optional_csv_byte(options.escape.as_deref(), "escape")?;
     let quote = parse_csv_byte(&options.quote, "quote")?;
@@ -1334,7 +1812,7 @@ fn csv_input_layout(path: &Path, options: &CsvConvertOptions) -> std::io::Result
         .delimiter(delimiter)
         .quote(quote)
         .escape(escape);
-    let mut reader = builder.from_reader(open_csv(path, options.skip_lines)?);
+    let mut reader = builder.from_reader(reader);
     let mut records = reader.records();
     let (header, has_records) = if let Some(header) = &options.header {
         (
@@ -2260,8 +2738,81 @@ mod install_tests {
     use super::*;
 
     #[test]
-    fn json_parser_rejects_out_of_range_numbers() {
-        assert!(serde_json::from_str::<Value>("1e400").is_err());
+    fn lossless_json_parser_rejects_out_of_range_value() {
+        let mut inexact = std::collections::BTreeSet::new();
+
+        let error =
+            parse_json_record_lossless(r#"{"value":1e400}"#, None, &mut inexact).unwrap_err();
+
+        let error = error.to_string();
+        assert!(error.contains("out of range for Float64"), "{error}");
+        assert!(inexact.is_empty());
+    }
+
+    #[test]
+    fn json_number_scanner_records_nested_inexact_integer_paths() {
+        let mut inexact = std::collections::BTreeSet::new();
+        let mut inexact_index = JsonNumberPathTrie::default();
+
+        for _ in 0..2 {
+            scan_json_numbers(
+                r#"{"integer":9007199254740993,"nested":[1.5,9007199254740993]}"#,
+                &mut inexact,
+                &mut inexact_index,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            inexact,
+            std::collections::BTreeSet::from([
+                vec![JsonNumberPathSegment::Field("integer".to_string())],
+                vec![
+                    JsonNumberPathSegment::Field("nested".to_string()),
+                    JsonNumberPathSegment::Element,
+                ],
+            ])
+        );
+    }
+
+    #[test]
+    fn json_value_fast_gate_only_scans_large_numbers() {
+        let common =
+            serde_json::from_str::<Value>(r#"{"id":9007199254740992,"v":1.5,"s":"1e400"}"#)
+                .unwrap();
+        let large_integer = serde_json::from_str::<Value>(r#"{"id":9007199254740993}"#).unwrap();
+        let negative_out_of_i64 =
+            serde_json::from_str::<Value>(r#"{"id":-9223372036854775809}"#).unwrap();
+        let large_float = serde_json::from_str::<Value>(r#"{"value":1e308}"#).unwrap();
+
+        assert!(!json_value_might_need_lossless_numbers(&common));
+        assert!(json_value_might_need_lossless_numbers(&large_integer));
+        assert!(json_value_might_need_lossless_numbers(&negative_out_of_i64));
+        assert!(json_value_might_need_lossless_numbers(&large_float));
+    }
+
+    #[test]
+    fn csv_layout_inspection_rewinds_reader_after_skip_lines() {
+        let options = CsvConvertOptions {
+            delimiter: ",".to_string(),
+            escape: None,
+            quote: "\"".to_string(),
+            no_header: false,
+            header: None,
+            skip_lines: 1,
+        };
+        let format = csv_format(&options).unwrap();
+        let reader = std::io::BufReader::new(std::io::Cursor::new(
+            b"ignored preamble\nid,name\n1,alice\n2,bob\n".to_vec(),
+        ));
+
+        let schema = inspect_csv_input(reader, &options, &format)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
     }
 
     #[test]

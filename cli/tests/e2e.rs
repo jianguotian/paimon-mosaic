@@ -1198,6 +1198,53 @@ fn convert_keeps_legacy_csv_entrypoint() {
 }
 
 #[test]
+fn convert_keeps_legacy_empty_csv_entrypoint() {
+    let dir = unique_temp_dir("convert_legacy_empty_csv");
+    let csv = dir.join("empty.csv");
+    std::fs::write(&csv, "").unwrap();
+    let out = dir.join("out.mosaic");
+
+    let (msg, err, ok) = run(&[
+        "convert",
+        csv.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (schema, err, ok) = run(&["schema", out.to_str().unwrap()]);
+    assert!(ok, "stdout: {schema}\nstderr: {err}");
+    assert_eq!(schema, "0 columns, 1 buckets\n");
+    let (count, err, ok) = run(&["count", out.to_str().unwrap()]);
+    assert!(ok, "stdout: {count}\nstderr: {err}");
+    assert_eq!(count, "0\n");
+}
+
+#[test]
+fn convert_legacy_schema_less_nonempty_csv_still_errors() {
+    let dir = unique_temp_dir("convert_legacy_schema_less_nonempty_csv");
+    for (name, contents) in [
+        ("header-only.csv", "id,name\n"),
+        ("blank-lines.csv", "\n\n"),
+    ] {
+        let csv = dir.join(name);
+        std::fs::write(&csv, contents).unwrap();
+        let out = dir.join(format!("{name}.mosaic"));
+
+        let (_, err, ok) = run(&[
+            "convert",
+            csv.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+
+        assert!(!ok, "{name} unexpectedly succeeded");
+        assert!(!err.is_empty(), "{name} should report why inference failed");
+        assert!(!out.exists(), "{name} should not create an output");
+    }
+}
+
+#[test]
 fn convert_keeps_out_long_option_alias() {
     let dir = std::env::temp_dir();
     let js = format!("{}/mosaic_e2e_convert_out_alias.json", dir.display());
@@ -1402,6 +1449,49 @@ fn convert_json_rejects_out_of_range_float_for_default_and_projection() {
 }
 
 #[test]
+fn convert_json_deep_nesting_returns_an_error_without_aborting() {
+    let dir = unique_temp_dir("json_deep_nesting");
+    let js = dir.join("input.jsonl");
+    std::fs::write(
+        &js,
+        format!(
+            "{{\"v\":{}1e400{}}}\n",
+            "[".repeat(100_000),
+            "]".repeat(100_000)
+        ),
+    )
+    .unwrap();
+
+    for (case, columns) in [("default", &[][..]), ("projected", &["-c", "v"][..])] {
+        let out = dir.join(format!("{case}.mosaic"));
+        let mut args = vec!["convert", js.to_str().unwrap(), "-o", out.to_str().unwrap()];
+        args.extend_from_slice(columns);
+        let (_, err, ok) = run(&args);
+
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(err.contains("recursion limit exceeded"), "{case}: {err}");
+        assert!(!out.exists(), "{case}");
+        assert!(!sibling_temp_exists(&dir, &format!("{case}.mosaic")));
+    }
+}
+
+#[test]
+fn convert_json_preserves_syntax_error_before_later_numeric_overflow() {
+    let dir = unique_temp_dir("json_syntax_before_numeric_overflow");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\"s\":\"\\q\",\"v\":1e400}\n").unwrap();
+    let out = dir.join("out.mosaic");
+
+    let (_, err, ok) = run(&["convert", js.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+
+    assert!(!ok);
+    assert!(err.contains("invalid escape"), "{err}");
+    assert!(!err.contains("out of range for Float64"), "{err}");
+    assert!(!out.exists());
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
+}
+
+#[test]
 fn convert_json_numeric_errors_sanitize_field_path() {
     let dir = unique_temp_dir("json_safe_field_path");
     let js = dir.join("input.jsonl");
@@ -1454,6 +1544,25 @@ fn convert_json_default_rejects_lossy_integer_float_promotion() {
     std::fs::write(&js, "{\"v\":1.5}\n{\"v\":9007199254740993}\n").unwrap();
     let out = dir.join("out.mosaic");
     let (_, err, ok) = run(&["convert", js.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(err.contains("'v'"), "{err}");
+    assert!(
+        err.contains("cannot be represented exactly as Float64"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
+}
+
+#[test]
+fn convert_json_default_rejects_lossy_negative_out_of_i64_integer() {
+    let dir = unique_temp_dir("json_default_negative_out_of_i64");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\"v\":-9223372036854775809}\n").unwrap();
+    let out = dir.join("out.mosaic");
+
+    let (_, err, ok) = run(&["convert", js.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+
     assert!(!ok);
     assert!(err.contains("'v'"), "{err}");
     assert!(
