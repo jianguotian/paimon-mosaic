@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 import xml.etree.ElementTree as ET
 
@@ -36,6 +38,25 @@ CANONICAL_NUMBER = r"(?:0|[1-9][0-9]*)"
 RELEASE_TAG = re.compile(
     rf"^v(?P<version>{CANONICAL_NUMBER}\.{CANONICAL_NUMBER}\."
     rf"{CANONICAL_NUMBER})(?:-rc{CANONICAL_NUMBER})?$"
+)
+REQUIRED_RELEASE_VERSION_FILES = {
+    "Cargo.toml",
+    "Cargo.lock",
+    "java/pom.xml",
+    "python/pyproject.toml",
+}
+GIT_ENVIRONMENT = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_WORK_TREE",
 )
 
 
@@ -53,10 +74,27 @@ def release_version(tag: str) -> str:
     return match.group("version")
 
 
+def git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for variable in list(environment):
+        if (
+            variable in GIT_ENVIRONMENT
+            or variable.startswith("GIT_CONFIG_KEY_")
+            or variable.startswith("GIT_CONFIG_VALUE_")
+        ):
+            environment.pop(variable)
+    environment["GIT_ATTR_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
+
+
 def run_git(root: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(root), *arguments],
         check=False,
+        env=git_environment(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -65,6 +103,22 @@ def run_git(root: Path, *arguments: str) -> str:
         detail = result.stderr.strip() or result.stdout.strip()
         raise ValueError(detail or f"git {' '.join(arguments)} failed")
     return result.stdout.strip()
+
+
+def run_git_bytes(root: Path, *arguments: str) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=False,
+        env=git_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip()
+        if not detail:
+            detail = result.stdout.decode(errors="replace").strip()
+        raise ValueError(detail or f"git {' '.join(arguments)} failed")
+    return result.stdout
 
 
 def verify_release_tag(root: Path, tag: str) -> str:
@@ -97,8 +151,17 @@ def verify_release_tag(root: Path, tag: str) -> str:
         )
 
     result = subprocess.run(
-        ["git", "-C", str(root), "verify-tag", tag_object],
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "gpg.program=gpg",
+            "verify-tag",
+            tag_object,
+        ],
         check=False,
+        env=git_environment(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -108,6 +171,62 @@ def verify_release_tag(root: Path, tag: str) -> str:
         suffix = f": {detail}" if detail else ""
         raise ValueError(f"{tag} is not a verifiable signed tag{suffix}")
     return tag_commit
+
+
+def is_release_version_file(path: str) -> bool:
+    return path in REQUIRED_RELEASE_VERSION_FILES or path.endswith("/Cargo.toml")
+
+
+def materialize_release_version_files(
+    repository: Path,
+    commit: str,
+    destination: Path,
+) -> None:
+    records = run_git_bytes(
+        repository,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        commit,
+    )
+    materialized = set()
+    for raw_record in records.split(b"\0"):
+        if not raw_record:
+            continue
+        metadata, raw_path = raw_record.split(b"\t", 1)
+        path = os.fsdecode(raw_path)
+        if not is_release_version_file(path):
+            continue
+        parts = path.split("/")
+        if (
+            path.startswith("/")
+            or "\\" in path
+            or "" in parts
+            or "." in parts
+            or ".." in parts
+        ):
+            raise ValueError(f"unsafe release version file path: {path!r}")
+        mode, object_type, object_id = metadata.decode("ascii").split()
+        if object_type != "blob" or mode not in {"100644", "100755"}:
+            raise ValueError(f"release version file is not regular: {path}")
+        target = destination.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(run_git_bytes(repository, "cat-file", "blob", object_id))
+        materialized.add(path)
+
+    missing = sorted(REQUIRED_RELEASE_VERSION_FILES - materialized)
+    if missing:
+        raise ValueError(f"signed commit is missing release version files: {missing}")
+
+
+def verify_signed_release_versions(root: Path, tag: str) -> str:
+    root = root.resolve()
+    commit = verify_release_tag(root, tag)
+    with tempfile.TemporaryDirectory(prefix="release-version-") as directory:
+        signed_root = Path(directory)
+        materialize_release_version_files(root, commit, signed_root)
+        return verify_release_versions(signed_root, tag)
 
 
 def excluded_workspace_manifests(root: Path, workspace: dict) -> set[Path]:
@@ -389,8 +508,9 @@ def main() -> int:
     args = parse_args()
     try:
         if args.verify_signature:
-            verify_release_tag(args.root, args.tag)
-        version = verify_release_versions(args.root, args.tag)
+            version = verify_signed_release_versions(args.root, args.tag)
+        else:
+            version = verify_release_versions(args.root, args.tag)
     except (OSError, ET.ParseError, tomllib.TOMLDecodeError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1

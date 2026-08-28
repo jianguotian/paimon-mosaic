@@ -240,6 +240,182 @@ def test_cli_verify_signature_accepts_signed_tag(
     assert f"verified release tag {TAG}" in result.stdout
 
 
+@pytest.mark.parametrize("injection", ("count", "parameters", "local"))
+def test_cli_verify_signature_rejects_injected_gpg_program(
+    tmp_path: Path,
+    injection: str,
+) -> None:
+    root = initialize_versions(tmp_path)
+    initialize_git_repository(root)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    forged_tag_object = subprocess.run(
+        ["git", "hash-object", "-t", "tag", "-w", "--stdin"],
+        cwd=root,
+        check=True,
+        input=(
+            f"object {commit}\n"
+            "type commit\n"
+            f"tag {TAG}\n"
+            "tagger Release Test <release-test@example.invalid> 0 +0000\n\n"
+            "forged release tag\n\n"
+            "-----BEGIN PGP SIGNATURE-----\n"
+            "invalid\n"
+            "-----END PGP SIGNATURE-----\n"
+        ),
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "update-ref", f"refs/tags/{TAG}", forged_tag_object],
+        cwd=root,
+        check=True,
+    )
+    fake_gpg = tmp_path / "fake-gpg"
+    write(
+        fake_gpg,
+        "#!/bin/sh\n"
+        "printf '%s\\n' \\\n"
+        "  '[GNUPG:] NEWSIG' \\\n"
+        "  '[GNUPG:] GOODSIG DEADBEEF Release Test' \\\n"
+        "  '[GNUPG:] VALIDSIG 0123456789ABCDEF0123456789ABCDEF01234567 "
+        "2026-08-28 0 4 0 1 10 00 "
+        "0123456789ABCDEF0123456789ABCDEF01234567'\n"
+        "exit 0\n",
+    )
+    fake_gpg.chmod(0o755)
+    env = os.environ.copy()
+    if injection == "count":
+        env.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "gpg.program",
+                "GIT_CONFIG_VALUE_0": str(fake_gpg),
+            }
+        )
+    elif injection == "parameters":
+        env["GIT_CONFIG_PARAMETERS"] = (
+            f"'gpg.program'='{fake_gpg}'"
+        )
+    else:
+        subprocess.run(
+            ["git", "config", "gpg.program", str(fake_gpg)],
+            cwd=root,
+            check=True,
+        )
+
+    result = run_verifier(root, env=env, verify_signature=True)
+
+    assert result.returncode == 1
+    assert "not a verifiable signed tag" in result.stderr
+
+
+def test_cli_verify_signature_reads_versions_from_signed_commit(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    root = initialize_versions(tmp_path)
+    pom = root / "java/pom.xml"
+    replace(pom, "<version>0.3.0</version>", "<version>0.3.1</version>")
+    initialize_git_repository(root)
+    env = sign_release_tag(root, signing_home)
+    replace(pom, "<version>0.3.1</version>", "<version>0.3.0</version>")
+
+    result = run_verifier(root, env=env, verify_signature=True)
+
+    assert result.returncode == 1
+    assert (
+        "java/pom.xml project version is '0.3.1', expected '0.3.0'"
+        in result.stderr
+    )
+
+
+def test_cli_verify_signature_ignores_inherited_git_repository_selection(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+) -> None:
+    root = initialize_versions(tmp_path / "intended")
+    initialize_git_repository(root)
+    sign_release_tag(root, signing_home)
+
+    foreign = initialize_versions(tmp_path / "foreign")
+    replace(
+        foreign / "java/pom.xml",
+        "<version>0.3.0</version>",
+        "<version>0.3.1</version>",
+    )
+    initialize_git_repository(foreign)
+    env = sign_release_tag(foreign, signing_home)
+    env.update(
+        {
+            "GIT_DIR": str(foreign / ".git"),
+            "GIT_WORK_TREE": str(foreign),
+        }
+    )
+
+    result = run_verifier(root, env=env, verify_signature=True)
+
+    assert result.returncode == 0, result.stderr
+    assert f"verified release tag {TAG}" in result.stdout
+
+
+def test_materialize_release_version_files_rejects_symlink(
+    tmp_path: Path,
+) -> None:
+    root = initialize_versions(tmp_path)
+    pom = root / "java/pom.xml"
+    pom.unlink()
+    pom.symlink_to("../Cargo.toml")
+    initialize_git_repository(root)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+
+    with pytest.raises(
+        ValueError,
+        match="release version file is not regular: java/pom.xml",
+    ):
+        verifier.materialize_release_version_files(
+            root,
+            commit,
+            tmp_path / "materialized",
+        )
+
+
+def test_materialize_release_version_files_requires_all_roots(
+    tmp_path: Path,
+) -> None:
+    root = initialize_versions(tmp_path)
+    (root / "python/pyproject.toml").unlink()
+    initialize_git_repository(root)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+
+    with pytest.raises(
+        ValueError,
+        match="signed commit is missing release version files.*python/pyproject.toml",
+    ):
+        verifier.materialize_release_version_files(
+            root,
+            commit,
+            tmp_path / "materialized",
+        )
+
+
 def test_cli_verify_signature_rejects_tag_not_at_head(
     tmp_path: Path,
     signing_home: tuple[Path, str],

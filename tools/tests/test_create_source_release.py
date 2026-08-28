@@ -406,6 +406,72 @@ def test_unsigned_tag_with_pgp_armor_text_is_rejected(
     assert "not a locally verifiable GPG-signed tag" in output(result)
 
 
+@pytest.mark.parametrize("injection", ("count", "parameters", "local"))
+def test_injected_gpg_program_cannot_approve_forged_tag(
+    tmp_path: Path,
+    signing_home: tuple[Path, str],
+    injection: str,
+) -> None:
+    repo, env, commit = initialize_release_repo(tmp_path, signing_home)
+    forged_tag_object = subprocess.run(
+        ["git", "hash-object", "-t", "tag", "-w", "--stdin"],
+        cwd=repo,
+        check=True,
+        input=(
+            f"object {commit}\n"
+            "type commit\n"
+            f"tag {RC_TAG}\n"
+            "tagger Release Test <release-test@example.invalid> 0 +0000\n\n"
+            "forged release tag\n\n"
+            "-----BEGIN PGP SIGNATURE-----\n"
+            "invalid\n"
+            "-----END PGP SIGNATURE-----\n"
+        ).encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout.decode().strip()
+    run(
+        ["git", "update-ref", f"refs/tags/{RC_TAG}", forged_tag_object],
+        cwd=repo,
+    )
+    fake_gpg = tmp_path / "fake-gpg"
+    write(
+        fake_gpg,
+        "#!/bin/sh\n"
+        "printf '%s\\n' \\\n"
+        "  '[GNUPG:] NEWSIG' \\\n"
+        "  '[GNUPG:] GOODSIG DEADBEEF Release Test' \\\n"
+        "  '[GNUPG:] VALIDSIG 0123456789ABCDEF0123456789ABCDEF01234567 "
+        "2026-08-28 0 4 0 1 10 00 "
+        "0123456789ABCDEF0123456789ABCDEF01234567'\n"
+        "exit 0\n",
+    )
+    fake_gpg.chmod(0o755)
+    if injection == "count":
+        env.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "gpg.program",
+                "GIT_CONFIG_VALUE_0": str(fake_gpg),
+            }
+        )
+    elif injection == "parameters":
+        env["GIT_CONFIG_PARAMETERS"] = (
+            f"'gpg.program'='{fake_gpg}'"
+        )
+    else:
+        run(
+            ["git", "config", "gpg.program", str(fake_gpg)],
+            cwd=repo,
+        )
+
+    result = run_script(repo, env)
+
+    assert result.returncode != 0
+    assert "not a locally verifiable GPG-signed tag" in output(result)
+    assert not (repo / "tools/release").exists()
+
+
 def test_rejects_alias_for_different_signed_tag_name(
     tmp_path: Path,
     signing_home: tuple[Path, str],

@@ -31,17 +31,23 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-# Do not let inherited Git selection variables redirect any check to another
-# repository or worktree.
+# Do not let inherited Git variables redirect checks or replace signature
+# verification.
 unset \
   GIT_ALTERNATE_OBJECT_DIRECTORIES \
   GIT_COMMON_DIR \
+  GIT_CONFIG_COUNT \
+  GIT_CONFIG_GLOBAL \
+  GIT_CONFIG_PARAMETERS \
+  GIT_CONFIG_SYSTEM \
   GIT_DIR \
   GIT_INDEX_FILE \
   GIT_NAMESPACE \
   GIT_OBJECT_DIRECTORY \
   GIT_WORK_TREE
 export GIT_ATTR_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
 export GIT_NO_REPLACE_OBJECTS=1
 
 CURR_DIR=$(pwd -P)
@@ -112,7 +118,7 @@ if [[ "${TAG_COMMIT}" != "${HEAD_COMMIT}" ]]; then
   exit 1
 fi
 if ! grep -q '^-----BEGIN PGP SIGNATURE-----$' <<< "${TAG_OBJECT}" ||
-  ! git verify-tag "${TAG_OBJECT_ID}"
+  ! git -c gpg.program=gpg verify-tag "${TAG_OBJECT_ID}"
 then
   echo \
     "RC_TAG ${RC_TAG} is not a locally verifiable GPG-signed tag" \
