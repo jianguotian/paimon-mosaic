@@ -299,6 +299,10 @@ Release Manager</code></pre>
             <p>If the vote reveals issues:</p>
             <ol>
                 <li>Fix them on the release branch via normal PRs.</li>
+                <li>Preserve the previous RC's local source artifacts outside the checkout so the next build does not overwrite them:
+<pre><code># From the paimon-mosaic checkout
+mv tools/release "../paimon-mosaic-${RC_TAG}-artifacts"</code></pre>
+                </li>
                 <li>Remove the old RC from dist dev (optional):
 <pre><code>cd paimon-dist-dev
 svn remove paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}

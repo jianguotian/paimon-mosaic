@@ -492,6 +492,21 @@ def test_release_documentation_describes_source_archive_preflight() -> None:
     assert "temporary source archive" in source
 
 
+def test_release_documentation_preserves_previous_rc_output_before_retry() -> None:
+    source = RELEASE_DOCUMENTATION.read_text(encoding="utf-8")
+    retry_section = source.partition('<h2 id="fix-any-issues">')[2].partition(
+        '<h2 id="finalize-the-release">'
+    )[0]
+    preserve_command = (
+        'mv tools/release "../paimon-mosaic-${RC_TAG}-artifacts"'
+    )
+
+    assert preserve_command in retry_section
+    assert retry_section.index(preserve_command) < retry_section.index(
+        "Increment <code>RC_NUM</code>"
+    )
+
+
 def test_release_vote_gate_matches_blocking_contract() -> None:
     workflow = load_workflow(GATE_WORKFLOW)
     assert_gate_contract(workflow)
