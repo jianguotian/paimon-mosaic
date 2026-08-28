@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io;
 
@@ -25,7 +28,7 @@ use crate::spec;
 use crate::types;
 use crate::varint;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMeta {
     pub name: String,
     pub data_type: DataType,
@@ -33,7 +36,7 @@ pub struct ColumnMeta {
     pub bucket_id: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MosaicSchema {
     pub num_buckets: usize,
     pub columns: Vec<ColumnMeta>,
@@ -41,6 +44,53 @@ pub struct MosaicSchema {
     pub bucket_to_global: Vec<Vec<usize>>,
     /// original_order[orig_pos] = sorted_pos. Used as default output order when no projection is set.
     pub original_order: Vec<usize>,
+}
+
+#[derive(Default)]
+struct SchemaSerializationCache {
+    entry: Option<(MosaicSchema, Vec<u8>)>,
+}
+
+impl SchemaSerializationCache {
+    fn get_or_insert_with(
+        &mut self,
+        schema: &MosaicSchema,
+        serialize: impl FnOnce() -> Vec<u8>,
+    ) -> Vec<u8> {
+        if let Some((cached_schema, serialized)) = &self.entry {
+            if cached_schema == schema {
+                return serialized.clone();
+            }
+        }
+
+        let serialized = serialize();
+        self.entry = Some((schema.clone(), serialized.clone()));
+        serialized
+    }
+}
+
+std::thread_local! {
+    // Writers are commonly recreated on one ingestion thread. Keep only that thread's
+    // most recent schema so repeated closes avoid BPE work without a global lock or
+    // unbounded cache growth.
+    static SERIALIZED_SCHEMA_CACHE: RefCell<SchemaSerializationCache> =
+        RefCell::new(SchemaSerializationCache::default());
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SERIALIZATION_CACHE_MISSES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn clear_serialization_cache_for_test() {
+    SERIALIZED_SCHEMA_CACHE.with(|cache| cache.borrow_mut().entry = None);
+    SERIALIZATION_CACHE_MISSES.with(|misses| misses.set(0));
+}
+
+#[cfg(test)]
+fn serialization_cache_misses_for_test() -> usize {
+    SERIALIZATION_CACHE_MISSES.with(Cell::get)
 }
 
 impl MosaicSchema {
@@ -238,6 +288,17 @@ impl MosaicSchema {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
+        SERIALIZED_SCHEMA_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .get_or_insert_with(self, || self.serialize_uncached())
+        })
+    }
+
+    fn serialize_uncached(&self) -> Vec<u8> {
+        #[cfg(test)]
+        SERIALIZATION_CACHE_MISSES.with(|misses| misses.set(misses.get() + 1));
+
         let num_columns = self.columns.len();
 
         let raw_names: Vec<Vec<u8>> = self
@@ -354,6 +415,62 @@ mod tests {
         let schema = MosaicSchema::new(columns, 2);
         let data = schema.serialize();
         assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_serialization_cache_reuses_identical_schema() {
+        let schema =
+            MosaicSchema::new(vec![("signal_speed".to_string(), DataType::Int16, true)], 1);
+        let mut cache = SchemaSerializationCache::default();
+        let mut serialize_calls = 0;
+
+        let first = cache.get_or_insert_with(&schema, || {
+            serialize_calls += 1;
+            vec![1, 2, 3]
+        });
+        let second = cache.get_or_insert_with(&schema, || {
+            serialize_calls += 1;
+            vec![4, 5, 6]
+        });
+
+        assert_eq!(first, second);
+        assert_eq!(1, serialize_calls);
+    }
+
+    #[test]
+    fn test_serialize_reuses_cached_bytes_on_same_thread() {
+        clear_serialization_cache_for_test();
+        let first_schema = MosaicSchema::new(
+            vec![("signal_engine_speed".to_string(), DataType::Int16, true)],
+            1,
+        );
+        let second_schema = MosaicSchema::new(
+            vec![("signal_engine_speed".to_string(), DataType::Int16, true)],
+            1,
+        );
+
+        let first = first_schema.serialize();
+        let misses_after_first = serialization_cache_misses_for_test();
+        let second = second_schema.serialize();
+
+        assert_eq!(first, second);
+        assert_eq!(1, misses_after_first);
+        assert_eq!(misses_after_first, serialization_cache_misses_for_test());
+    }
+
+    #[test]
+    fn test_serialize_invalidates_cache_for_changed_schema() {
+        clear_serialization_cache_for_test();
+        let first_schema =
+            MosaicSchema::new(vec![("signal_speed".to_string(), DataType::Int16, true)], 1);
+        let changed_schema =
+            MosaicSchema::new(vec![("signal_speed".to_string(), DataType::Int32, true)], 1);
+
+        let first = first_schema.serialize();
+        let changed = changed_schema.serialize();
+
+        assert_ne!(first, changed);
+        assert_eq!(2, serialization_cache_misses_for_test());
     }
 
     #[test]
