@@ -48,7 +48,7 @@ All inspection and query commands accept `--json`; `convert` and `convert-csv` w
 | `cat` | rows as a table (all rows by default; `-n` to limit) | column data |
 | `head` | first N rows (default 10) | column data |
 | `count` | total row count | footer + index |
-| `convert` | import JSON into a new file | writes file |
+| `convert` | import JSON; legacy single-file CSV calls remain compatible | writes file |
 | `convert-csv` | import CSV into a new file | writes file |
 
 ## Inspect
@@ -104,6 +104,8 @@ with no non-null value cannot be inferred and is reported as an error.
 Inferred conversion requires a regular file because schema inference and
 conversion read the input separately; FIFOs and devices are rejected.
 An existing output is kept unless `--overwrite` is given.
+Existing `mosaic convert data.csv -o data.mosaic` calls remain supported with
+the default CSV dialect; use `convert-csv` for multiple inputs or CSV options.
 Use `-c`/`--column` to project top-level fields; each occurrence accepts a
 comma-separated list, and unselected fields do not participate in inference.
 `--stats id` builds min/max for those columns, which `cat --where` then uses

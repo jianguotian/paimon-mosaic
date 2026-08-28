@@ -79,7 +79,7 @@ mosaic schema data.mosaic</code></pre>
                     <tr><td><code>column-size</code></td><td>on-disk bytes per column</td><td>footer + index + paged directories</td></tr>
                     <tr><td><code>cat</code> / <code>head</code></td><td>cat: all rows by default (<code>-n</code> to limit); head: first 10; <code>-c</code>, <code>--where</code></td><td>column data</td></tr>
                     <tr><td><code>count</code></td><td>total row count</td><td>footer + index</td></tr>
-                    <tr><td><code>convert</code></td><td>import JSON into a new Mosaic file</td><td>writes file</td></tr>
+                    <tr><td><code>convert</code></td><td>import JSON; legacy single-file CSV calls remain compatible</td><td>writes file</td></tr>
                     <tr><td><code>convert-csv</code></td><td>import CSV into a new Mosaic file</td><td>writes file</td></tr>
                 </tbody>
             </table>
@@ -174,7 +174,7 @@ row group 0: 3 entries
 200</code></pre>
 
             <h2>convert</h2>
-            <p>Import a regular JSON data file (<code>.json</code>/<code>.ndjson</code>/<code>.jsonl</code>, one object per line) into a new Mosaic file with a schema inferred from the complete input. FIFOs and devices are rejected because inference and conversion read the input separately. <code>-c</code>/<code>--column</code> projects top-level fields before inference; each occurrence accepts a comma-separated list. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
+            <p>Import a regular JSON data file (<code>.json</code>/<code>.ndjson</code>/<code>.jsonl</code>, one object per line) into a new Mosaic file with a schema inferred from the complete input. Existing <code>mosaic convert data.csv -o data.mosaic</code> calls remain supported with the default CSV dialect; use <code>convert-csv</code> for multiple inputs or CSV options. FIFOs and devices are rejected because inference and conversion read the input separately. <code>-c</code>/<code>--column</code> projects top-level fields before inference; each occurrence accepts a comma-separated list. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
 <pre><code><span class="cmt">$ mosaic convert data.ndjson -o data.mosaic --stats id</span>
 wrote data.mosaic (200 rows, 5 columns)
 <span class="cmt">$ mosaic convert data.json -o projected.mosaic -c id,kind</span>

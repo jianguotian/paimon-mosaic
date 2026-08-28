@@ -1180,19 +1180,21 @@ fn convert_refuses_existing_output_before_opening_input() {
 }
 
 #[test]
-fn convert_rejects_csv_input() {
-    let csv = format!(
-        "{}/mosaic_e2e_convert_rejects_csv.csv",
-        std::env::temp_dir().display()
-    );
+fn convert_keeps_legacy_csv_entrypoint() {
+    let dir = unique_temp_dir("convert_legacy_csv");
+    let csv = dir.join("input.csv");
     std::fs::write(&csv, "id\n1\n").unwrap();
-    let out = format!(
-        "{}/mosaic_e2e_convert_rejects_csv.mosaic",
-        std::env::temp_dir().display()
-    );
-    let (_, err, ok) = run(&["convert", &csv, "-o", &out, "--overwrite"]);
-    assert!(!ok);
-    assert!(err.contains("use convert-csv for CSV data"), "{err}");
+    let out = dir.join("out.mosaic");
+    let (msg, err, ok) = run(&[
+        "convert",
+        csv.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", out.to_str().unwrap(), "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows, "{\"id\":1}\n");
 }
 
 #[test]
@@ -1210,7 +1212,7 @@ fn convert_keeps_out_long_option_alias() {
 }
 
 #[test]
-fn convert_accepts_jsonl_and_rejects_other_extensions() {
+fn convert_accepts_json_extensions_and_legacy_csv_fallback() {
     let dir = std::env::temp_dir();
     let js = format!("{}/mosaic_e2e_convert_jsonl.jsonl", dir.display());
     std::fs::write(&js, "{\"id\":1}\n").unwrap();
@@ -1223,17 +1225,28 @@ fn convert_accepts_jsonl_and_rejects_other_extensions() {
     let (msg, err, ok) = run(&["convert", &upper, "-o", &out, "--overwrite"]);
     assert!(ok, "stdout: {msg}\nstderr: {err}");
 
-    let not_json = format!("{}/mosaic_e2e_convert_rejects.notjson", dir.display());
-    std::fs::write(&not_json, "{\"id\":1}\n").unwrap();
-    let (_, err, ok) = run(&["convert", &not_json, "-o", &out, "--overwrite"]);
-    assert!(!ok);
-    assert!(err.contains("convert only supports JSON inputs"), "{err}");
+    let csv = format!("{}/mosaic_e2e_convert_legacy_csv.txt", dir.display());
+    std::fs::write(&csv, "id\n2\n").unwrap();
+    let (msg, err, ok) = run(&["convert", &csv, "-o", &out, "--overwrite"]);
+    assert!(ok, "stdout: {msg}\nstderr: {err}");
+    let (rows, err, ok) = run(&["cat", &out, "--json"]);
+    assert!(ok, "stdout: {rows}\nstderr: {err}");
+    assert_eq!(rows, "{\"id\":2}\n");
+}
 
-    let txt = format!("{}/mosaic_e2e_convert_rejects.txt", dir.display());
-    std::fs::write(&txt, "{\"id\":1}\n").unwrap();
-    let (_, err, ok) = run(&["convert", &txt, "-o", &out, "--overwrite"]);
-    assert!(!ok);
-    assert!(err.contains("convert only supports JSON inputs"), "{err}");
+#[test]
+fn convert_json_rejects_multiline_records_for_default_and_projection() {
+    let dir = unique_temp_dir("json_multiline_record");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\n\"id\":1\n}\n").unwrap();
+    for (case, columns) in [("default", &[][..]), ("projected", &["-c", "id"][..])] {
+        let out = dir.join(format!("{case}.mosaic"));
+        let mut args = vec!["convert", js.to_str().unwrap(), "-o", out.to_str().unwrap()];
+        args.extend_from_slice(columns);
+        let (_, _, ok) = run(&args);
+        assert!(!ok, "{case} unexpectedly accepted a multiline record");
+        assert!(!out.exists(), "{case}");
+    }
 }
 
 #[test]
@@ -1408,6 +1421,45 @@ fn convert_json_numeric_errors_sanitize_field_path() {
     assert!(err.contains("out of range for Float64"), "{err}");
     assert!(!err.contains('\x1b'), "{err:?}");
     assert!(!err.contains('\x07'), "{err:?}");
+    assert!(!out.exists());
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
+}
+
+#[test]
+fn convert_json_missing_projection_sanitizes_field_name() {
+    let dir = unique_temp_dir("json_safe_missing_projection");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\"id\":1}\n").unwrap();
+    let field = "missing\x1b]0;owned\x07";
+    let out = dir.join("out.mosaic");
+    let (_, err, ok) = run(&[
+        "convert",
+        js.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-c",
+        field,
+    ]);
+    assert!(!ok);
+    assert!(err.contains("not found in schema"), "{err}");
+    assert!(!err.contains('\x1b'), "{err:?}");
+    assert!(!err.contains('\x07'), "{err:?}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn convert_json_default_rejects_lossy_integer_float_promotion() {
+    let dir = unique_temp_dir("json_default_lossy_float");
+    let js = dir.join("input.jsonl");
+    std::fs::write(&js, "{\"v\":1.5}\n{\"v\":9007199254740993}\n").unwrap();
+    let out = dir.join("out.mosaic");
+    let (_, err, ok) = run(&["convert", js.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(err.contains("'v'"), "{err}");
+    assert!(
+        err.contains("cannot be represented exactly as Float64"),
+        "{err}"
+    );
     assert!(!out.exists());
     assert!(!sibling_temp_exists(&dir, "out.mosaic"));
 }

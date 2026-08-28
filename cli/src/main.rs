@@ -133,9 +133,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Create a Mosaic file from a JSON data file.
+    /// Create a Mosaic file from JSON, with legacy single-file CSV compatibility.
     Convert {
-        /// Input JSON data file (.json/.ndjson/.jsonl).
+        /// JSON data file; non-JSON paths use the legacy default CSV conversion.
         input: PathBuf,
         /// Output .mosaic path.
         #[arg(short = 'o', long = "output", visible_alias = "out")]
@@ -518,23 +518,35 @@ fn convert(
     use arrow::error::ArrowError;
     let bad = |e: ArrowError| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
     if !is_json_input(input) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "convert only supports JSON inputs (.json/.ndjson/.jsonl); use convert-csv for CSV data",
-        ));
+        if !columns.is_empty() {
+            return Err(invalid_schema(
+                "--column is only supported for JSON input; use convert-csv for CSV options",
+            ));
+        }
+        let inputs = [input.to_path_buf()];
+        return convert_csv(
+            &inputs,
+            out,
+            &[],
+            CsvConvertOptions {
+                delimiter: ",".to_string(),
+                escape: None,
+                quote: "\"".to_string(),
+                no_header: false,
+                header: None,
+                skip_lines: 0,
+            },
+            stats,
+            overwrite,
+        );
     }
     let columns = parse_convert_columns(columns)?;
     ensure_can_write(out, overwrite)?;
     ensure_regular_inferred_input(input, "JSON")?;
     let open =
         || -> std::io::Result<_> { Ok(std::io::BufReader::new(std::fs::File::open(input)?)) };
-    let schema = if columns.is_empty() {
-        arrow::json::reader::infer_json_schema(&mut open()?, None)
-            .map(|(schema, _)| schema)
-            .map_err(bad)?
-    } else {
-        infer_projected_json_schema(open()?, &columns).map_err(bad)?
-    };
+    let selected = (!columns.is_empty()).then_some(columns.as_slice());
+    let schema = infer_json_schema_lossless(open()?, selected).map_err(bad)?;
     let schema = project_convert_schema(schema, &columns)?;
     reject_null_inferred_fields(&schema)?;
     let reader = arrow::json::ReaderBuilder::new(Arc::new(schema.clone()))
@@ -845,10 +857,12 @@ fn project_convert_schema(schema: Schema, columns: &[String]) -> std::io::Result
         if name.is_empty() {
             return Err(invalid_schema("--column field name cannot be empty"));
         }
-        let index = by_name
-            .get(name.as_str())
-            .copied()
-            .ok_or_else(|| invalid_schema(format!("--column '{name}' not found in schema")))?;
+        let index = by_name.get(name.as_str()).copied().ok_or_else(|| {
+            invalid_schema(format!(
+                "--column '{}' not found in schema",
+                fmt::safe(name)
+            ))
+        })?;
         if seen.insert(index) {
             fields.push(schema.fields()[index].as_ref().clone());
         }
@@ -870,30 +884,47 @@ fn parse_convert_columns(arguments: &[String]) -> std::io::Result<Vec<String>> {
     Ok(columns)
 }
 
-fn infer_projected_json_schema<R: std::io::Read>(
-    reader: R,
-    columns: &[String],
+fn infer_json_schema_lossless<R: std::io::BufRead>(
+    mut reader: R,
+    columns: Option<&[String]>,
 ) -> Result<Schema, arrow::error::ArrowError> {
     use arrow::error::ArrowError;
 
-    let columns = columns.iter().map(String::as_str).collect();
+    let columns: Option<std::collections::HashSet<&str>> =
+        columns.map(|columns| columns.iter().map(String::as_str).collect());
     let mut inexact_f64_integer_paths = std::collections::BTreeSet::new();
-    // Keep each root value raw so unselected fields are skipped before
-    // serde_json materializes values that cannot be represented as f64.
-    let values = serde_json::Deserializer::from_reader(reader)
-        .into_iter::<Box<RawValue>>()
-        .map(|raw| {
-            let raw = raw.map_err(|e| ArrowError::JsonError(e.to_string()))?;
-            let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-            let projected = ProjectedJsonRecordSeed {
-                columns: &columns,
-                inexact_f64_integer_paths: &mut inexact_f64_integer_paths,
+    let schema = {
+        let mut line = String::new();
+        let values = std::iter::from_fn(|| loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => return None,
+                Err(error) => {
+                    return Some(Err(ArrowError::JsonError(format!(
+                        "Failed to read JSON record: {error}"
+                    ))));
+                }
+                Ok(_) if line.trim().is_empty() => continue,
+                Ok(_) => {
+                    // Parse one JSON value per line, matching Arrow's JSON reader,
+                    // while keeping retained values raw until numeric validation.
+                    let mut deserializer = serde_json::Deserializer::from_str(line.trim());
+                    let value = FilteredJsonRecordSeed {
+                        columns: columns.as_ref(),
+                        inexact_f64_integer_paths: &mut inexact_f64_integer_paths,
+                    }
+                    .deserialize(&mut deserializer)
+                    .and_then(|value| {
+                        deserializer.end()?;
+                        Ok(value)
+                    })
+                    .map_err(|error| ArrowError::JsonError(format!("Not valid JSON: {error}")));
+                    return Some(value);
+                }
             }
-            .deserialize(&mut deserializer)
-            .map_err(|e| ArrowError::JsonError(e.to_string()))?;
-            Ok(projected)
         });
-    let schema = arrow::json::reader::infer_json_schema_from_iterator(values)?;
+        arrow::json::reader::infer_json_schema_from_iterator(values)?
+    };
     // Integer tokens are only lossy when inference promotes their exact path
     // to Float64; sibling struct fields can retain independent Int64 types.
     if let Some(path) = inexact_f64_integer_paths
@@ -1087,31 +1118,31 @@ fn format_json_number_path(path: &[JsonNumberPathSegment]) -> String {
     formatted
 }
 
-struct ProjectedJsonRecordSeed<'columns, 'inexact> {
-    columns: &'columns std::collections::HashSet<&'columns str>,
+struct FilteredJsonRecordSeed<'columns, 'inexact> {
+    columns: Option<&'columns std::collections::HashSet<&'columns str>>,
     inexact_f64_integer_paths: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
 }
 
-impl<'de> DeserializeSeed<'de> for ProjectedJsonRecordSeed<'_, '_> {
+impl<'de> DeserializeSeed<'de> for FilteredJsonRecordSeed<'_, '_> {
     type Value = Value;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Value, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(ProjectedJsonRecordVisitor {
+        deserializer.deserialize_map(FilteredJsonRecordVisitor {
             columns: self.columns,
             inexact_f64_integer_paths: self.inexact_f64_integer_paths,
         })
     }
 }
 
-struct ProjectedJsonRecordVisitor<'columns, 'inexact> {
-    columns: &'columns std::collections::HashSet<&'columns str>,
+struct FilteredJsonRecordVisitor<'columns, 'inexact> {
+    columns: Option<&'columns std::collections::HashSet<&'columns str>>,
     inexact_f64_integer_paths: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
 }
 
-impl<'de> Visitor<'de> for ProjectedJsonRecordVisitor<'_, '_> {
+impl<'de> Visitor<'de> for FilteredJsonRecordVisitor<'_, '_> {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1124,7 +1155,10 @@ impl<'de> Visitor<'de> for ProjectedJsonRecordVisitor<'_, '_> {
     {
         let mut projected = serde_json::Map::new();
         while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-            if self.columns.contains(name.as_ref()) {
+            if self
+                .columns
+                .is_none_or(|columns| columns.contains(name.as_ref()))
+            {
                 let name = name.into_owned();
                 let raw = map.next_value::<&RawValue>()?;
                 let mut path = vec![JsonNumberPathSegment::Field(name.clone())];
