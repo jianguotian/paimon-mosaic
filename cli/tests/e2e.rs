@@ -564,6 +564,28 @@ fn convert_csv_rejects_non_finite_float_values() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn convert_csv_numeric_errors_sanitize_input_path() {
+    let dir = unique_temp_dir("csv_safe_input_path");
+    let csv = dir.join("bad\x1b]0;owned\x07.csv");
+    std::fs::write(&csv, "value\n1.5\n1e400\n").unwrap();
+    let out = dir.join("out.mosaic");
+    let (_, err, ok) = run(&[
+        "convert-csv",
+        csv.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(!ok);
+    assert!(
+        err.contains("cannot be represented exactly as Float64"),
+        "{err}"
+    );
+    assert!(!err.contains('\x1b'), "{err:?}");
+    assert!(!err.contains('\x07'), "{err:?}");
+}
+
 #[test]
 fn convert_csv_preserves_inferred_timestamp_precision() {
     let dir = std::env::temp_dir();
@@ -1324,6 +1346,70 @@ fn convert_json_projection_ignores_unselected_out_of_range_number() {
     let (rows, err, ok) = run(&["cat", &out, "--json"]);
     assert!(ok, "stdout: {rows}\nstderr: {err}");
     assert_eq!(rows.trim(), r#"{"id":1}"#);
+}
+
+#[test]
+fn convert_json_rejects_out_of_range_float_for_default_and_projection() {
+    let dir = unique_temp_dir("json_float_overflow");
+    let js = dir.join("input.jsonl");
+
+    for (case, input, columns, expected_path) in [
+        ("default", "{\"v\":1e400}\n", &[][..], None),
+        (
+            "projected",
+            "{\"v\":1e400}\n",
+            &["-c", "v"][..],
+            Some("'v'"),
+        ),
+        (
+            "nested",
+            "{\"v\":[1e400]}\n",
+            &["-c", "v"][..],
+            Some("'v[]'"),
+        ),
+    ] {
+        std::fs::write(&js, input).unwrap();
+        let out = dir.join(format!("{case}.mosaic"));
+        let mut args = vec!["convert", js.to_str().unwrap(), "-o", out.to_str().unwrap()];
+        args.extend_from_slice(columns);
+        let (_, err, ok) = run(&args);
+        assert!(!ok, "{case} unexpectedly succeeded");
+        assert!(
+            err.contains("number out of range")
+                || err.contains("cannot be represented")
+                || err.contains("Json error"),
+            "{case}: {err}"
+        );
+        if let Some(path) = expected_path {
+            assert!(err.contains(path), "{case}: {err}");
+        }
+        assert!(!out.exists(), "{case}");
+        assert!(!sibling_temp_exists(&dir, &format!("{case}.mosaic")));
+    }
+}
+
+#[test]
+fn convert_json_numeric_errors_sanitize_field_path() {
+    let dir = unique_temp_dir("json_safe_field_path");
+    let js = dir.join("input.jsonl");
+    let field = "v\x1b]0;owned\x07";
+    let encoded_field = serde_json::to_string(field).unwrap();
+    std::fs::write(&js, format!("{{{encoded_field}:1e400}}\n")).unwrap();
+    let out = dir.join("out.mosaic");
+    let (_, err, ok) = run(&[
+        "convert",
+        js.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-c",
+        field,
+    ]);
+    assert!(!ok);
+    assert!(err.contains("out of range for Float64"), "{err}");
+    assert!(!err.contains('\x1b'), "{err:?}");
+    assert!(!err.contains('\x07'), "{err:?}");
+    assert!(!out.exists());
+    assert!(!sibling_temp_exists(&dir, "out.mosaic"));
 }
 
 #[test]

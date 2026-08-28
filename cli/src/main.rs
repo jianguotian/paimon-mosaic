@@ -33,7 +33,7 @@ use arrow::compute::kernels::cast_utils::{string_to_datetime, Parser as ArrowVal
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use clap::{Parser, Subcommand};
 use paimon_mosaic_core::reader::{MosaicReader, ReaderAccess};
-use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
@@ -615,11 +615,13 @@ fn convert_csv(
             let source_mapping = csv_output_mapping(&schema, &schema_index, &layout);
             validate_csv_mapping(&schema, &layout, &source_mapping, input)?;
             let (projection, mapping) = csv_projection(&source_mapping);
-            let reader = arrow::csv::ReaderBuilder::new(Arc::new(reader_schema))
-                .with_format(format.clone().with_truncated_rows(true))
-                .with_projection(projection)
-                .build(open_csv(input, options.skip_lines)?)
-                .map_err(bad)?;
+            let reader = build_csv_replay_reader(
+                reader_schema,
+                format.clone(),
+                projection,
+                open_csv(input, options.skip_lines)?,
+            )
+            .map_err(bad)?;
             for batch in reader {
                 let batch = batch.map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
@@ -671,9 +673,19 @@ where
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = install_mosaic_output(&tmp, out, overwrite) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    match install_mosaic_output(&tmp, out, overwrite) {
+        Ok(InstallOutcome::Clean) => {}
+        Ok(InstallOutcome::CommittedWithCleanupError(error)) => {
+            eprintln!(
+                "warning: output was committed to {}, but temporary file {} could not be removed: {error}",
+                fmt::safe_path(out),
+                fmt::safe_path(&tmp)
+            );
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
     }
     let plural = |n: usize, w: &str| {
         if n == 1 {
@@ -684,49 +696,67 @@ where
     };
     println!(
         "wrote {} ({}, {})",
-        out.display(),
+        fmt::safe_path(out),
         plural(rows, "row"),
         plural(schema.fields().len(), "column")
     );
     Ok(())
 }
 
-fn install_mosaic_output(tmp: &Path, out: &Path, overwrite: bool) -> std::io::Result<()> {
+#[derive(Debug)]
+enum InstallOutcome {
+    Clean,
+    CommittedWithCleanupError(std::io::Error),
+}
+
+fn install_mosaic_output(
+    tmp: &Path,
+    out: &Path,
+    overwrite: bool,
+) -> std::io::Result<InstallOutcome> {
     if overwrite {
         #[cfg(windows)]
         if std::fs::symlink_metadata(out).is_ok() {
             std::fs::remove_file(out)?;
         }
-        return std::fs::rename(tmp, out);
+        std::fs::rename(tmp, out)?;
+        return Ok(InstallOutcome::Clean);
     }
     install_mosaic_output_no_replace(
         tmp,
         out,
         |from, to| std::fs::hard_link(from, to),
         rename_no_replace,
+        |path| std::fs::remove_file(path),
     )
 }
 
-fn install_mosaic_output_no_replace<H, R>(
+fn install_mosaic_output_no_replace<H, R, C>(
     tmp: &Path,
     out: &Path,
     hard_link: H,
     rename_no_replace: R,
-) -> std::io::Result<()>
+    cleanup_temp: C,
+) -> std::io::Result<InstallOutcome>
 where
     H: FnOnce(&Path, &Path) -> std::io::Result<()>,
     R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    C: FnOnce(&Path) -> std::io::Result<()>,
 {
     // Both paths are siblings. Prefer a hard link for a portable atomic
     // no-replace install, but filesystems such as VFAT do not support links;
     // use the platform's no-replace rename there.
     match hard_link(tmp, out) {
-        Ok(()) => std::fs::remove_file(tmp),
+        Ok(()) => match cleanup_temp(tmp) {
+            Ok(()) => Ok(InstallOutcome::Clean),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(InstallOutcome::Clean),
+            Err(error) => Ok(InstallOutcome::CommittedWithCleanupError(error)),
+        },
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(output_exists_error(out))
         }
         Err(hard_link_error) => match rename_no_replace(tmp, out) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(InstallOutcome::Clean),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(output_exists_error(out))
             }
@@ -855,14 +885,12 @@ fn infer_projected_json_schema<R: std::io::Read>(
         .map(|raw| {
             let raw = raw.map_err(|e| ArrowError::JsonError(e.to_string()))?;
             let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-            let projected = ProjectedJsonRecordSeed { columns: &columns }
-                .deserialize(&mut deserializer)
-                .map_err(|e| ArrowError::JsonError(e.to_string()))?;
-            collect_inexact_f64_integer_paths(
-                &projected,
-                &mut Vec::new(),
-                &mut inexact_f64_integer_paths,
-            );
+            let projected = ProjectedJsonRecordSeed {
+                columns: &columns,
+                inexact_f64_integer_paths: &mut inexact_f64_integer_paths,
+            }
+            .deserialize(&mut deserializer)
+            .map_err(|e| ArrowError::JsonError(e.to_string()))?;
             Ok(projected)
         });
     let schema = arrow::json::reader::infer_json_schema_from_iterator(values)?;
@@ -887,52 +915,123 @@ enum JsonNumberPathSegment {
 }
 
 fn collect_inexact_f64_integer_paths(
-    value: &Value,
+    raw: &RawValue,
     path: &mut Vec<JsonNumberPathSegment>,
     inexact: &mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
-) {
-    match value {
-        Value::Object(record) => {
-            for (name, value) in record {
-                path.push(JsonNumberPathSegment::Field(name.clone()));
-                collect_inexact_f64_integer_paths(value, path, inexact);
-                path.pop();
-            }
+) -> Result<(), String> {
+    let literal = raw.get().trim();
+    match literal.as_bytes().first().copied() {
+        Some(b'{') => {
+            let mut deserializer = serde_json::Deserializer::from_str(literal);
+            serde::Deserializer::deserialize_map(
+                &mut deserializer,
+                RawJsonObjectVisitor { path, inexact },
+            )
+            .map_err(|error| error.to_string())?;
         }
-        Value::Array(values) => {
-            path.push(JsonNumberPathSegment::Element);
-            for value in values {
-                collect_inexact_f64_integer_paths(value, path, inexact);
-            }
-            path.pop();
+        Some(b'[') => {
+            let mut deserializer = serde_json::Deserializer::from_str(literal);
+            serde::Deserializer::deserialize_seq(
+                &mut deserializer,
+                RawJsonArrayVisitor { path, inexact },
+            )
+            .map_err(|error| error.to_string())?;
         }
-        Value::Number(number) if is_inexact_f64_integer(number) => {
-            inexact.insert(path.clone());
+        Some(b'-' | b'0'..=b'9') => {
+            let promoted = literal.parse::<f64>().map_err(|_| {
+                format!(
+                    "invalid JSON number at '{}'",
+                    fmt::safe(&format_json_number_path(path))
+                )
+            })?;
+            if !promoted.is_finite() {
+                return Err(format!(
+                    "numeric value in JSON field '{}' is out of range for Float64",
+                    fmt::safe(&format_json_number_path(path))
+                ));
+            }
+            if !literal
+                .bytes()
+                .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
+                && is_inexact_f64_integer(literal)
+            {
+                inexact.insert(path.clone());
+            }
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn is_inexact_f64_integer(number: &serde_json::Number) -> bool {
-    if let Some(exact) = number.as_i128() {
-        return number
-            .as_f64()
+struct RawJsonObjectVisitor<'path, 'inexact> {
+    path: &'path mut Vec<JsonNumberPathSegment>,
+    inexact: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+}
+
+impl<'de> Visitor<'de> for RawJsonObjectVisitor<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<(), M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            let raw = map.next_value::<&RawValue>()?;
+            self.path
+                .push(JsonNumberPathSegment::Field(name.into_owned()));
+            collect_inexact_f64_integer_paths(raw, self.path, self.inexact)
+                .map_err(serde::de::Error::custom)?;
+            self.path.pop();
+        }
+        Ok(())
+    }
+}
+
+struct RawJsonArrayVisitor<'path, 'inexact> {
+    path: &'path mut Vec<JsonNumberPathSegment>,
+    inexact: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+}
+
+impl<'de> Visitor<'de> for RawJsonArrayVisitor<'_, '_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON array")
+    }
+
+    fn visit_seq<S>(self, mut sequence: S) -> Result<(), S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        self.path.push(JsonNumberPathSegment::Element);
+        while let Some(raw) = sequence.next_element::<&RawValue>()? {
+            collect_inexact_f64_integer_paths(raw, self.path, self.inexact)
+                .map_err(serde::de::Error::custom)?;
+        }
+        self.path.pop();
+        Ok(())
+    }
+}
+
+fn is_inexact_f64_integer(literal: &str) -> bool {
+    if let Ok(exact) = literal.parse::<i128>() {
+        return literal
+            .parse::<f64>()
+            .ok()
             .and_then(exact_i128_from_f64)
             .is_none_or(|promoted| promoted != exact);
     }
 
-    // arbitrary_precision keeps integer tokens outside i128 as decimal text.
     // Fixed-point formatting recovers the exact integer represented by f64,
     // including large powers of two, without conservatively rejecting them.
-    let literal = number.as_str();
-    if literal
-        .bytes()
-        .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
-    {
-        return false;
-    }
-    number
-        .as_f64()
+    literal
+        .parse::<f64>()
+        .ok()
+        .filter(|promoted| promoted.is_finite())
         .is_none_or(|promoted| format!("{promoted:.0}") != literal)
 }
 
@@ -988,11 +1087,12 @@ fn format_json_number_path(path: &[JsonNumberPathSegment]) -> String {
     formatted
 }
 
-struct ProjectedJsonRecordSeed<'a> {
-    columns: &'a std::collections::HashSet<&'a str>,
+struct ProjectedJsonRecordSeed<'columns, 'inexact> {
+    columns: &'columns std::collections::HashSet<&'columns str>,
+    inexact_f64_integer_paths: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
 }
 
-impl<'de> DeserializeSeed<'de> for ProjectedJsonRecordSeed<'_> {
+impl<'de> DeserializeSeed<'de> for ProjectedJsonRecordSeed<'_, '_> {
     type Value = Value;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Value, D::Error>
@@ -1001,15 +1101,17 @@ impl<'de> DeserializeSeed<'de> for ProjectedJsonRecordSeed<'_> {
     {
         deserializer.deserialize_map(ProjectedJsonRecordVisitor {
             columns: self.columns,
+            inexact_f64_integer_paths: self.inexact_f64_integer_paths,
         })
     }
 }
 
-struct ProjectedJsonRecordVisitor<'a> {
-    columns: &'a std::collections::HashSet<&'a str>,
+struct ProjectedJsonRecordVisitor<'columns, 'inexact> {
+    columns: &'columns std::collections::HashSet<&'columns str>,
+    inexact_f64_integer_paths: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
 }
 
-impl<'de> Visitor<'de> for ProjectedJsonRecordVisitor<'_> {
+impl<'de> Visitor<'de> for ProjectedJsonRecordVisitor<'_, '_> {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1023,7 +1125,13 @@ impl<'de> Visitor<'de> for ProjectedJsonRecordVisitor<'_> {
         let mut projected = serde_json::Map::new();
         while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
             if self.columns.contains(name.as_ref()) {
-                projected.insert(name.into_owned(), map.next_value()?);
+                let name = name.into_owned();
+                let raw = map.next_value::<&RawValue>()?;
+                let mut path = vec![JsonNumberPathSegment::Field(name.clone())];
+                collect_inexact_f64_integer_paths(raw, &mut path, self.inexact_f64_integer_paths)
+                    .map_err(serde::de::Error::custom)?;
+                let value = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+                projected.insert(name, value);
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
@@ -1066,7 +1174,7 @@ fn ensure_regular_inferred_input(input: &Path, format: &str) -> std::io::Result<
     } else {
         Err(invalid_schema(format!(
             "{format} schema inference requires a regular file: {}",
-            input.display()
+            fmt::safe_path(input)
         )))
     }
 }
@@ -1085,7 +1193,10 @@ fn ensure_can_write(out: &Path, overwrite: bool) -> std::io::Result<()> {
 fn output_exists_error(out: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
-        format!("{} exists (use --overwrite to replace)", out.display()),
+        format!(
+            "{} exists (use --overwrite to replace)",
+            fmt::safe_path(out)
+        ),
     )
 }
 
@@ -1137,6 +1248,30 @@ fn open_csv(path: &Path, skip_lines: usize) -> std::io::Result<std::io::BufReade
         }
     }
     Ok(reader)
+}
+
+const DEFAULT_CSV_BATCH_SIZE: usize = 1024;
+const CSV_REPLAY_CELL_BUDGET: usize = 1 << 20;
+
+fn csv_replay_batch_size(columns: usize) -> usize {
+    CSV_REPLAY_CELL_BUDGET
+        .checked_div(columns)
+        .unwrap_or(DEFAULT_CSV_BATCH_SIZE)
+        .clamp(1, DEFAULT_CSV_BATCH_SIZE)
+}
+
+fn build_csv_replay_reader<R: std::io::Read>(
+    schema: Schema,
+    format: arrow::csv::reader::Format,
+    projection: Vec<usize>,
+    reader: R,
+) -> Result<arrow::csv::Reader<R>, arrow::error::ArrowError> {
+    let batch_size = csv_replay_batch_size(schema.fields().len());
+    arrow::csv::ReaderBuilder::new(Arc::new(schema))
+        .with_format(format.with_truncated_rows(false))
+        .with_batch_size(batch_size)
+        .with_projection(projection)
+        .build(reader)
 }
 
 struct CsvInputLayout {
@@ -1303,7 +1438,7 @@ fn validate_csv_mapping(
     {
         return Err(invalid_schema(format!(
             "none of the schema fields were found in the CSV header of {}; use --no-header if the file has no header row",
-            input.display()
+            fmt::safe_path(input)
         )));
     }
     for (field, index) in schema.fields().iter().zip(mapping) {
@@ -1311,7 +1446,7 @@ fn validate_csv_mapping(
             return Err(invalid_schema(format!(
                 "required field '{}' was not found in the CSV header of {}",
                 fmt::safe(field.name()),
-                input.display()
+                fmt::safe_path(input)
             )));
         }
     }
@@ -1324,24 +1459,30 @@ fn align_csv_batch_to_schema(
     mapping: &[Option<usize>],
     input: &Path,
 ) -> std::io::Result<RecordBatch> {
+    let (_, source_columns, rows) = batch.into_parts();
+    let mut source_columns: Vec<Option<ArrayRef>> = source_columns.into_iter().map(Some).collect();
     let columns: Vec<ArrayRef> = schema
         .fields()
         .iter()
         .zip(mapping)
-        .map(|(field, index)| match index {
-            Some(index) if batch.column(*index).data_type() == &DataType::Utf8 => {
-                match field.data_type() {
-                    DataType::Float64 => {
-                        parse_inferred_csv_float64(batch.column(*index), field, input)
+        .map(|(field, index)| match *index {
+            Some(index) => {
+                let source = source_columns[index]
+                    .take()
+                    .ok_or_else(|| invalid_schema("invalid duplicate CSV projection"))?;
+                if source.data_type() != &DataType::Utf8 {
+                    Ok(source)
+                } else {
+                    match field.data_type() {
+                        DataType::Float64 => parse_inferred_csv_float64(&source, field, input),
+                        DataType::Timestamp(_, _) => {
+                            parse_inferred_csv_timestamp_column(&source, field, input)
+                        }
+                        _ => Ok(source),
                     }
-                    DataType::Timestamp(_, _) => {
-                        parse_inferred_csv_timestamp_column(batch.column(*index), field, input)
-                    }
-                    _ => Ok(batch.column(*index).clone()),
                 }
             }
-            Some(index) => Ok(batch.column(*index).clone()),
-            None => Ok(new_null_array(field.data_type(), batch.num_rows())),
+            None => Ok(new_null_array(field.data_type(), rows)),
         })
         .collect::<std::io::Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::new(schema.clone()), columns)
@@ -1397,7 +1538,7 @@ fn parse_csv_timestamp_value(
         return Err(invalid_schema(format!(
             "CSV field '{}' in {} must not include a timezone for an inferred local timestamp",
             fmt::safe(field.name()),
-            input.display()
+            fmt::safe_path(input)
         )));
     }
     let parse_error = || {
@@ -1406,7 +1547,7 @@ fn parse_csv_timestamp_value(
             fmt::safe(value),
             field.data_type(),
             fmt::safe(field.name()),
-            input.display()
+            fmt::safe_path(input)
         ))
     };
     let datetime = string_to_datetime(parser_timezone, value).map_err(|_| parse_error())?;
@@ -1512,7 +1653,7 @@ fn csv_inferred_float_parse_error(value: &str, field: &Field, input: &Path) -> s
         "numeric value '{}' in CSV field '{}' of {} cannot be represented exactly as Float64",
         fmt::safe(value),
         fmt::safe(field.name()),
-        input.display()
+        fmt::safe_path(input)
     ))
 }
 
@@ -1521,7 +1662,7 @@ fn csv_non_finite_float_error(value: &str, field: &Field, input: &Path) -> std::
         "non-finite Float64 value '{}' in CSV field '{}' of {} is not supported",
         fmt::safe(value),
         fmt::safe(field.name()),
-        input.display()
+        fmt::safe_path(input)
     ))
 }
 
@@ -1713,7 +1854,7 @@ fn csv_schema_mismatch(input: &Path) -> std::io::Error {
         std::io::ErrorKind::InvalidInput,
         format!(
             "{} has a schema that is incompatible with the other CSV inputs",
-            input.display()
+            fmt::safe_path(input)
         ),
     )
 }
@@ -2076,6 +2217,11 @@ mod install_tests {
     use super::*;
 
     #[test]
+    fn json_parser_rejects_out_of_range_numbers() {
+        assert!(serde_json::from_str::<Value>("1e400").is_err());
+    }
+
+    #[test]
     fn no_replace_install_falls_back_when_hard_links_are_unsupported() {
         let dir = std::env::temp_dir().join(format!(
             "mosaic_install_fallback_{}_{}",
@@ -2090,7 +2236,7 @@ mod install_tests {
         let out = dir.join("out.mosaic");
         std::fs::write(&tmp, b"complete").unwrap();
 
-        install_mosaic_output_no_replace(
+        let outcome = install_mosaic_output_no_replace(
             &tmp,
             &out,
             |_, _| {
@@ -2101,9 +2247,11 @@ mod install_tests {
                 ))
             },
             rename_no_replace,
+            |path| std::fs::remove_file(path),
         )
         .unwrap();
 
+        assert!(matches!(outcome, InstallOutcome::Clean));
         assert_eq!(std::fs::read(&out).unwrap(), b"complete");
         assert!(!tmp.exists());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2141,6 +2289,7 @@ mod install_tests {
                 ))
             },
             rename_no_replace,
+            |path| std::fs::remove_file(path),
         )
         .unwrap_err();
 
@@ -2148,5 +2297,113 @@ mod install_tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"sentinel");
         assert_eq!(std::fs::read(&tmp).unwrap(), b"complete");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_replace_install_succeeds_after_output_commit_when_temp_cleanup_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "mosaic_install_cleanup_failure_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let tmp = dir.join("out.tmp");
+        let out = dir.join("out.mosaic");
+        std::fs::write(&tmp, b"complete").unwrap();
+
+        let outcome = install_mosaic_output_no_replace(
+            &tmp,
+            &out,
+            |from, to| std::fs::hard_link(from, to),
+            |_, _| panic!("hard-link success must not fall back to rename"),
+            |_| Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap();
+
+        let InstallOutcome::CommittedWithCleanupError(error) = outcome else {
+            panic!("expected committed output with cleanup error");
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(std::fs::read(&out).unwrap(), b"complete");
+        assert!(tmp.exists());
+        std::fs::remove_file(&tmp).unwrap();
+        std::fs::remove_file(&out).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn csv_replay_rejects_truncated_rows() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let format = arrow::csv::reader::Format::default().with_header(true);
+        let mut reader = build_csv_replay_reader(
+            schema,
+            format,
+            vec![0, 1],
+            std::io::Cursor::new(b"a,b\n1\n"),
+        )
+        .unwrap();
+
+        let error = reader.next().unwrap().unwrap_err();
+        assert!(error.to_string().contains("expected 2 got 1"), "{error}");
+    }
+
+    #[test]
+    fn csv_replay_batch_size_bounds_wide_batches() {
+        assert_eq!(csv_replay_batch_size(0), DEFAULT_CSV_BATCH_SIZE);
+        assert_eq!(csv_replay_batch_size(1), DEFAULT_CSV_BATCH_SIZE);
+        assert_eq!(csv_replay_batch_size(1024), 1024);
+        assert_eq!(csv_replay_batch_size(16_384), 64);
+        assert_eq!(csv_replay_batch_size(CSV_REPLAY_CELL_BUDGET * 2), 1);
+    }
+
+    #[test]
+    fn csv_alignment_moves_and_converts_columns_without_changing_values() {
+        use arrow::array::{Array, Float64Array, Int64Array};
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("field_0", DataType::Utf8, true),
+            Field::new("field_1", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["1.5", "2.0"])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        let output_schema = Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("missing", DataType::Utf8, true),
+        ]);
+
+        let aligned = align_csv_batch_to_schema(
+            batch,
+            &output_schema,
+            &[Some(0), Some(1), None],
+            Path::new("input.csv"),
+        )
+        .unwrap();
+
+        let values = aligned
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let ids = aligned
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.values(), &[1.5, 2.0]);
+        assert_eq!(ids.values(), &[1, 2]);
+        assert_eq!(aligned.column(2).null_count(), 2);
     }
 }
