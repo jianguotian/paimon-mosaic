@@ -760,9 +760,7 @@ impl BucketWriter {
 
     pub fn reset(&mut self) {
         for i in 0..self.total_columns {
-            for b in &mut self.null_bitmaps[i] {
-                *b = 0;
-            }
+            self.null_bitmaps[i].fill(0);
             self.value_buffers[i].clear();
             self.non_null_counts[i] = 0;
             self.const_tracking[i] = true;
