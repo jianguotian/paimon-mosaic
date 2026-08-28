@@ -196,7 +196,7 @@ cd tools
 OLD_VERSION=${RELEASE_VERSION} NEW_VERSION=${NEXT_VERSION}-SNAPSHOT ./update_branch_version.sh
 cd ..
 git push origin main</code></pre>
-            <p>The script updates version strings in all <code>pom.xml</code> (matching both <code>${OLD_VERSION}</code> and <code>${OLD_VERSION}-SNAPSHOT</code>), <code>Cargo.toml</code> (excluding <code>target/</code>), and <code>python/pyproject.toml</code> files, then creates a commit.</p>
+            <p>The script updates version strings in all <code>pom.xml</code> (matching both <code>${OLD_VERSION}</code> and <code>${OLD_VERSION}-SNAPSHOT</code>), Cargo package versions, Cargo path dependency constraints and Cargo.lock, and <code>python/pyproject.toml</code>, validates the locked Cargo workspace metadata, then creates a commit.</p>
 
             <!-- ============================================================ -->
             <h2 id="build-a-release-candidate">Build a Release Candidate</h2>
@@ -217,6 +217,7 @@ git tag -v ${RC_TAG}
 git push origin ${RELEASE_BRANCH}
 git push origin ${RC_TAG}</code></pre>
             <p>After pushing, verify in <a href="https://github.com/apache/paimon-mosaic/actions">GitHub Actions</a> that the <code>Release</code> workflow succeeds:</p>
+            <p>The release preflight validates the signed tag and component versions, then creates and verifies a temporary source archive before any language release job starts.</p>
             <ul>
                 <li><strong>Rust release</strong> &mdash; dry-run check (does not publish for RC tags)</li>
                 <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
@@ -229,7 +230,7 @@ git push origin ${RC_TAG}</code></pre>
             <p>Create source release artifacts from the same commit as the RC tag:</p>
 <pre><code>git checkout ${RC_TAG}
 cd tools
-RELEASE_VERSION=${RELEASE_VERSION} ./create_source_release.sh</code></pre>
+RELEASE_VERSION=${RELEASE_VERSION} RC_TAG=${RC_TAG} ./create_source_release.sh</code></pre>
             <p>This creates the following under <code>tools/release/</code>:</p>
             <ul>
                 <li><code>apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz</code> &mdash; source archive</li>
@@ -298,6 +299,10 @@ Release Manager</code></pre>
             <p>If the vote reveals issues:</p>
             <ol>
                 <li>Fix them on the release branch via normal PRs.</li>
+                <li>Preserve the previous RC's local source artifacts outside the checkout so the next build does not overwrite them:
+<pre><code># From the paimon-mosaic checkout
+mv tools/release "../paimon-mosaic-${RC_TAG}-artifacts"</code></pre>
+                </li>
                 <li>Remove the old RC from dist dev (optional):
 <pre><code>cd paimon-dist-dev
 svn remove paimon-mosaic-${RELEASE_VERSION}-rc${RC_NUM}

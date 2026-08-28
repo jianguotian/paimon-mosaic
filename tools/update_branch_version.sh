@@ -60,11 +60,23 @@ NEW_VERSION_CLEAN=$(echo "$NEW_VERSION" | sed 's/-SNAPSHOT//')
 #change version in all pom files (match both exact and -SNAPSHOT suffix)
 find . -name 'pom.xml' -type f -exec perl -pi -e 's#<version>'$OLD_VERSION'(-SNAPSHOT)?</version>#<version>'$NEW_VERSION'</version>#' {} \;
 
-#change version in Cargo.toml files
-find . -name 'Cargo.toml' -not -path '*/target/*' -type f -exec perl -pi -e 's#^version = "'$OLD_VERSION_CLEAN'"#version = "'$NEW_VERSION_CLEAN'"#' {} \;
+#change package versions and versioned path dependencies in Cargo.toml files
+OLD_VERSION_CLEAN="${OLD_VERSION_CLEAN}" \
+NEW_VERSION_CLEAN="${NEW_VERSION_CLEAN}" \
+find . -name 'Cargo.toml' -not -path '*/target/*' -type f \
+  -exec perl -pi -e '
+    s/^version = "\Q$ENV{OLD_VERSION_CLEAN}\E"/version = "$ENV{NEW_VERSION_CLEAN}"/;
+    if (/path\s*=/) {
+      s/(\bversion\s*=\s*")\Q$ENV{OLD_VERSION_CLEAN}\E(")/$1$ENV{NEW_VERSION_CLEAN}$2/g;
+    }
+  ' {} \;
 
 #change version in pyproject.toml
 perl -pi -e 's#^version = "'$OLD_VERSION_CLEAN'"#version = "'$NEW_VERSION_CLEAN'"#' python/pyproject.toml
+
+#refresh and validate workspace package versions in Cargo.lock
+cargo update --workspace
+cargo metadata --locked --format-version 1 --no-deps >/dev/null
 
 git commit -am "Update version to $NEW_VERSION"
 
