@@ -925,12 +925,9 @@ fn infer_json_schema_lossless<R: std::io::BufRead>(
         });
         arrow::json::reader::infer_json_schema_from_iterator(values)?
     };
-    // Integer tokens are only lossy when inference promotes their exact path
-    // to Float64; sibling struct fields can retain independent Int64 types.
-    if let Some(path) = inexact_f64_integer_paths
-        .iter()
-        .find(|path| matches!(json_path_data_type(&schema, path), Some(DataType::Float64)))
-    {
+    // Walk the inferred schema once: resolving every raw path independently is
+    // quadratic for wide objects. Sibling fields can retain independent types.
+    if let Some(path) = find_inexact_f64_path(&schema, &inexact_f64_integer_paths) {
         return Err(ArrowError::JsonError(format!(
             "numeric value in JSON field '{}' cannot be represented exactly as Float64",
             fmt::safe(&format_json_number_path(path))
@@ -1066,40 +1063,52 @@ fn is_inexact_f64_integer(literal: &str) -> bool {
         .is_none_or(|promoted| format!("{promoted:.0}") != literal)
 }
 
-fn json_path_data_type<'a>(
-    schema: &'a Schema,
-    path: &[JsonNumberPathSegment],
-) -> Option<&'a DataType> {
-    let (JsonNumberPathSegment::Field(name), rest) = path.split_first()? else {
-        return None;
-    };
-    let field = schema.fields().iter().find(|field| field.name() == name)?;
-    nested_json_path_data_type(field.data_type(), rest)
+fn find_inexact_f64_path<'a>(
+    schema: &Schema,
+    inexact: &'a std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+) -> Option<&'a [JsonNumberPathSegment]> {
+    let mut path = Vec::new();
+    for field in schema.fields() {
+        path.push(JsonNumberPathSegment::Field(field.name().clone()));
+        let found = find_inexact_f64_path_in_type(field.data_type(), &mut path, inexact);
+        path.pop();
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
 }
 
-fn nested_json_path_data_type<'a>(
-    data_type: &'a DataType,
-    path: &[JsonNumberPathSegment],
-) -> Option<&'a DataType> {
-    let Some((segment, rest)) = path.split_first() else {
-        return Some(data_type);
-    };
-    let nested = match (segment, data_type) {
-        (JsonNumberPathSegment::Field(name), DataType::Struct(fields)) => fields
-            .iter()
-            .find(|field| field.name() == name)?
-            .data_type(),
-        (
-            JsonNumberPathSegment::Element,
-            DataType::List(field)
-            | DataType::ListView(field)
-            | DataType::FixedSizeList(field, _)
-            | DataType::LargeList(field)
-            | DataType::LargeListView(field),
-        ) => field.data_type(),
-        _ => return None,
-    };
-    nested_json_path_data_type(nested, rest)
+fn find_inexact_f64_path_in_type<'a>(
+    data_type: &DataType,
+    path: &mut Vec<JsonNumberPathSegment>,
+    inexact: &'a std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+) -> Option<&'a [JsonNumberPathSegment]> {
+    match data_type {
+        DataType::Float64 => inexact.get(path.as_slice()).map(Vec::as_slice),
+        DataType::Struct(fields) => {
+            for field in fields {
+                path.push(JsonNumberPathSegment::Field(field.name().clone()));
+                let found = find_inexact_f64_path_in_type(field.data_type(), path, inexact);
+                path.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        DataType::List(field)
+        | DataType::ListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::LargeList(field)
+        | DataType::LargeListView(field) => {
+            path.push(JsonNumberPathSegment::Element);
+            let found = find_inexact_f64_path_in_type(field.data_type(), path, inexact);
+            path.pop();
+            found
+        }
+        _ => None,
+    }
 }
 
 fn format_json_number_path(path: &[JsonNumberPathSegment]) -> String {
@@ -2253,6 +2262,61 @@ mod install_tests {
     #[test]
     fn json_parser_rejects_out_of_range_numbers() {
         assert!(serde_json::from_str::<Value>("1e400").is_err());
+    }
+
+    #[test]
+    fn inexact_json_path_only_matches_float64_schema_fields() {
+        let schema = Schema::new(vec![
+            Field::new("integer", DataType::Int64, true),
+            Field::new("float", DataType::Float64, true),
+        ]);
+        let inexact = std::collections::BTreeSet::from([
+            vec![JsonNumberPathSegment::Field("integer".to_string())],
+            vec![JsonNumberPathSegment::Field("float".to_string())],
+        ]);
+
+        let path = find_inexact_f64_path(&schema, &inexact).unwrap();
+
+        assert_eq!(format_json_number_path(path), "float");
+    }
+
+    #[test]
+    fn inexact_json_path_traverses_nested_structs_and_lists() {
+        let schema = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(
+                vec![
+                    Field::new(
+                        "integers",
+                        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                        true,
+                    ),
+                    Field::new(
+                        "floats",
+                        DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            true,
+        )]);
+        let inexact = std::collections::BTreeSet::from([
+            vec![
+                JsonNumberPathSegment::Field("payload".to_string()),
+                JsonNumberPathSegment::Field("integers".to_string()),
+                JsonNumberPathSegment::Element,
+            ],
+            vec![
+                JsonNumberPathSegment::Field("payload".to_string()),
+                JsonNumberPathSegment::Field("floats".to_string()),
+                JsonNumberPathSegment::Element,
+            ],
+        ]);
+
+        let path = find_inexact_f64_path(&schema, &inexact).unwrap();
+
+        assert_eq!(format_json_number_path(path), "payload.floats[]");
     }
 
     #[test]
