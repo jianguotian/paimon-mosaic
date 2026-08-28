@@ -19,11 +19,12 @@ name: Release Vote Gate
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, "release-*"]
     paths:
       - ".github/workflows/release-vote-gate.yml"
       - ".github/workflows/release-java.yml"
       - ".github/workflows/release-python-publish.yml"
+      - ".github/workflows/release-python.yml"
       - ".github/workflows/release-rust.yml"
       - ".github/workflows/release.yml"
       - "docs/creating-a-release.html"
@@ -42,6 +43,7 @@ on:
       - ".github/workflows/release-vote-gate.yml"
       - ".github/workflows/release-java.yml"
       - ".github/workflows/release-python-publish.yml"
+      - ".github/workflows/release-python.yml"
       - ".github/workflows/release-rust.yml"
       - ".github/workflows/release.yml"
       - "docs/creating-a-release.html"

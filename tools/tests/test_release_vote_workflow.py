@@ -56,6 +56,7 @@ REQUIRED_GATE_PATHS = {
     ".github/workflows/release-vote-gate.yml",
     ".github/workflows/release-java.yml",
     ".github/workflows/release-python-publish.yml",
+    ".github/workflows/release-python.yml",
     ".github/workflows/release-rust.yml",
     ".github/workflows/release.yml",
     "docs/creating-a-release.html",
@@ -75,12 +76,12 @@ RELEASE_WORKFLOW_BY_JOB = {
     "python-wheels": "./.github/workflows/release-python.yml",
     "python-publish": "./.github/workflows/release-python-publish.yml",
 }
-IMPORT_SIGNING_KEY_COMMAND = """set -euo pipefail
-if [[ -z "${GPG_SECRET_KEY}" ]]; then
-  echo "GPG_SECRET_KEY is unset" >&2
-  exit 1
-fi
-printf '%s' "${GPG_SECRET_KEY}" | gpg --batch --import
+IMPORT_VERIFICATION_KEYS_COMMAND = """set -euo pipefail
+keys_file="${RUNNER_TEMP}/KEYS"
+curl --fail --location --proto '=https' --tlsv1.2 \\
+  --output "${keys_file}" \\
+  https://downloads.apache.org/paimon/KEYS
+gpg --batch --import "${keys_file}"
 """
 VERIFY_RELEASE_COMMAND = (
     'python3 tools/verify_release_versions.py "${TAG_NAME}" '
@@ -167,6 +168,8 @@ def gate_step(workflow: dict, name: str) -> dict:
 def assert_gate_contract(workflow: dict) -> None:
     triggers = workflow["on"]
     assert "workflow_dispatch" in triggers
+    assert set(triggers["pull_request"]["branches"]) == {"main", "release-*"}
+    assert set(triggers["push"]["branches"]) == {"main", "release-*"}
     for event in ("pull_request", "push"):
         assert REQUIRED_GATE_PATHS <= set(triggers[event]["paths"])
 
@@ -206,13 +209,11 @@ def assert_release_contract(workflow: dict) -> None:
     assert checkout_options.get("fetch-depth") == "0"
     assert "ref" not in checkout_options
 
-    import_step = named_step(workflow, "Import release signing key")
+    import_step = named_step(workflow, "Import release verification keys")
     assert import_step["if"] == TAG_CONDITION
-    assert import_step["env"] == {
-        "GPG_SECRET_KEY": "${{ secrets.GPG_SECRET_KEY }}"
-    }
+    assert "env" not in import_step
     assert "continue-on-error" not in import_step
-    assert import_step["run"] == IMPORT_SIGNING_KEY_COMMAND
+    assert import_step["run"] == IMPORT_VERIFICATION_KEYS_COMMAND
 
     version_step = release_version_step(workflow)
     assert version_step["if"] == TAG_CONDITION
@@ -254,6 +255,10 @@ def test_release_has_signed_exact_tag_preflight() -> None:
     assert version_step["if"] == TAG_CONDITION
     assert "github.ref_name" in version_step["env"]["TAG_NAME"]
     assert "github.ref_name" not in version_step["run"]
+
+
+def test_release_preflight_does_not_use_private_key_secret() -> None:
+    assert "GPG_SECRET_KEY" not in RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
 
 def test_release_tag_context_is_not_interpolated_into_shell() -> None:
@@ -409,6 +414,7 @@ def test_contract_rejects_source_archive_preflight_mutations(
         "missing-signature-verification",
         "masked-key-import",
         "key-import-continue",
+        "private-key-secret",
     ),
 )
 def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
@@ -425,11 +431,21 @@ def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
             'python3 tools/verify_release_versions.py "${TAG_NAME}"'
         )
     elif mutation == "masked-key-import":
-        named_step(workflow, "Import release signing key")["run"] += " || true"
+        named_step(workflow, "Import release verification keys")[
+            "run"
+        ] += " || true"
     elif mutation == "key-import-continue":
-        named_step(workflow, "Import release signing key")[
+        named_step(workflow, "Import release verification keys")[
             "continue-on-error"
         ] = "true"
+    elif mutation == "private-key-secret":
+        import_step = named_step(workflow, "Import release verification keys")
+        import_step["env"] = {
+            "GPG_SECRET_KEY": "${{ secrets.GPG_SECRET_KEY }}"
+        }
+        import_step["run"] = (
+            "printf '%s' \"${GPG_SECRET_KEY}\" | gpg --batch --import"
+        )
     else:
         raise AssertionError(f"unknown mutation: {mutation}")
 
@@ -465,7 +481,10 @@ def test_source_release_documentation_passes_rc_tag_explicitly() -> None:
     assert invocation in source
 
     assert "Cargo path dependency constraints and Cargo.lock" in source
-    assert "RC tag verification and Java artifact signing" in source
+    assert (
+        "<tr><td><code>GPG_SECRET_KEY</code></td>"
+        "<td>Java artifact signing</td></tr>"
+    ) in source
 
 
 def test_release_documentation_describes_source_archive_preflight() -> None:
@@ -479,9 +498,31 @@ def test_release_vote_gate_matches_blocking_contract() -> None:
 
 
 @pytest.mark.parametrize("event", ("pull_request", "push"))
-def test_gate_contract_rejects_missing_release_workflow_path(event: str) -> None:
+@pytest.mark.parametrize(
+    "workflow_path",
+    (
+        ".github/workflows/release.yml",
+        *(
+            path.removeprefix("./")
+            for path in RELEASE_WORKFLOW_BY_JOB.values()
+        ),
+    ),
+)
+def test_gate_contract_rejects_missing_release_workflow_path(
+    event: str,
+    workflow_path: str,
+) -> None:
     workflow = copy.deepcopy(load_workflow(GATE_WORKFLOW))
-    workflow["on"][event]["paths"].remove(".github/workflows/release.yml")
+    workflow["on"][event]["paths"].remove(workflow_path)
+
+    with pytest.raises(AssertionError):
+        assert_gate_contract(workflow)
+
+
+@pytest.mark.parametrize("event", ("pull_request", "push"))
+def test_gate_contract_rejects_missing_release_branch(event: str) -> None:
+    workflow = copy.deepcopy(load_workflow(GATE_WORKFLOW))
+    workflow["on"][event]["branches"].remove("release-*")
 
     with pytest.raises(AssertionError):
         assert_gate_contract(workflow)
