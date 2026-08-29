@@ -33,7 +33,7 @@ use arrow::compute::kernels::cast_utils::{string_to_datetime, Parser as ArrowVal
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use clap::{Parser, Subcommand};
 use paimon_mosaic_core::reader::{MosaicReader, ReaderAccess};
-use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
@@ -629,8 +629,14 @@ fn convert_csv(
             let source_mapping = csv_output_mapping(&schema, &schema_index, &layout);
             validate_csv_mapping(&schema, &layout, &source_mapping, input)?;
             let (projection, mapping) = csv_projection(&source_mapping);
-            let reader = build_csv_replay_reader(reader_schema, format.clone(), projection, reader)
-                .map_err(bad)?;
+            let reader = build_csv_replay_reader(
+                reader_schema,
+                format.clone(),
+                projection,
+                schema.fields().len(),
+                reader,
+            )
+            .map_err(bad)?;
             for batch in reader {
                 let batch = batch.map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
@@ -935,6 +941,9 @@ fn infer_json_schema_lossless<R: std::io::BufRead>(
                                     .map_err(|error| {
                                         ArrowError::JsonError(format!("Not valid JSON: {error}"))
                                     }),
+                                    Err(JsonNumberScanError::Validation(error)) => Err(
+                                        ArrowError::JsonError(format!("Not valid JSON: {error}")),
+                                    ),
                                 }
                             }
                             Err(error) => match parse_json_record_lossless(
@@ -982,126 +991,6 @@ enum JsonNumberPathSegment {
 
 const MAX_JSON_NESTING_DEPTH: usize = 128;
 
-fn collect_inexact_f64_integer_paths(
-    raw: &RawValue,
-    path: &mut Vec<JsonNumberPathSegment>,
-    inexact: &mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
-    parent_depth: usize,
-) -> Result<(), String> {
-    let literal = raw.get().trim();
-    match literal.as_bytes().first().copied() {
-        Some(b'{') => {
-            if parent_depth == MAX_JSON_NESTING_DEPTH {
-                return Err("recursion limit exceeded".to_string());
-            }
-            let mut deserializer = serde_json::Deserializer::from_str(literal);
-            serde::Deserializer::deserialize_map(
-                &mut deserializer,
-                RawJsonObjectVisitor {
-                    path,
-                    inexact,
-                    depth: parent_depth + 1,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        Some(b'[') => {
-            if parent_depth == MAX_JSON_NESTING_DEPTH {
-                return Err("recursion limit exceeded".to_string());
-            }
-            let mut deserializer = serde_json::Deserializer::from_str(literal);
-            serde::Deserializer::deserialize_seq(
-                &mut deserializer,
-                RawJsonArrayVisitor {
-                    path,
-                    inexact,
-                    depth: parent_depth + 1,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        Some(b'-' | b'0'..=b'9') => {
-            let promoted = literal.parse::<f64>().map_err(|_| {
-                format!(
-                    "invalid JSON number at '{}'",
-                    fmt::safe(&format_json_number_path(path))
-                )
-            })?;
-            if !promoted.is_finite() {
-                return Err(format!(
-                    "numeric value in JSON field '{}' is out of range for Float64",
-                    fmt::safe(&format_json_number_path(path))
-                ));
-            }
-            if !literal
-                .bytes()
-                .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
-                && is_inexact_f64_integer(literal)
-            {
-                inexact.insert(path.clone());
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-struct RawJsonObjectVisitor<'path, 'inexact> {
-    path: &'path mut Vec<JsonNumberPathSegment>,
-    inexact: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
-    depth: usize,
-}
-
-impl<'de> Visitor<'de> for RawJsonObjectVisitor<'_, '_> {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON object")
-    }
-
-    fn visit_map<M>(self, mut map: M) -> Result<(), M::Error>
-    where
-        M: MapAccess<'de>,
-    {
-        while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-            let raw = map.next_value::<&RawValue>()?;
-            self.path
-                .push(JsonNumberPathSegment::Field(name.into_owned()));
-            collect_inexact_f64_integer_paths(raw, self.path, self.inexact, self.depth)
-                .map_err(serde::de::Error::custom)?;
-            self.path.pop();
-        }
-        Ok(())
-    }
-}
-
-struct RawJsonArrayVisitor<'path, 'inexact> {
-    path: &'path mut Vec<JsonNumberPathSegment>,
-    inexact: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
-    depth: usize,
-}
-
-impl<'de> Visitor<'de> for RawJsonArrayVisitor<'_, '_> {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON array")
-    }
-
-    fn visit_seq<S>(self, mut sequence: S) -> Result<(), S::Error>
-    where
-        S: SeqAccess<'de>,
-    {
-        self.path.push(JsonNumberPathSegment::Element);
-        while let Some(raw) = sequence.next_element::<&RawValue>()? {
-            collect_inexact_f64_integer_paths(raw, self.path, self.inexact, self.depth)
-                .map_err(serde::de::Error::custom)?;
-        }
-        self.path.pop();
-        Ok(())
-    }
-}
-
 fn json_integer_exceeds_exact_f64_range(literal: &str) -> bool {
     const MAX_EXACT_F64_INTEGER: &str = "9007199254740992";
     let digits = literal
@@ -1137,20 +1026,33 @@ enum JsonScanPathSegment {
 #[derive(Debug)]
 enum JsonNumberScanError {
     Syntax,
+    Validation(String),
 }
 
-fn scan_json_numbers(
+impl std::fmt::Display for JsonNumberScanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Syntax => formatter.write_str("invalid JSON syntax"),
+            Self::Validation(message) => formatter.write_str(message),
+        }
+    }
+}
+
+fn scan_json_numbers_with_prefix(
     record: &str,
     inexact: &mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
     inexact_index: &mut JsonNumberPathTrie,
+    path_prefix: Vec<JsonNumberPathSegment>,
+    parent_depth: usize,
 ) -> Result<(), JsonNumberScanError> {
     let mut scanner = JsonNumberScanner {
         bytes: record.as_bytes(),
         position: 0,
         path: Vec::new(),
+        path_prefix,
         inexact,
         inexact_index,
-        depth: 0,
+        depth: parent_depth,
     };
     scanner.scan_value()?;
     scanner.skip_whitespace();
@@ -1161,10 +1063,19 @@ fn scan_json_numbers(
     }
 }
 
+fn scan_json_numbers(
+    record: &str,
+    inexact: &mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
+    inexact_index: &mut JsonNumberPathTrie,
+) -> Result<(), JsonNumberScanError> {
+    scan_json_numbers_with_prefix(record, inexact, inexact_index, Vec::new(), 0)
+}
+
 struct JsonNumberScanner<'record, 'inexact, 'index> {
     bytes: &'record [u8],
     position: usize,
     path: Vec<JsonScanPathSegment>,
+    path_prefix: Vec<JsonNumberPathSegment>,
     inexact: &'inexact mut std::collections::BTreeSet<Vec<JsonNumberPathSegment>>,
     inexact_index: &'index mut JsonNumberPathTrie,
     depth: usize,
@@ -1248,7 +1159,9 @@ impl JsonNumberScanner<'_, '_, '_> {
 
     fn enter_container(&mut self) -> Result<(), JsonNumberScanError> {
         if self.depth == MAX_JSON_NESTING_DEPTH {
-            return Err(JsonNumberScanError::Syntax);
+            return Err(JsonNumberScanError::Validation(
+                "recursion limit exceeded".to_string(),
+            ));
         }
         self.depth += 1;
         Ok(())
@@ -1331,21 +1244,47 @@ impl JsonNumberScanner<'_, '_, '_> {
         }
         let literal = std::str::from_utf8(&self.bytes[start..self.position])
             .map_err(|_| JsonNumberScanError::Syntax)?;
+        let promoted = match literal.parse::<f64>() {
+            Ok(promoted) => promoted,
+            Err(_) => {
+                let path = self.materialize_path()?;
+                return Err(JsonNumberScanError::Validation(format!(
+                    "invalid JSON number at '{}'",
+                    fmt::safe(&format_json_number_path(&path))
+                )));
+            }
+        };
+        if !promoted.is_finite() {
+            let path = self.materialize_path()?;
+            return Err(JsonNumberScanError::Validation(format!(
+                "numeric value in JSON field '{}' is out of range for Float64",
+                fmt::safe(&format_json_number_path(&path))
+            )));
+        }
         let integer = !literal
             .bytes()
             .any(|byte| matches!(byte, b'.' | b'e' | b'E'));
-        if integer
-            && json_integer_exceeds_exact_f64_range(literal)
-            && !self
-                .inexact_index
-                .contains_scan_path(self.bytes, &self.path)?
-            && is_inexact_f64_integer(literal)
-        {
-            let path = materialize_json_scan_path(self.bytes, &self.path)?;
-            self.inexact_index.insert(&path);
-            self.inexact.insert(path);
+        if integer && json_integer_exceeds_exact_f64_range(literal) {
+            let known = if self.path_prefix.is_empty() {
+                self.inexact_index
+                    .contains_scan_path(self.bytes, &self.path)?
+            } else {
+                let path = self.materialize_path()?;
+                self.inexact.contains(&path)
+            };
+            if !known && is_inexact_f64_integer(literal) {
+                let path = self.materialize_path()?;
+                self.inexact_index.insert(&path);
+                self.inexact.insert(path);
+            }
         }
         Ok(())
+    }
+
+    fn materialize_path(&self) -> Result<Vec<JsonNumberPathSegment>, JsonNumberScanError> {
+        let mut path = self.path_prefix.clone();
+        path.extend(materialize_json_scan_path(self.bytes, &self.path)?);
+        Ok(path)
     }
 
     fn scan_keyword(&mut self, keyword: &[u8]) -> Result<(), JsonNumberScanError> {
@@ -1604,11 +1543,12 @@ impl<'de> Visitor<'de> for FilteredJsonRecordVisitor<'_, '_> {
             {
                 let name = name.into_owned();
                 let raw = map.next_value::<&RawValue>()?;
-                let mut path = vec![JsonNumberPathSegment::Field(name.clone())];
-                collect_inexact_f64_integer_paths(
-                    raw,
-                    &mut path,
+                let mut inexact_index = JsonNumberPathTrie::default();
+                scan_json_numbers_with_prefix(
+                    raw.get(),
                     self.inexact_f64_integer_paths,
+                    &mut inexact_index,
+                    vec![JsonNumberPathSegment::Field(name.clone())],
                     1,
                 )
                 .map_err(serde::de::Error::custom)?;
@@ -1748,9 +1688,10 @@ fn build_csv_replay_reader<R: std::io::Read>(
     schema: Schema,
     format: arrow::csv::reader::Format,
     projection: Vec<usize>,
+    output_columns: usize,
     reader: R,
 ) -> Result<arrow::csv::Reader<R>, arrow::error::ArrowError> {
-    let batch_size = csv_replay_batch_size(schema.fields().len());
+    let batch_size = csv_replay_batch_size(output_columns);
     arrow::csv::ReaderBuilder::new(Arc::new(schema))
         .with_format(format.with_truncated_rows(false))
         .with_batch_size(batch_size)
@@ -2768,6 +2709,29 @@ mod install_tests {
     }
 
     #[test]
+    fn projected_json_parser_does_not_rescan_large_nested_subtrees() {
+        let payload = serde_json::to_string(&"x".repeat(8 << 20)).unwrap();
+        let columns = std::collections::HashSet::from(["v"]);
+        let parse_at_depth = |depth: usize| {
+            let nested = format!("{}{payload}{}", "[".repeat(depth), "]".repeat(depth));
+            let record = format!(r#"{{"v":{nested}}}"#);
+            let mut inexact = std::collections::BTreeSet::new();
+            let started = std::time::Instant::now();
+            let value = parse_json_record_lossless(&record, Some(&columns), &mut inexact).unwrap();
+            assert!(value.get("v").is_some());
+            assert!(inexact.is_empty());
+            started.elapsed()
+        };
+
+        let shallow = parse_at_depth(1);
+        let deep = parse_at_depth(96);
+        assert!(
+            deep <= shallow.saturating_mul(4) + std::time::Duration::from_millis(500),
+            "projected parse scaled with depth: shallow={shallow:?}, deep={deep:?}"
+        );
+    }
+
+    #[test]
     fn json_number_scanner_records_nested_inexact_integer_paths() {
         let mut inexact = std::collections::BTreeSet::new();
         let mut inexact_index = JsonNumberPathTrie::default();
@@ -3012,6 +2976,7 @@ mod install_tests {
             schema,
             format,
             vec![0, 1],
+            2,
             std::io::Cursor::new(b"a,b\n1\n"),
         )
         .unwrap();
@@ -3027,6 +2992,22 @@ mod install_tests {
         assert_eq!(csv_replay_batch_size(1024), 1024);
         assert_eq!(csv_replay_batch_size(16_384), 64);
         assert_eq!(csv_replay_batch_size(CSV_REPLAY_CELL_BUDGET * 2), 1);
+    }
+
+    #[test]
+    fn csv_replay_batch_size_uses_final_union_width() {
+        let schema = Schema::new(vec![Field::new("only", DataType::Int64, true)]);
+        let format = arrow::csv::reader::Format::default().with_header(true);
+        let rows = (0..100)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = format!("only\n{rows}\n");
+        let mut reader =
+            build_csv_replay_reader(schema, format, vec![0], 65_536, std::io::Cursor::new(input))
+                .unwrap();
+
+        assert_eq!(reader.next().unwrap().unwrap().num_rows(), 16);
     }
 
     #[test]
