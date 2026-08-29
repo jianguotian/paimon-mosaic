@@ -54,6 +54,94 @@ pub struct ChildColumnMeta {
     pub num_elements: usize,
 }
 
+enum DictIndexBuffer {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    Usize(Vec<usize>),
+}
+
+impl DictIndexBuffer {
+    fn new(max_entries: usize) -> Self {
+        if max_entries <= u8::MAX as usize + 1 {
+            Self::U8(Vec::new())
+        } else if max_entries <= u16::MAX as usize + 1 {
+            Self::U16(Vec::new())
+        } else if max_entries <= u32::MAX as usize {
+            Self::U32(Vec::new())
+        } else {
+            Self::Usize(Vec::new())
+        }
+    }
+
+    fn push(&mut self, index: usize) {
+        match self {
+            Self::U8(indices) => indices.push(index as u8),
+            Self::U16(indices) => indices.push(index as u16),
+            Self::U32(indices) => indices.push(index as u32),
+            Self::Usize(indices) => indices.push(index),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::U8(indices) => indices.clear(),
+            Self::U16(indices) => indices.clear(),
+            Self::U32(indices) => indices.clear(),
+            Self::Usize(indices) => indices.clear(),
+        }
+    }
+
+    fn discard(&mut self) {
+        match self {
+            Self::U8(indices) => *indices = Vec::new(),
+            Self::U16(indices) => *indices = Vec::new(),
+            Self::U32(indices) => *indices = Vec::new(),
+            Self::Usize(indices) => *indices = Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U8(indices) => indices.len(),
+            Self::U16(indices) => indices.len(),
+            Self::U32(indices) => indices.len(),
+            Self::Usize(indices) => indices.len(),
+        }
+    }
+
+    fn pack_into(&self, buf: &mut [u8], data_start: usize, bit_width: usize) {
+        fn pack_indices<T: Copy>(
+            indices: &[T],
+            buf: &mut [u8],
+            data_start: usize,
+            bit_width: usize,
+            to_usize: impl Fn(T) -> usize,
+        ) {
+            for (position, &index) in indices.iter().enumerate() {
+                write_bit_packed(
+                    buf,
+                    data_start,
+                    position * bit_width,
+                    to_usize(index),
+                    bit_width,
+                );
+            }
+        }
+
+        match self {
+            Self::U8(indices) => pack_indices(indices, buf, data_start, bit_width, usize::from),
+            Self::U16(indices) => pack_indices(indices, buf, data_start, bit_width, usize::from),
+            Self::U32(indices) => {
+                pack_indices(indices, buf, data_start, bit_width, |index| index as usize)
+            }
+            Self::Usize(indices) => {
+                pack_indices(indices, buf, data_start, bit_width, |index| index)
+            }
+        }
+    }
+}
+
 pub struct BucketWriter {
     num_primary: usize,
     total_columns: usize,
@@ -68,6 +156,7 @@ pub struct BucketWriter {
 
     long_dict_maps: Vec<Option<HashMap<u64, usize>>>,
     byte_dict_maps: Vec<Option<HashMap<Vec<u8>, usize>>>,
+    dict_indices: Vec<DictIndexBuffer>,
     dict_total_bytes: Vec<usize>,
     max_dict_total_bytes: usize,
     max_dict_entries: usize,
@@ -110,6 +199,9 @@ impl BucketWriter {
             first_value_len: vec![0; total_columns],
             long_dict_maps,
             byte_dict_maps,
+            dict_indices: (0..total_columns)
+                .map(|_| DictIndexBuffer::new(max_dict_entries))
+                .collect(),
             dict_total_bytes: vec![0; total_columns],
             max_dict_total_bytes,
             max_dict_entries,
@@ -349,30 +441,7 @@ impl BucketWriter {
                     }
                 }
 
-                if let Some(ref mut dict) = self.long_dict_maps[col] {
-                    let key = values::extract_fixed_key(
-                        &self.value_buffers[col],
-                        before,
-                        self.fixed_widths[col],
-                    );
-                    let len = dict.len();
-                    dict.entry(key).or_insert(len);
-                    if dict.len() > self.max_dict_entries {
-                        self.long_dict_maps[col] = None;
-                    }
-                } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
-                    let slice = &self.value_buffers[col][before..before + written];
-                    if !dict.contains_key(slice) {
-                        let len = dict.len();
-                        dict.insert(slice.to_vec(), len);
-                        self.dict_total_bytes[col] += written;
-                    }
-                    if dict.len() > self.max_dict_entries
-                        || self.dict_total_bytes[col] > self.max_dict_total_bytes
-                    {
-                        self.byte_dict_maps[col] = None;
-                    }
-                }
+                self.track_dict_value(col, before, written);
             }
         }
         Ok(col_size)
@@ -514,30 +583,9 @@ impl BucketWriter {
             }
         }
 
-        if let Some(ref mut dict) = self.long_dict_maps[col] {
+        if self.long_dict_maps[col].is_some() || self.byte_dict_maps[col].is_some() {
             for i in 0..num_rows {
-                let key =
-                    values::extract_fixed_key(buf, before_all + i * fw, self.fixed_widths[col]);
-                let len = dict.len();
-                dict.entry(key).or_insert(len);
-                if dict.len() > self.max_dict_entries {
-                    self.long_dict_maps[col] = None;
-                    break;
-                }
-            }
-        } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
-            for i in 0..num_rows {
-                let start = before_all + i * fw;
-                let slice = &buf[start..start + fw];
-                if !dict.contains_key(slice) {
-                    let len = dict.len();
-                    dict.insert(slice.to_vec(), len);
-                    self.dict_total_bytes[col] += fw;
-                }
-                if dict.len() > self.max_dict_entries
-                    || self.dict_total_bytes[col] > self.max_dict_total_bytes
-                {
-                    self.byte_dict_maps[col] = None;
+                if !self.track_dict_value(col, before_all + i * fw, fw) {
                     break;
                 }
             }
@@ -547,6 +595,56 @@ impl BucketWriter {
         let _ = start_row;
 
         Ok(Some(col_size))
+    }
+
+    fn track_dict_value(&mut self, col: usize, value_start: usize, value_len: usize) -> bool {
+        let mut index = None;
+        let mut disable_long_dict = false;
+        let mut disable_byte_dict = false;
+
+        if let Some(ref mut dict) = self.long_dict_maps[col] {
+            let key = values::extract_fixed_key(
+                &self.value_buffers[col],
+                value_start,
+                self.fixed_widths[col],
+            );
+            let next_index = dict.len();
+            let value_index = *dict.entry(key).or_insert(next_index);
+            if dict.len() > self.max_dict_entries {
+                disable_long_dict = true;
+            } else {
+                index = Some(value_index);
+            }
+        } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
+            let value = &self.value_buffers[col][value_start..value_start + value_len];
+            let value_index = if let Some(&value_index) = dict.get(value) {
+                value_index
+            } else {
+                let value_index = dict.len();
+                dict.insert(value.to_vec(), value_index);
+                self.dict_total_bytes[col] += value_len;
+                value_index
+            };
+            if dict.len() > self.max_dict_entries
+                || self.dict_total_bytes[col] > self.max_dict_total_bytes
+            {
+                disable_byte_dict = true;
+            } else {
+                index = Some(value_index);
+            }
+        }
+
+        if disable_long_dict {
+            self.long_dict_maps[col] = None;
+            self.dict_indices[col].discard();
+        } else if disable_byte_dict {
+            self.byte_dict_maps[col] = None;
+            self.dict_indices[col].discard();
+        } else if let Some(index) = index {
+            self.dict_indices[col].push(index);
+        }
+
+        index.is_some()
     }
 
     fn compute_encodings(&self) -> (Vec<u8>, Vec<bool>) {
@@ -665,7 +763,7 @@ impl BucketWriter {
                 let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
                 let data_start = out.len();
                 out.resize(data_start + packed_bytes, 0);
-                self.write_dict_bit_packed(i, &mut out, data_start);
+                self.write_dict_indices(i, &mut out, data_start);
             }
         }
 
@@ -733,7 +831,7 @@ impl BucketWriter {
                     let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
                     let data_start = page.len();
                     page.resize(data_start + packed_bytes, 0);
-                    self.write_dict_bit_packed(i, &mut page, data_start);
+                    self.write_dict_indices(i, &mut page, data_start);
                     column_pages[i] = Some(page);
                 }
                 ENCODING_PLAIN => {
@@ -768,6 +866,7 @@ impl BucketWriter {
             self.const_tracking[i] = true;
             self.first_value_len[i] = 0;
             self.dict_total_bytes[i] = 0;
+            self.dict_indices[i].clear();
             if uses_long_dict(self.fixed_widths[i]) {
                 if let Some(ref mut dict) = self.long_dict_maps[i] {
                     dict.clear();
@@ -796,40 +895,11 @@ impl BucketWriter {
         0
     }
 
-    fn write_dict_bit_packed(&self, col: usize, buf: &mut [u8], data_start: usize) -> usize {
+    fn write_dict_indices(&self, col: usize, buf: &mut [u8], data_start: usize) {
         let dict_size = self.get_dict_size(col);
         let bw = bit_width(dict_size);
-        let w = self.fixed_widths[col];
-        let mut bit_offset = 0usize;
-        let mut val_pos = 0usize;
-
-        for r in 0..self.col_num_rows(col) {
-            let is_null = (self.null_bitmaps[col][r / 8] & (1 << (r % 8))) != 0;
-            if !is_null {
-                let idx = if let Some(ref dict) = self.long_dict_maps[col] {
-                    let key = values::extract_fixed_key(&self.value_buffers[col], val_pos, w);
-                    val_pos += w as usize;
-                    *dict.get(&key).unwrap()
-                } else if let Some(ref dict) = self.byte_dict_maps[col] {
-                    let value_len = if w > 0 {
-                        w as usize
-                    } else {
-                        let var_len =
-                            varint::decode(&self.value_buffers[col], &mut val_pos.clone())
-                                .expect("internal varint in value buffer");
-                        varint::encoded_size(var_len) + var_len as usize
-                    };
-                    let slice = &self.value_buffers[col][val_pos..val_pos + value_len];
-                    val_pos += value_len;
-                    *dict.get(slice).unwrap()
-                } else {
-                    unreachable!()
-                };
-                write_bit_packed(buf, data_start, bit_offset, idx, bw);
-                bit_offset += bw;
-            }
-        }
-        bit_offset
+        debug_assert_eq!(self.dict_indices[col].len(), self.non_null_counts[col]);
+        self.dict_indices[col].pack_into(buf, data_start, bw);
     }
 
     fn dict_encoded_size(&self, col: usize) -> usize {
@@ -1611,6 +1681,16 @@ mod tests {
     }
 
     #[test]
+    fn test_dict_index_buffer_uses_narrowest_integer_width() {
+        assert!(matches!(DictIndexBuffer::new(256), DictIndexBuffer::U8(_)));
+        assert!(matches!(DictIndexBuffer::new(257), DictIndexBuffer::U16(_)));
+        assert!(matches!(
+            DictIndexBuffer::new(65_537),
+            DictIndexBuffer::U32(_)
+        ));
+    }
+
+    #[test]
     fn test_expand_col_types_records_explicit_child_layout() {
         let map_type = DataType::Map(
             Arc::new(Field::new(
@@ -1699,6 +1779,120 @@ mod tests {
         let data = writer.finish();
         let h = header_size(&data);
         assert_eq!(data[h] & 0x03, ENCODING_DICT);
+    }
+
+    #[test]
+    fn test_dict_finish_uses_indices_recorded_during_append() {
+        let types = [DataType::Int32];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let vals: Vec<i32> = (0..100).map(|i| i % 3).collect();
+        let arr = Int32Array::from(vals);
+        writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
+
+        let expected = writer.finish();
+        assert_eq!(expected[0] & 0x03, ENCODING_DICT);
+
+        // Finishing a DICT column should use indices captured while appending,
+        // rather than reading and hashing the value buffer a second time.
+        writer.value_buffers[0].fill(0xff);
+        assert_eq!(writer.finish(), expected);
+    }
+
+    #[test]
+    fn test_nullable_string_dict_finish_uses_recorded_indices() {
+        let types = [DataType::Utf8];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let vals: Vec<Option<&str>> = (0..100)
+            .map(|i| {
+                if i % 5 == 0 {
+                    None
+                } else {
+                    Some(["aa", "bb", "cc"][i % 3])
+                }
+            })
+            .collect();
+        let arr = StringArray::from(vals);
+        writer.write_columns(&[&arr], &[&DataType::Utf8]).unwrap();
+
+        let expected = writer.finish();
+        assert_eq!(expected[0] & 0x03, ENCODING_DICT);
+
+        writer.value_buffers[0].fill(0xff);
+        assert_eq!(writer.finish(), expected);
+    }
+
+    #[test]
+    fn test_paged_dict_finish_uses_recorded_indices() {
+        let types = [DataType::Int32];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let vals: Vec<i32> = (0..100).map(|i| i % 3).collect();
+        let arr = Int32Array::from(vals);
+        writer.write_columns(&[&arr], &[&DataType::Int32]).unwrap();
+
+        let expected = writer.finish_paged();
+        assert_eq!(expected.encodings[0], ENCODING_DICT);
+
+        writer.value_buffers[0].fill(0xff);
+        let actual = writer.finish_paged();
+        assert_eq!(actual.encodings, expected.encodings);
+        assert_eq!(actual.has_nulls, expected.has_nulls);
+        assert_eq!(actual.const_data, expected.const_data);
+        assert_eq!(actual.column_pages, expected.column_pages);
+    }
+
+    #[test]
+    fn test_dict_indices_are_compact_and_reset_between_row_groups() {
+        let types = [DataType::Int32];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let first = Int32Array::from((0..100).map(|i| i % 3).collect::<Vec<_>>());
+        writer
+            .write_columns(&[&first], &[&DataType::Int32])
+            .unwrap();
+        assert!(matches!(&writer.dict_indices[0], DictIndexBuffer::U8(_)));
+        assert_eq!(writer.dict_indices[0].len(), first.len());
+
+        writer.reset();
+        assert_eq!(writer.dict_indices[0].len(), 0);
+
+        let second = Int32Array::from((0..100).map(|i| (i + 1) % 3).collect::<Vec<_>>());
+        writer
+            .write_columns(&[&second], &[&DataType::Int32])
+            .unwrap();
+
+        let mut fresh = BucketWriter::new(&type_refs, 32768, 255);
+        fresh
+            .write_columns(&[&second], &[&DataType::Int32])
+            .unwrap();
+        assert_eq!(writer.finish(), fresh.finish());
+    }
+
+    #[test]
+    fn test_dict_indices_are_discarded_when_dictionary_falls_back_to_plain() {
+        let types = [DataType::Int32, DataType::Utf8];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 3, 2);
+
+        let ints = Int32Array::from((0..100).map(|i| i % 3).collect::<Vec<_>>());
+        let strings = StringArray::from((0..100).map(|i| ["aa", "bb"][i % 2]).collect::<Vec<_>>());
+        writer
+            .write_columns(&[&ints, &strings], &[&DataType::Int32, &DataType::Utf8])
+            .unwrap();
+
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_PLAIN);
+        assert_eq!((data[0] >> 2) & 0x03, ENCODING_PLAIN);
+        assert_eq!(writer.dict_indices[0].len(), 0);
+        assert_eq!(writer.dict_indices[1].len(), 0);
+        assert!(matches!(&writer.dict_indices[0], DictIndexBuffer::U8(v) if v.capacity() == 0));
+        assert!(matches!(&writer.dict_indices[1], DictIndexBuffer::U8(v) if v.capacity() == 0));
     }
 
     #[test]
