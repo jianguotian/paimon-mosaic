@@ -21,6 +21,7 @@ set -o pipefail
 
 TEST_SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOOLS_DIR=$(cd "$TEST_SCRIPT_DIR/.." && pwd)
+REAL_GIT=$(command -v git)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/paimon-mosaic-staging-test.XXXXXX")
 TEST_COUNT=0
 
@@ -70,10 +71,11 @@ assert_maven_not_invoked() {
 
 new_fixture() {
   FIXTURE_DIR=$(mktemp -d "$TEST_ROOT/fixture.XXXXXX")
+  GIT_LOG="$FIXTURE_DIR/git.log"
   MAVEN_LOG="$FIXTURE_DIR/maven.log"
   GH_LOG="$FIXTURE_DIR/gh.log"
   OUTPUT_LOG="$FIXTURE_DIR/output.log"
-  export FIXTURE_DIR MAVEN_LOG GH_LOG OUTPUT_LOG
+  export FIXTURE_DIR GIT_LOG MAVEN_LOG GH_LOG OUTPUT_LOG
 
   mkdir -p \
     "$FIXTURE_DIR/fake-bin" \
@@ -98,6 +100,26 @@ java/target/
 java/src/main/resources/native/
 *.class
 *.log
+EOF
+
+  cat > "$FIXTURE_DIR/fake-bin/git" <<'EOF'
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+for argument in "$@"; do
+  if [[ "$argument" == verify-tag ]]; then
+    printf 'args=%s\n' "$*" >> "$FAKE_GIT_LOG"
+    if [[ "${FAKE_VERIFY_TAG_STATUS:-0}" -ne 0 ]]; then
+      echo "fake tag signature verification failure" >&2
+      exit "$FAKE_VERIFY_TAG_STATUS"
+    fi
+    exit 0
+  fi
+done
+
+exec "$REAL_GIT" "$@"
 EOF
 
   cat > "$FIXTURE_DIR/fake-bin/gh" <<'EOF'
@@ -227,6 +249,7 @@ done
 EOF
 
   chmod +x \
+    "$FIXTURE_DIR/fake-bin/git" \
     "$FIXTURE_DIR/fake-bin/gh" \
     "$FIXTURE_DIR/fake-bin/mvn" \
     "$FIXTURE_DIR/fake-bin/jar"
@@ -236,7 +259,8 @@ EOF
   git -C "$FIXTURE_DIR" config user.email "release-script-test@example.invalid"
   git -C "$FIXTURE_DIR" add .
   git -C "$FIXTURE_DIR" commit -q -m fixture
-  git -C "$FIXTURE_DIR" tag v0.3.0-rc1
+  git -C "$FIXTURE_DIR" tag -a v0.3.0-rc1 -m v0.3.0-rc1
+  : > "$GIT_LOG"
   : > "$MAVEN_LOG"
   : > "$GH_LOG"
 }
@@ -245,6 +269,8 @@ run_script() {
   (
     cd "$FIXTURE_DIR"
     PATH="$FIXTURE_DIR/fake-bin:$(dirname "$BASH"):$PATH" \
+      REAL_GIT="$REAL_GIT" \
+      FAKE_GIT_LOG="$GIT_LOG" \
       MVN="$FIXTURE_DIR/fake-bin/mvn" \
       FAKE_MVN_LOG="$MAVEN_LOG" \
       FAKE_GH_LOG="$GH_LOG" \
@@ -302,6 +328,50 @@ test_workflow_run_tag_and_sha_must_match_checkout() {
     fail "workflow run from another commit was accepted"
   fi
   assert_contains "$OUTPUT_LOG" "does not match v0.3.0-rc1"
+  assert_maven_not_invoked
+}
+
+test_release_tag_must_be_annotated() {
+  new_fixture
+  git -C "$FIXTURE_DIR" tag -d v0.3.0-rc1 >/dev/null
+  git -C "$FIXTURE_DIR" tag v0.3.0-rc1
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "lightweight release tag was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "must be an annotated tag"
+  assert_not_contains "$GH_LOG" "run view"
+  assert_maven_not_invoked
+}
+
+test_release_tag_signature_must_verify() {
+  new_fixture
+  tag_object=$(git -C "$FIXTURE_DIR" rev-parse "v0.3.0-rc1^{tag}")
+
+  if FAKE_VERIFY_TAG_STATUS=7 \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "release tag with an invalid signature was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "signature verification failed"
+  assert_contains "$GIT_LOG" "verify-tag $tag_object"
+  assert_not_contains "$GH_LOG" "run view"
+  assert_maven_not_invoked
+}
+
+test_signed_tag_object_name_must_match_release_tag() {
+  new_fixture
+  git -C "$FIXTURE_DIR" tag -a v0.3.0-rc2 -m v0.3.0-rc2
+  mismatched_object=$(
+    git -C "$FIXTURE_DIR" rev-parse "v0.3.0-rc2^{tag}"
+  )
+  git -C "$FIXTURE_DIR" update-ref refs/tags/v0.3.0-rc1 "$mismatched_object"
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "signed tag object with a different embedded name was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" \
+    "signed tag object is for v0.3.0-rc2, not v0.3.0-rc1"
+  assert_not_contains "$GH_LOG" "run view"
   assert_maven_not_invoked
 }
 
@@ -363,7 +433,7 @@ test_real_deploy_uses_one_validated_signed_lifecycle() {
   printf '<settings/>\n' > "$FIXTURE_DIR/settings.xml"
   git -C "$FIXTURE_DIR" add settings.xml
   git -C "$FIXTURE_DIR" commit -q -m settings
-  git -C "$FIXTURE_DIR" tag -f v0.3.0-rc1 >/dev/null
+  git -C "$FIXTURE_DIR" tag -fa v0.3.0-rc1 -m v0.3.0-rc1 >/dev/null
 
   run_script --maven-settings settings.xml > "$OUTPUT_LOG" 2>&1
 
@@ -527,6 +597,9 @@ run_test() {
 run_test test_missing_option_value_never_runs_maven
 run_test test_workflow_run_must_be_successful_release_tag_push
 run_test test_workflow_run_tag_and_sha_must_match_checkout
+run_test test_release_tag_must_be_annotated
+run_test test_release_tag_signature_must_verify
+run_test test_signed_tag_object_name_must_match_release_tag
 run_test test_downloads_four_native_artifacts_from_exact_run_and_repo
 run_test test_github_host_is_pinned
 run_test test_missing_native_artifact_stops_before_maven

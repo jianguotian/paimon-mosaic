@@ -203,12 +203,41 @@ if [[ "$POM_VERSION" != "$RELEASE_VERSION" ]]; then
   exit 1
 fi
 
-if ! git -C "$REPO_DIR" rev-parse -q --verify "$TAG^{commit}" >/dev/null; then
-  echo "Tag $TAG does not exist locally." >&2
+if ! TAG_OBJECT=$(
+  git -C "$REPO_DIR" rev-parse -q --verify "refs/tags/$TAG^{tag}"
+); then
+  echo "Tag $TAG must be an annotated tag." >&2
   echo "Run: git fetch --tags && git checkout $TAG" >&2
   exit 1
 fi
-TAG_COMMIT=$(git -C "$REPO_DIR" rev-parse "$TAG^{commit}")
+if ! TAG_OBJECT_NAME=$(
+  git -C "$REPO_DIR" cat-file tag "$TAG_OBJECT" |
+    awk '
+      /^$/ { exit }
+      /^tag / {
+        count += 1
+        name = substr($0, 5)
+      }
+      END {
+        if (count != 1) {
+          exit 1
+        }
+        print name
+      }
+    '
+); then
+  echo "Unable to read the release name from tag object $TAG_OBJECT." >&2
+  exit 1
+fi
+if [[ "$TAG_OBJECT_NAME" != "$TAG" ]]; then
+  echo "Tag $TAG signed tag object is for $TAG_OBJECT_NAME, not $TAG." >&2
+  exit 1
+fi
+if ! git -C "$REPO_DIR" -c gpg.program=gpg verify-tag "$TAG_OBJECT"; then
+  echo "Tag $TAG signature verification failed." >&2
+  exit 1
+fi
+TAG_COMMIT=$(git -C "$REPO_DIR" rev-parse "$TAG_OBJECT^{commit}")
 HEAD_COMMIT=$(git -C "$REPO_DIR" rev-parse HEAD)
 if [[ "$HEAD_COMMIT" != "$TAG_COMMIT" ]]; then
   echo "Current checkout does not match $TAG." >&2
