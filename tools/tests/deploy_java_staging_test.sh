@@ -1878,6 +1878,8 @@ EOF
 }
 
 test_real_deploy_uses_only_two_direct_plugin_goals() {
+  local nexus_args_log
+
   new_fixture
   keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
   printf 'fake KEYS\n' > "$keys"
@@ -1893,13 +1895,24 @@ test_real_deploy_uses_only_two_direct_plugin_goals() {
     "org.apache.maven.plugins:maven-gpg-plugin:3.2.8:sign-and-deploy-file"
   assert_contains "$MAVEN_LOG" \
     "org.sonatype.plugins:nexus-staging-maven-plugin:1.7.0:deploy-staged-repository"
-  assert_contains "$MAVEN_LOG" \
+  nexus_args_log=$(mktemp "$TEST_ROOT/nexus-args.XXXXXX")
+  grep -F \
+    "org.sonatype.plugins:nexus-staging-maven-plugin:1.7.0:deploy-staged-repository" \
+    "$MAVEN_LOG" > "$nexus_args_log"
+  if [[ $(wc -l < "$nexus_args_log") -ne 1 ]]; then
+    fail "real deploy must invoke the Nexus plugin exactly once"
+  fi
+  assert_contains "$nexus_args_log" \
     "-DstagingProfileId=$STAGING_PROFILE_ID"
-  assert_contains "$MAVEN_LOG" "-DstagingRepositoryId="
-  assert_contains "$MAVEN_LOG" "-DserverId=apache.releases.https"
-  assert_contains "$MAVEN_LOG" "-DautoReleaseAfterClose=false"
-  assert_contains "$MAVEN_LOG" "-DskipStaging=false"
-  assert_contains "$MAVEN_LOG" "-Dmaven.wagon.http.ssl.insecure=false"
+  assert_contains "$nexus_args_log" "-DstagingRepositoryId="
+  assert_contains "$nexus_args_log" "-DserverId=apache.releases.https"
+  assert_contains "$nexus_args_log" "-DautoReleaseAfterClose=false"
+  assert_contains "$nexus_args_log" \
+    "-DkeepStagingRepositoryOnFailure=false"
+  assert_contains "$nexus_args_log" \
+    "-DkeepStagingRepositoryOnCloseRuleFailure=false"
+  assert_contains "$nexus_args_log" "-DskipStaging=false"
+  assert_contains "$nexus_args_log" "-Dmaven.wagon.http.ssl.insecure=false"
   if sed -n 's/^args=//p' "$MAVEN_LOG" |
     tr ' ' '\n' |
     grep -Eq '^(clean|package|verify|install|deploy)$'; then
@@ -2088,6 +2101,26 @@ test_maven_failure_status_is_preserved() {
   assert_not_contains "$OUTPUT_LOG" "deploy finished"
 }
 
+test_nexus_maven_failure_status_is_preserved() {
+  new_fixture
+  keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+  printf 'fake KEYS\n' > "$keys"
+  set +o errexit
+  FAKE_NEXUS_MAVEN_EXIT_CODE=43 \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      --keys-file "$keys" \
+      > "$OUTPUT_LOG" 2>&1
+  status=$?
+  set -o errexit
+
+  if [[ "$status" -ne 43 ]]; then
+    fail "Nexus Maven exit 43 was not preserved; got $status"
+  fi
+  assert_contains "$NEXUS_CALLED_LOG" "called"
+  assert_not_contains "$OUTPUT_LOG" "deploy finished"
+}
+
 test_real_deploy_requires_official_repository_run() {
   new_fixture
   if run_script \
@@ -2218,6 +2251,7 @@ run_test test_missing_bad_or_wrong_key_signature_blocks_nexus
 run_test test_final_provenance_boundary_runs_after_signatures
 run_test test_maven_and_jvm_environment_is_scrubbed
 run_test test_maven_failure_status_is_preserved
+run_test test_nexus_maven_failure_status_is_preserved
 run_test test_real_deploy_requires_official_repository_run
 run_test test_dirty_release_input_stops_before_download
 run_test test_foreign_git_environment_cannot_redirect_checkout_checks
