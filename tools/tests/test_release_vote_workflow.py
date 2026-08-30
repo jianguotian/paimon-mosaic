@@ -63,6 +63,7 @@ REQUIRED_GATE_PATHS = {
     ".gitattributes",
     ".github/workflows/**",
     "docs/creating-a-release.html",
+    "docs/verifying-a-release-candidate.html",
     "java/pom.xml",
     "tools/create_source_release.sh",
     "tools/deploy_java_staging.sh",
@@ -94,6 +95,17 @@ VERIFY_RELEASE_COMMAND = (
     'python3 tools/verify_release_versions.py "${TAG_NAME}" '
     "--verify-signature"
 )
+EXPORT_RELEASE_PROVENANCE_COMMAND = """set -euo pipefail
+tag_object="$(git rev-parse -q --verify "refs/tags/${TAG_NAME}^{tag}")"
+commit="$(git rev-parse "${tag_object}^{commit}")"
+if [[ "${commit}" != "${GITHUB_SHA}" ||
+      "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
+  echo "Verified release tag does not match GITHUB_SHA." >&2
+  exit 1
+fi
+printf 'tag_object=%s\\n' "${tag_object}" >> "${GITHUB_OUTPUT}"
+printf 'commit=%s\\n' "${commit}" >> "${GITHUB_OUTPUT}"
+"""
 VERIFY_SOURCE_ARCHIVE_COMMAND = """set -euo pipefail
 release_version="${GITHUB_REF_NAME#v}"
 release_version="${release_version%-rc*}"
@@ -119,6 +131,11 @@ GATE_TEST_COMMAND = """python -m pytest -q \\
   tools/tests/test_verify_source_archive.py
 """
 GATE_JAVA_STAGING_COMMAND = "bash tools/tests/deploy_java_staging_test.sh"
+JAVA_CANDIDATE_PATHS = """${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}.jar
+${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-sources.jar
+${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-javadoc.jar
+${{ runner.temp }}/java-package/java-staging-provenance.txt
+"""
 GATE_SOURCE_TREE_COMMAND = """set -euo pipefail
 output_dir="$(mktemp -d "${RUNNER_TEMP}/source-tree.XXXXXX")"
 archive="${output_dir}/source.tgz"
@@ -180,6 +197,13 @@ def release_version_step(workflow: dict) -> dict:
 
 def named_step(workflow: dict, name: str) -> dict:
     steps = workflow["jobs"]["release-preflight"]["steps"]
+    matches = [step for step in steps if step.get("name") == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def java_package_step(workflow: dict, name: str) -> dict:
+    steps = workflow["jobs"]["package-java"]["steps"]
     matches = [step for step in steps if step.get("name") == name]
     assert len(matches) == 1
     return matches[0]
@@ -261,13 +285,27 @@ def assert_release_contract(workflow: dict) -> None:
 
 
 def assert_release_preflight_contract(workflow: dict) -> None:
-    assert "workflow_call" in workflow["on"]
+    workflow_call = workflow["on"]["workflow_call"]
+    assert workflow_call["outputs"] == {
+        "tag_object": {
+            "description": "Verified annotated release tag object.",
+            "value": "${{ jobs.release-preflight.outputs.tag_object }}",
+        },
+        "commit": {
+            "description": "Commit referenced by the verified release tag.",
+            "value": "${{ jobs.release-preflight.outputs.commit }}",
+        },
+    }
     assert workflow["permissions"]["contents"] == "read"
 
     preflight = workflow["jobs"]["release-preflight"]
     assert "runs-on" in preflight
     assert "uses" not in preflight
     assert "continue-on-error" not in preflight
+    assert preflight["outputs"] == {
+        "tag_object": "${{ steps.release-provenance.outputs.tag_object }}",
+        "commit": "${{ steps.release-provenance.outputs.commit }}",
+    }
     assert "continue-on-error" not in release_version_step(workflow)
 
     checkout = next(
@@ -292,10 +330,23 @@ def assert_release_preflight_contract(workflow: dict) -> None:
     }
     assert version_step["run"] == VERIFY_RELEASE_COMMAND
 
+    provenance_step = named_step(workflow, "Export verified release provenance")
+    assert provenance_step["id"] == "release-provenance"
+    assert provenance_step["if"] == TAG_CONDITION
+    assert provenance_step["env"] == {
+        "TAG_NAME": "${{ github.ref_name }}",
+    }
+    assert "continue-on-error" not in provenance_step
+    assert provenance_step["run"] == EXPORT_RELEASE_PROVENANCE_COMMAND
+
     source_step = named_step(workflow, "Verify source archive")
     assert source_step["if"] == TAG_CONDITION
     assert "continue-on-error" not in source_step
     assert source_step["run"] == VERIFY_SOURCE_ARCHIVE_COMMAND
+
+    steps = preflight["steps"]
+    assert steps.index(version_step) < steps.index(provenance_step)
+    assert steps.index(provenance_step) < steps.index(source_step)
 
 
 def assert_leaf_release_contract(
@@ -365,32 +416,80 @@ def test_manual_rust_dispatch_cannot_publish() -> None:
     assert publish_steps[0]["if"] == RUST_PUBLISH_CONDITION
 
 
-def test_java_workflow_only_packages_unsigned_artifacts() -> None:
-    workflow = load_workflow(JAVA_RELEASE_WORKFLOW)
+def assert_java_release_contract(workflow: dict) -> None:
     package_job = workflow["jobs"]["package-java"]
 
     assert package_job["if"] == JAVA_PACKAGE_CONDITION
-    package_steps = [
+    assert needs(package_job) == {"release-preflight", "build-native"}
+    assert "continue-on-error" not in package_job
+
+    checkout_steps = [
         step
         for step in package_job["steps"]
-        if step.get("name") == "Package Java artifacts"
+        if step.get("uses") == "actions/checkout@v6"
     ]
-    assert len(package_steps) == 1
-    assert package_steps[0]["run"] == (
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0]["with"] == {
+        "ref": "${{ needs.release-preflight.outputs.commit }}",
+        "fetch-depth": "0",
+    }
+
+    package_step = java_package_step(workflow, "Package Java artifacts")
+    assert package_step["working-directory"] == "java"
+    assert package_step["run"] == (
         "mvn clean verify -Prelease -Dgpg.skip=true -DskipTests"
     )
-    upload_steps = [
-        step
-        for step in package_job["steps"]
-        if step.get("name") == "Upload Java artifacts"
-    ]
-    assert len(upload_steps) == 1
-    assert upload_steps[0]["uses"] == "actions/upload-artifact@v5"
-    assert upload_steps[0]["with"] == {
+
+    candidate_step = java_package_step(
+        workflow,
+        "Freeze exact Java candidate",
+    )
+    assert candidate_step["id"] == "java-candidate"
+    assert candidate_step["env"] == {
+        "TAG_NAME": "${{ github.ref_name }}",
+        "VERIFIED_TAG_OBJECT": (
+            "${{ needs.release-preflight.outputs.tag_object }}"
+        ),
+        "VERIFIED_COMMIT": "${{ needs.release-preflight.outputs.commit }}",
+    }
+    candidate_run = candidate_step["run"]
+    for required in (
+        'candidate_dir="${RUNNER_TEMP}/java-package"',
+        '"mosaic-${version}.jar"',
+        '"mosaic-${version}-sources.jar"',
+        '"mosaic-${version}-javadoc.jar"',
+        '"${commit}" != "${GITHUB_SHA}"',
+        '"$(git rev-parse HEAD)" != "${GITHUB_SHA}"',
+        "printf 'repository=%s\\n' \"${GITHUB_REPOSITORY}\"",
+        "printf 'tag=%s\\n' \"${TAG_NAME}\"",
+        "printf 'tag_object=%s\\n' \"${tag_object}\"",
+        "printf 'commit=%s\\n' \"${commit}\"",
+        "printf 'run_id=%s\\n' \"${GITHUB_RUN_ID}\"",
+        "printf 'run_attempt=%s\\n' \"${GITHUB_RUN_ATTEMPT}\"",
+        '} > "${candidate_dir}/java-staging-provenance.txt"',
+        "./tools/validate_java_staging_artifacts.sh \\\n"
+        '  "${candidate_dir}" \\\n'
+        '  "${version}"',
+        "printf 'version=%s\\n' \"${version}\" >> \"${GITHUB_OUTPUT}\"",
+    ):
+        assert required in candidate_run
+    assert 'refs/tags/${TAG_NAME}' not in candidate_run
+
+    upload_step = java_package_step(workflow, "Upload Java artifacts")
+    assert upload_step["uses"] == "actions/upload-artifact@v5"
+    assert upload_step["with"] == {
         "name": "java-package",
-        "path": "java/target/*.jar",
+        "path": JAVA_CANDIDATE_PATHS,
         "if-no-files-found": "error",
     }
+    steps = package_job["steps"]
+    assert steps.index(package_step) < steps.index(candidate_step)
+    assert steps.index(candidate_step) < steps.index(upload_step)
+
+
+def test_java_workflow_freezes_exact_unsigned_candidate() -> None:
+    workflow = load_workflow(JAVA_RELEASE_WORKFLOW)
+    assert_java_release_contract(workflow)
 
 
 def test_java_release_never_receives_signing_or_nexus_credentials() -> None:
@@ -409,58 +508,83 @@ def test_java_release_never_receives_signing_or_nexus_credentials() -> None:
     assert "secrets" not in release["jobs"]["java"]
 
 
-def test_java_staging_validation_runs_before_deploy() -> None:
+def test_java_pom_does_not_control_candidate_validation_or_deploy_order() -> None:
     root = ET.parse(JAVA_POM).getroot()
     namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
-    profiles = root.findall("m:profiles/m:profile", namespace)
-    staging_profiles = [
-        profile
-        for profile in profiles
-        if profile.findtext("m:id", namespaces=namespace)
-        == "staging-artifact-validation"
+    plugin_ids = [
+        plugin.findtext("m:artifactId", namespaces=namespace)
+        for plugin in root.findall(".//m:plugin", namespace)
     ]
+    assert "exec-maven-plugin" not in plugin_ids
 
-    assert len(staging_profiles) == 1
-    profile = staging_profiles[0]
-    assert (
-        profile.findtext(
-            "m:activation/m:property/m:name",
-            namespaces=namespace,
+    source = JAVA_POM.read_text(encoding="utf-8")
+    for forbidden in (
+        "staging-artifact-validation",
+        "validate-staging-artifacts",
+        "stagingValidationScript",
+        "stagingReferenceDirectory",
+    ):
+        assert forbidden not in source
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "mutable-checkout",
+        "shallow-checkout",
+        "mutable-tag-object",
+        "mutable-commit",
+        "missing-run-attempt",
+        "missing-validator",
+        "wildcard-upload",
+        "extra-upload",
+        "upload-before-validation",
+    ),
+)
+def test_java_candidate_contract_rejects_mutations(mutation: str) -> None:
+    workflow = copy.deepcopy(load_workflow(JAVA_RELEASE_WORKFLOW))
+    package_job = workflow["jobs"]["package-java"]
+    checkout = next(
+        step
+        for step in package_job["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    )
+    candidate = java_package_step(workflow, "Freeze exact Java candidate")
+    upload = java_package_step(workflow, "Upload Java artifacts")
+
+    if mutation == "mutable-checkout":
+        checkout["with"]["ref"] = "${{ github.ref }}"
+    elif mutation == "shallow-checkout":
+        checkout["with"]["fetch-depth"] = "1"
+    elif mutation == "mutable-tag-object":
+        candidate["env"]["VERIFIED_TAG_OBJECT"] = "${{ github.sha }}"
+    elif mutation == "mutable-commit":
+        candidate["env"]["VERIFIED_COMMIT"] = "${{ github.sha }}"
+    elif mutation == "missing-run-attempt":
+        candidate["run"] = candidate["run"].replace(
+            "  printf 'run_attempt=%s\\n' \"${GITHUB_RUN_ATTEMPT}\"\n",
+            "",
         )
-        == "stagingValidationScript"
-    )
-    execution = profile.find(
-        "m:build/m:plugins/m:plugin/m:executions/m:execution",
-        namespace,
-    )
-    assert execution is not None
-    plugin = profile.find("m:build/m:plugins/m:plugin", namespace)
-    assert plugin is not None
-    assert plugin.findtext("m:groupId", namespaces=namespace) == (
-        "org.codehaus.mojo"
-    )
-    assert plugin.findtext("m:artifactId", namespaces=namespace) == (
-        "exec-maven-plugin"
-    )
-    assert execution.findtext("m:id", namespaces=namespace) == (
-        "validate-staging-artifacts"
-    )
-    assert execution.findtext("m:phase", namespaces=namespace) == "verify"
-    assert execution.findtext(
-        "m:goals/m:goal",
-        namespaces=namespace,
-    ) == "exec"
-    assert execution.findtext(
-        "m:configuration/m:executable",
-        namespaces=namespace,
-    ) == "${stagingValidationScript}"
-    assert [
-        argument.text
-        for argument in execution.findall(
-            "m:configuration/m:arguments/m:argument",
-            namespace,
+    elif mutation == "missing-validator":
+        candidate["run"] = candidate["run"].replace(
+            "./tools/validate_java_staging_artifacts.sh \\\n"
+            '  "${candidate_dir}" \\\n'
+            '  "${version}"',
+            "true",
         )
-    ] == ["${project.build.directory}", "${project.version}"]
+    elif mutation == "wildcard-upload":
+        upload["with"]["path"] = "${{ runner.temp }}/java-package/*"
+    elif mutation == "extra-upload":
+        upload["with"]["path"] += "java/pom.xml\n"
+    elif mutation == "upload-before-validation":
+        steps = package_job["steps"]
+        steps.remove(upload)
+        steps.insert(steps.index(candidate), upload)
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    with pytest.raises(AssertionError):
+        assert_java_release_contract(workflow)
 
 
 def test_manual_release_dispatch_cannot_publish_python() -> None:
@@ -680,6 +804,53 @@ def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
 
 @pytest.mark.parametrize(
     "mutation",
+    (
+        "missing-call-output",
+        "wrong-call-output",
+        "missing-job-output",
+        "wrong-job-output",
+        "wrong-step-id",
+        "missing-sha-binding",
+        "export-before-signature-check",
+    ),
+)
+def test_contract_rejects_release_provenance_output_mutations(
+    mutation: str,
+) -> None:
+    workflow = copy.deepcopy(load_workflow(RELEASE_PREFLIGHT_WORKFLOW))
+    workflow_call = workflow["on"]["workflow_call"]
+    preflight = workflow["jobs"]["release-preflight"]
+    provenance = named_step(workflow, "Export verified release provenance")
+
+    if mutation == "missing-call-output":
+        workflow_call["outputs"].pop("tag_object")
+    elif mutation == "wrong-call-output":
+        workflow_call["outputs"]["tag_object"]["value"] = "${{ github.sha }}"
+    elif mutation == "missing-job-output":
+        preflight["outputs"].pop("commit")
+    elif mutation == "wrong-job-output":
+        preflight["outputs"]["commit"] = "${{ github.sha }}"
+    elif mutation == "wrong-step-id":
+        provenance["id"] = "mutable-provenance"
+    elif mutation == "missing-sha-binding":
+        provenance["run"] = provenance["run"].replace(
+            'if [[ "${commit}" != "${GITHUB_SHA}" ||\n'
+            '      "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then\n',
+            "if false; then\n",
+        )
+    elif mutation == "export-before-signature-check":
+        steps = preflight["steps"]
+        steps.remove(provenance)
+        steps.insert(steps.index(release_version_step(workflow)), provenance)
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    with pytest.raises(AssertionError):
+        assert_release_preflight_contract(workflow)
+
+
+@pytest.mark.parametrize(
+    "mutation",
     ("cancel-in-progress", "preflight-continue", "version-step-continue"),
 )
 def test_contract_rejects_non_blocking_preflight_mutations(mutation: str) -> None:
@@ -726,9 +897,27 @@ def test_release_documentation_keeps_java_credentials_local() -> None:
     staging_command = """./tools/deploy_java_staging.sh \\
   --release-version ${RELEASE_VERSION} \\
   --rc ${RC_NUM} \\
-  --run-id ${RELEASE_RUN_ID}"""
+  --run-id ${RELEASE_RUN_ID} \\
+  --provenance-manifest ${JAVA_STAGING_PROVENANCE} \\
+  --staging-profile-id ${STAGING_PROFILE_ID}"""
     assert f"{staging_command} \\\n  --dry-run" in source
     assert staging_command in source
+    assert (
+        'JAVA_STAGING_PROVENANCE="../${RC_TAG}-java-staging.provenance"'
+        in source
+    )
+    assert 'STAGING_PROFILE_ID="PAIMON_NEXUS_STAGING_PROFILE_ID"' in source
+    assert (
+        "nexus-staging-maven-plugin:1.7.0:rc-list-profiles" in source
+    )
+    assert "maven-gpg-plugin:3.2.8:sign-and-deploy-file" in source
+    assert (
+        "nexus-staging-maven-plugin:1.7.0:deploy-staged-repository"
+        in source
+    )
+    assert "It does not rebuild the JARs or run a Maven lifecycle." in source
+    assert "verifies all four detached signatures" in source
+    assert "earlier producer attempt than the final successful run attempt" in source
     assert "local GPG keyring" in source
     assert "apache.releases.https" in source
 

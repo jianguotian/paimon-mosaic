@@ -132,6 +132,9 @@ jobs:
     needs: [release-preflight, build-native]
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
+          fetch-depth: 0
 
       - name: Download linux x86_64 native library
         uses: actions/download-artifact@v5
@@ -174,9 +177,74 @@ jobs:
         working-directory: java
         run: mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
 
+      - name: Freeze exact Java candidate
+        id: java-candidate
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          VERIFIED_TAG_OBJECT: ${{ needs.release-preflight.outputs.tag_object }}
+          VERIFIED_COMMIT: ${{ needs.release-preflight.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${TAG_NAME}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-rc[1-9][0-9]*$ ]]; then
+            echo "Invalid Java RC tag: ${TAG_NAME}" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          tag_object="${VERIFIED_TAG_OBJECT}"
+          commit="${VERIFIED_COMMIT}"
+          if [[ ! "${tag_object}" =~ ^[0-9a-f]{40}$ ||
+                ! "${commit}" =~ ^[0-9a-f]{40}$ ||
+                "${commit}" != "${GITHUB_SHA}" ||
+                "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
+            echo "Verified RC provenance does not match GITHUB_SHA." >&2
+            exit 1
+          fi
+
+          candidate_dir="${RUNNER_TEMP}/java-package"
+          if [[ -e "${candidate_dir}" ]]; then
+            echo "Java candidate directory already exists: ${candidate_dir}" >&2
+            exit 1
+          fi
+          install -d -m 700 "${candidate_dir}"
+
+          for artifact in \
+            "mosaic-${version}.jar" \
+            "mosaic-${version}-sources.jar" \
+            "mosaic-${version}-javadoc.jar"
+          do
+            source="java/target/${artifact}"
+            if [[ -L "${source}" || ! -f "${source}" || ! -s "${source}" ]]; then
+              echo "Expected Java artifact is missing or unsafe: ${source}" >&2
+              exit 1
+            fi
+            install -m 600 "${source}" "${candidate_dir}/${artifact}"
+          done
+
+          umask 077
+          {
+            printf 'schema=1\n'
+            printf 'repository=%s\n' "${GITHUB_REPOSITORY}"
+            printf 'tag=%s\n' "${TAG_NAME}"
+            printf 'tag_object=%s\n' "${tag_object}"
+            printf 'commit=%s\n' "${commit}"
+            printf 'run_id=%s\n' "${GITHUB_RUN_ID}"
+            printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+          } > "${candidate_dir}/java-staging-provenance.txt"
+
+          ./tools/validate_java_staging_artifacts.sh \
+            "${candidate_dir}" \
+            "${version}"
+
+          printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
+
       - name: Upload Java artifacts
         uses: actions/upload-artifact@v5
         with:
           name: java-package
-          path: java/target/*.jar
+          path: |
+            ${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}.jar
+            ${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-sources.jar
+            ${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-javadoc.jar
+            ${{ runner.temp }}/java-package/java-staging-provenance.txt
           if-no-files-found: error

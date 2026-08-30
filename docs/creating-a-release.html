@@ -226,16 +226,22 @@ git push origin ${RC_TAG}</code></pre>
             <p>The release preflight validates the signed tag and component versions, then creates and verifies a temporary source archive before any language release job starts.</p>
             <ul>
                 <li><strong>Rust release</strong> &mdash; dry-run check (does not publish for RC tags)</li>
-                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, packages without signing, and uploads the JARs as workflow artifacts</li>
+                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, packages without signing, and uploads exactly the main, sources, and javadoc JARs plus their signed-tag/run provenance as the <code>java-package</code> workflow artifact</li>
                 <li><strong>Python wheels</strong> &mdash; builds wheels for 4 platforms</li>
                 <li><strong>Python publish</strong> &mdash; publishes to TestPyPI only after the Rust, Java, and Python wheel jobs succeed</li>
             </ul>
-            <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated.</p>
+            <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated. A reused <code>java-package</code> may therefore record an earlier producer attempt than the final successful run attempt; local staging accepts that ordering while freezing the final run attempt and immutable artifact identity.</p>
 
             <h3>Deploy Java Artifacts to Nexus Staging</h3>
-            <p>Copy the numeric run id from the successful RC-tag <code>Release</code> workflow, check out the exact RC tag, then run the local dry-run before the signed deployment:</p>
+            <p>First use the Nexus staging plugin to list the available profile ids. Copy the Paimon profile id from the output; it is not a secret:</p>
+<pre><code>mvn org.sonatype.plugins:nexus-staging-maven-plugin:1.7.0:rc-list-profiles \
+  -DnexusUrl=https://repository.apache.org/ \
+  -DserverId=apache.releases.https</code></pre>
+            <p>Then copy the numeric run id from the successful RC-tag <code>Release</code> workflow, check out the exact RC tag, and run the local dry-run before the signed deployment:</p>
 <pre><code>RELEASE_RUN_ID="12345678901"
+STAGING_PROFILE_ID="PAIMON_NEXUS_STAGING_PROFILE_ID"
 GPG_FINGERPRINT="YOUR_FULL_OPENPGP_FINGERPRINT"
+JAVA_STAGING_PROVENANCE="../${RC_TAG}-java-staging.provenance"
 
 git checkout ${RC_TAG}
 
@@ -243,14 +249,19 @@ git checkout ${RC_TAG}
   --release-version ${RELEASE_VERSION} \
   --rc ${RC_NUM} \
   --run-id ${RELEASE_RUN_ID} \
+  --provenance-manifest ${JAVA_STAGING_PROVENANCE} \
+  --staging-profile-id ${STAGING_PROFILE_ID} \
   --dry-run
 
 ./tools/deploy_java_staging.sh \
   --release-version ${RELEASE_VERSION} \
   --rc ${RC_NUM} \
   --run-id ${RELEASE_RUN_ID} \
+  --provenance-manifest ${JAVA_STAGING_PROVENANCE} \
+  --staging-profile-id ${STAGING_PROFILE_ID} \
   --gpg-keyname ${GPG_FINGERPRINT}</code></pre>
-            <p>The script requires the workflow to be a successful <code>Release</code> tag-push run whose tag and commit match the current remote annotated tag and clean local checkout. It builds from an isolated archive of that exact tag, downloads all four JNI artifacts, verifies that the full signing fingerprint names a local secret key present in the ASF Paimon <code>KEYS</code> file, validates the main, sources, and javadoc JARs during Maven's <code>verify</code> phase, and uses one local Maven lifecycle to sign and deploy. Record the resulting <code>orgapachepaimon-XXXX</code> repository id and leave it staged for the vote.</p>
+            <p>The dry-run downloads the immutable <code>java-package</code> artifact by id, checks its ZIP size and SHA-256 digest, safely extracts exactly three JARs plus <code>java-staging-provenance.txt</code>, validates the candidate contents, and writes a non-overwriting manifest outside the clean checkout. The manifest freezes the annotated tag object and commit, canonical workflow path and id, run id and attempt, artifact id/digest/size, and Nexus staging profile id. It does not invoke Maven, GPG, or Nexus.</p>
+            <p>The real deployment requires that unchanged manifest and revalidates the live tag, run, and artifact metadata. It does not rebuild the JARs or run a Maven lifecycle. Instead, fixed <code>maven-gpg-plugin:3.2.8:sign-and-deploy-file</code> writes the exact frozen main, sources, and javadoc JARs plus the exact signed-source <code>java/pom.xml</code> into a private <code>file://</code> Maven repository. The script verifies all four payloads byte-for-byte, rejects unexpected payloads or symlinks, and verifies all four detached signatures with the requested full GPG fingerprint. It then performs one final live provenance check and uses fixed <code>nexus-staging-maven-plugin:1.7.0:deploy-staged-repository</code> with the explicit profile id to upload and close the repository without auto-release. Maven settings are sanitized before both direct plugin goals: only the <code>apache.releases.https</code> server and necessary local repository, plugin group, mirror, and proxy settings are retained; profiles and active profiles are removed. Record the resulting <code>orgapachepaimon-XXXX</code> repository id and leave it staged for the vote.</p>
 
             <h3>Create Source Release Artifacts</h3>
             <p>Create source release artifacts from the same commit as the RC tag:</p>

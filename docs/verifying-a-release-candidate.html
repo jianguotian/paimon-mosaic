@@ -158,7 +158,7 @@ make</code></pre>
 paimon-mosaic-core = { git = "https://github.com/apache/paimon-mosaic", tag = "v${RELEASE_VERSION}-rc${RC_NUM}" }</code></pre>
 
             <h3>Java (Apache Nexus Staging)</h3>
-            <p>The RC tag deploys to Apache Nexus staging. To test:</p>
+            <p>After the RC-tag workflow succeeds, the Release Manager deploys the frozen Java candidate to Apache Nexus staging from a local machine. To test:</p>
             <ol>
                 <li>Find the staging repository at <a href="https://repository.apache.org/#stagingRepositories">repository.apache.org</a>.</li>
                 <li>Add the staging repository URL to your <code>pom.xml</code>:
