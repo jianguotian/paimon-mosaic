@@ -123,9 +123,8 @@ jobs:
           name: native-${{ matrix.os_name }}-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
 
-  deploy-staging:
+  package-java:
     if: >-
-      github.event_name != 'workflow_dispatch' &&
       github.repository == 'apache/paimon-mosaic' &&
       startsWith(github.ref, 'refs/tags/') &&
       contains(github.ref_name, '-rc')
@@ -166,31 +165,18 @@ jobs:
         with:
           java-version: ${{ env.JDK_VERSION }}
           distribution: 'temurin'
-          server-id: apache.releases.https
-          server-username: MAVEN_USERNAME
-          server-password: MAVEN_PASSWORD
-          gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          cache: maven
 
       - name: Show Maven version
         run: mvn --version
 
-      - name: Deploy to Apache Nexus staging
+      - name: Package Java artifacts
         working-directory: java
-        run: |
-          REF="${TAG_NAME}"
-          VERSION="${REF#v}"
-          if [[ "$VERSION" == *-rc* ]]; then
-            DESC="Apache Paimon Mosaic, version ${VERSION%-rc*}, release candidate ${VERSION#*-rc}"
-          else
-            DESC="Apache Paimon Mosaic, version ${VERSION}"
-          fi
-          mvn clean deploy \
-            -Prelease \
-            -DskipTests \
-            -DstagingDescription="$DESC"
-        env:
-          TAG_NAME: ${{ github.ref_name }}
-          MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
-          MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
+
+      - name: Upload Java artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: java-package
+          path: java/target/*.jar
+          if-no-files-found: error

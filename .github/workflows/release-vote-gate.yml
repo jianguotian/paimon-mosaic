@@ -24,11 +24,15 @@ on:
       - ".gitattributes"
       - ".github/workflows/**"
       - "docs/creating-a-release.html"
+      - "java/pom.xml"
       - "tools/create_source_release.sh"
+      - "tools/deploy_java_staging.sh"
       - "tools/update_branch_version.sh"
+      - "tools/validate_java_staging_artifacts.sh"
       - "tools/verify_release_versions.py"
       - "tools/verify_source_archive.py"
       - "tools/tests/test_create_source_release.py"
+      - "tools/tests/deploy_java_staging_test.sh"
       - "tools/tests/test_release_vote_workflow.py"
       - "tools/tests/test_update_branch_version.py"
       - "tools/tests/test_verify_release_versions.py"
@@ -39,11 +43,15 @@ on:
       - ".gitattributes"
       - ".github/workflows/**"
       - "docs/creating-a-release.html"
+      - "java/pom.xml"
       - "tools/create_source_release.sh"
+      - "tools/deploy_java_staging.sh"
       - "tools/update_branch_version.sh"
+      - "tools/validate_java_staging_artifacts.sh"
       - "tools/verify_release_versions.py"
       - "tools/verify_source_archive.py"
       - "tools/tests/test_create_source_release.py"
+      - "tools/tests/deploy_java_staging_test.sh"
       - "tools/tests/test_release_vote_workflow.py"
       - "tools/tests/test_update_branch_version.py"
       - "tools/tests/test_verify_release_versions.py"
@@ -78,6 +86,10 @@ jobs:
             tools/tests/test_verify_release_versions.py \
             tools/tests/test_verify_source_archive.py
 
+      - name: Test local Java staging
+        shell: bash
+        run: bash tools/tests/deploy_java_staging_test.sh
+
       - name: Verify current source tree
         shell: bash
         run: |
@@ -110,7 +122,10 @@ jobs:
             tools/tests/test_verify_release_versions.py \
             tools/tests/test_verify_source_archive.py
           bash -n tools/create_source_release.sh
+          bash -n tools/deploy_java_staging.sh
           bash -n tools/update_branch_version.sh
+          bash -n tools/validate_java_staging_artifacts.sh
+          bash -n tools/tests/deploy_java_staging_test.sh
           if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
             comparison_ref="origin/${GITHUB_BASE_REF}"
           else
