@@ -56,6 +56,20 @@ if ! jar tf "$MAIN_JAR" > "$JAR_ENTRIES"; then
   exit 1
 fi
 
+for required_entry in \
+  org/apache/paimon/mosaic/MosaicReader.class \
+  META-INF/maven/org.apache.paimon/mosaic/pom.xml \
+  META-INF/maven/org.apache.paimon/mosaic/pom.properties \
+  META-INF/LICENSE \
+  META-INF/NOTICE
+do
+  count=$(grep -Fxc -- "$required_entry" "$JAR_ENTRIES" || true)
+  if [[ "$count" -ne 1 ]]; then
+    echo "Packaged JAR is missing required entry: $required_entry" >&2
+    exit 1
+  fi
+done
+
 for native_entry in \
   native/linux/x86_64/libpaimon_mosaic_jni.so \
   native/linux/aarch64/libpaimon_mosaic_jni.so \

@@ -74,8 +74,9 @@ new_fixture() {
   GIT_LOG="$FIXTURE_DIR/git.log"
   MAVEN_LOG="$FIXTURE_DIR/maven.log"
   GH_LOG="$FIXTURE_DIR/gh.log"
+  CURL_LOG="$FIXTURE_DIR/curl.log"
   OUTPUT_LOG="$FIXTURE_DIR/output.log"
-  export FIXTURE_DIR GIT_LOG MAVEN_LOG GH_LOG OUTPUT_LOG
+  export FIXTURE_DIR GIT_LOG MAVEN_LOG GH_LOG CURL_LOG OUTPUT_LOG
 
   mkdir -p \
     "$FIXTURE_DIR/fake-bin" \
@@ -130,6 +131,17 @@ set -o pipefail
 
 printf 'args=%s\n' "$*" >> "$FAKE_GH_LOG"
 printf 'host=%s\n' "${GH_HOST:-}" >> "$FAKE_GH_LOG"
+
+if [[ "${1-}" == api ]]; then
+  case "${2-}" in
+    repos/*/git/ref/tags/*)
+      printf '%s\n%s\n' \
+        "${FAKE_REMOTE_TAG_TYPE:-tag}" \
+        "${FAKE_REMOTE_TAG_OBJECT:-$(git rev-parse v0.3.0-rc1^{tag})}"
+      exit 0
+      ;;
+  esac
+fi
 
 if [[ "${1-} ${2-}" == "run view" ]]; then
   printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
@@ -196,6 +208,9 @@ set -o pipefail
   printf 'java-tool-options=%s\n' "${JAVA_TOOL_OPTIONS:-}"
   printf 'jdk-java-options=%s\n' "${JDK_JAVA_OPTIONS:-}"
   printf 'underscore-java-options=%s\n' "${_JAVA_OPTIONS:-}"
+  printf 'maven-gpg-key=%s\n' "${MAVEN_GPG_KEY:-}"
+  printf 'maven-gpg-key-fingerprint=%s\n' "${MAVEN_GPG_KEY_FINGERPRINT:-}"
+  printf 'maven-gpg-passphrase=%s\n' "${MAVEN_GPG_PASSPHRASE:-}"
 } >> "$FAKE_MVN_LOG"
 
 if [[ "${FAKE_MAVEN_EXIT_CODE:-0}" -ne 0 ]]; then
@@ -237,22 +252,77 @@ if [[ "${1-}" != "tf" ]]; then
 fi
 
 for entry in \
+  org/apache/paimon/mosaic/MosaicReader.class \
+  META-INF/maven/org.apache.paimon/mosaic/pom.xml \
+  META-INF/maven/org.apache.paimon/mosaic/pom.properties \
+  META-INF/LICENSE \
+  META-INF/NOTICE \
   native/linux/x86_64/libpaimon_mosaic_jni.so \
   native/linux/aarch64/libpaimon_mosaic_jni.so \
   native/macos/aarch64/libpaimon_mosaic_jni.dylib \
   native/windows/x86_64/paimon_mosaic_jni.dll
 do
-  if [[ "${FAKE_MISSING_NATIVE:-}" != "$entry" ]]; then
+  if [[ "${FAKE_MISSING_NATIVE:-}" != "$entry" &&
+        "${FAKE_MISSING_JAR_ENTRY:-}" != "$entry" ]]; then
     printf '%s\n' "$entry"
   fi
 done
+EOF
+
+  cat > "$FIXTURE_DIR/fake-bin/gpg" <<'EOF'
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+for argument in "$@"; do
+  if [[ "$argument" == --list-secret-keys ]]; then
+    printf 'fpr:::::::::%s:\n' \
+      "${FAKE_LOCAL_GPG_FINGERPRINT:-0123456789ABCDEF0123456789ABCDEF01234567}"
+    exit 0
+  fi
+  if [[ "$argument" == --import ]]; then
+    printf 'fpr:::::::::%s:\n' \
+      "${FAKE_KEYS_FINGERPRINT:-0123456789ABCDEF0123456789ABCDEF01234567}"
+    exit 0
+  fi
+done
+
+exit 2
+EOF
+
+  cat > "$FIXTURE_DIR/fake-bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+printf 'args=%s\n' "$*" >> "$FAKE_CURL_LOG"
+output=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output)
+      output=$2
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -z "$output" ]]; then
+  exit 2
+fi
+printf 'fake KEYS\n' > "$output"
 EOF
 
   chmod +x \
     "$FIXTURE_DIR/fake-bin/git" \
     "$FIXTURE_DIR/fake-bin/gh" \
     "$FIXTURE_DIR/fake-bin/mvn" \
-    "$FIXTURE_DIR/fake-bin/jar"
+    "$FIXTURE_DIR/fake-bin/jar" \
+    "$FIXTURE_DIR/fake-bin/gpg" \
+    "$FIXTURE_DIR/fake-bin/curl"
 
   git -C "$FIXTURE_DIR" init -q
   git -C "$FIXTURE_DIR" config user.name "Release Script Test"
@@ -263,6 +333,7 @@ EOF
   : > "$GIT_LOG"
   : > "$MAVEN_LOG"
   : > "$GH_LOG"
+  : > "$CURL_LOG"
 }
 
 run_script() {
@@ -272,8 +343,11 @@ run_script() {
       REAL_GIT="$REAL_GIT" \
       FAKE_GIT_LOG="$GIT_LOG" \
       MVN="$FIXTURE_DIR/fake-bin/mvn" \
+      GPG="$FIXTURE_DIR/fake-bin/gpg" \
+      CURL="$FIXTURE_DIR/fake-bin/curl" \
       FAKE_MVN_LOG="$MAVEN_LOG" \
       FAKE_GH_LOG="$GH_LOG" \
+      FAKE_CURL_LOG="$CURL_LOG" \
       TMPDIR="$TEST_ROOT" \
       "$BASH" ./tools/deploy_java_staging.sh \
         --release-version 0.3.0 \
@@ -375,6 +449,18 @@ test_signed_tag_object_name_must_match_release_tag() {
   assert_maven_not_invoked
 }
 
+test_current_remote_tag_object_must_match_local_tag() {
+  new_fixture
+
+  if FAKE_REMOTE_TAG_OBJECT=0000000000000000000000000000000000000000 \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "stale local tag object was accepted after the remote tag moved"
+  fi
+  assert_contains "$OUTPUT_LOG" "current remote tag object does not match"
+  assert_not_contains "$GH_LOG" "run view"
+  assert_maven_not_invoked
+}
+
 test_downloads_four_native_artifacts_from_exact_run_and_repo() {
   new_fixture
   run_script --repo example/fork --dry-run > "$OUTPUT_LOG" 2>&1
@@ -426,20 +512,135 @@ test_dry_run_uses_one_unsigned_verify_lifecycle() {
   if [[ $(grep -c '^invocation$' "$MAVEN_LOG") -ne 1 ]]; then
     fail "dry-run should invoke Maven exactly once"
   fi
+  if grep -Fq "pwd=$FIXTURE_DIR/java" "$MAVEN_LOG"; then
+    fail "Maven used the mutable caller worktree instead of the exact tag archive"
+  fi
 }
 
-test_real_deploy_uses_one_validated_signed_lifecycle() {
+test_real_deploy_requires_full_signing_fingerprint() {
   new_fixture
-  printf '<settings/>\n' > "$FIXTURE_DIR/settings.xml"
+  if run_script --gpg-keyname ABCDEF > "$OUTPUT_LOG" 2>&1; then
+    fail "real deployment accepted a short signing key id"
+  fi
+  assert_contains "$OUTPUT_LOG" "full 40- or 64-hex OpenPGP fingerprint"
+  assert_maven_not_invoked
+}
+
+test_real_deploy_requires_explicit_signing_fingerprint() {
+  new_fixture
+  if run_script > "$OUTPUT_LOG" 2>&1; then
+    fail "real deployment accepted an ambient default signing key"
+  fi
+  assert_contains "$OUTPUT_LOG" "--gpg-keyname is required"
+  assert_maven_not_invoked
+}
+
+test_real_deploy_requires_local_secret_key() {
+  new_fixture
+  if FAKE_LOCAL_GPG_FINGERPRINT=89ABCDEF0123456789ABCDEF0123456789ABCDEF \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      > "$OUTPUT_LOG" 2>&1; then
+    fail "real deployment accepted a signing fingerprint without a local secret key"
+  fi
+  assert_contains "$OUTPUT_LOG" \
+    "Local GPG secret keys do not contain 0123456789ABCDEF0123456789ABCDEF01234567"
+  assert_maven_not_invoked
+}
+
+test_real_deploy_requires_signing_key_in_asf_keys() {
+  new_fixture
+  keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+  printf 'fake KEYS\n' > "$keys"
+
+  if FAKE_KEYS_FINGERPRINT=89ABCDEF0123456789ABCDEF0123456789ABCDEF \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      --keys-file "$keys" \
+      > "$OUTPUT_LOG" 2>&1; then
+    fail "real deployment accepted a signing key absent from ASF Paimon KEYS"
+  fi
+  assert_contains "$OUTPUT_LOG" \
+    "is not present in the ASF Paimon KEYS file"
+  assert_maven_not_invoked
+}
+
+test_real_deploy_downloads_pinned_asf_keys_by_default() {
+  new_fixture
+  run_script \
+    --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+    > "$OUTPUT_LOG" 2>&1
+
+  assert_contains "$CURL_LOG" \
+    "args=--proto =https --tlsv1.2 --location --fail --silent --show-error --retry 3 --retry-connrefused --connect-timeout 10 --max-time 300"
+  assert_contains "$CURL_LOG" "https://downloads.apache.org/paimon/KEYS"
+}
+
+test_real_deploy_forces_gpg_signer_and_scrubs_bc_key_env() {
+  new_fixture
+  keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+  printf 'fake KEYS\n' > "$keys"
+  cat > "$FIXTURE_DIR/settings.xml" <<'EOF'
+<settings>
+  <profiles>
+    <profile>
+      <id>bc-signer-override</id>
+      <properties>
+        <gpg.signer>bc</gpg.signer>
+        <gpg.executable>/tmp/ambient-gpg</gpg.executable>
+      </properties>
+    </profile>
+  </profiles>
+  <activeProfiles>
+    <activeProfile>bc-signer-override</activeProfile>
+  </activeProfiles>
+</settings>
+EOF
   git -C "$FIXTURE_DIR" add settings.xml
   git -C "$FIXTURE_DIR" commit -q -m settings
   git -C "$FIXTURE_DIR" tag -fa v0.3.0-rc1 -m v0.3.0-rc1 >/dev/null
 
-  run_script --maven-settings settings.xml > "$OUTPUT_LOG" 2>&1
+  MAVEN_GPG_KEY='ambient-bc-secret-key' \
+    MAVEN_GPG_KEY_FINGERPRINT=89ABCDEF0123456789ABCDEF0123456789ABCDEF \
+    MAVEN_GPG_PASSPHRASE='ambient-passphrase' \
+    run_script \
+      --maven-settings settings.xml \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      --keys-file "$keys" \
+      > "$OUTPUT_LOG" 2>&1
+
+  assert_contains "$MAVEN_LOG" "-Dgpg.signer=gpg"
+  assert_contains "$MAVEN_LOG" \
+    "-Dgpg.executable=$FIXTURE_DIR/fake-bin/gpg"
+  assert_contains "$MAVEN_LOG" "maven-gpg-key="
+  assert_not_contains "$MAVEN_LOG" "maven-gpg-key=ambient-bc-secret-key"
+  assert_contains "$MAVEN_LOG" "maven-gpg-key-fingerprint="
+  assert_not_contains "$MAVEN_LOG" \
+    "maven-gpg-key-fingerprint=89ABCDEF0123456789ABCDEF0123456789ABCDEF"
+  assert_contains "$MAVEN_LOG" "maven-gpg-passphrase="
+  assert_not_contains "$MAVEN_LOG" "maven-gpg-passphrase=ambient-passphrase"
+}
+
+test_real_deploy_uses_one_validated_signed_lifecycle() {
+  new_fixture
+  keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+  printf '<settings/>\n' > "$FIXTURE_DIR/settings.xml"
+  printf 'fake KEYS\n' > "$keys"
+  git -C "$FIXTURE_DIR" add settings.xml
+  git -C "$FIXTURE_DIR" commit -q -m settings
+  git -C "$FIXTURE_DIR" tag -fa v0.3.0-rc1 -m v0.3.0-rc1 >/dev/null
+
+  run_script \
+    --maven-settings settings.xml \
+    --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+    --keys-file "$keys" \
+    > "$OUTPUT_LOG" 2>&1
 
   assert_contains "$MAVEN_LOG" \
     "args=-s $FIXTURE_DIR/settings.xml clean deploy -Prelease"
   assert_contains "$MAVEN_LOG" "-Dgpg.skip=false"
+  assert_contains "$MAVEN_LOG" \
+    "-Dgpg.keyname=0123456789ABCDEF0123456789ABCDEF01234567!"
   assert_contains "$MAVEN_LOG" \
     "-DstagingDescription=Apache Paimon Mosaic 0.3.0 RC1"
   assert_contains "$MAVEN_LOG" "-DstagingRepositoryId="
@@ -482,6 +683,7 @@ test_maven_and_jvm_environment_is_scrubbed() {
   assert_not_contains "$MAVEN_LOG" "skipNexusStagingDeployMojo=true"
   assert_not_contains "$MAVEN_LOG" "skipStaging=true"
   assert_not_contains "$MAVEN_LOG" "ssl.insecure=true"
+  assert_contains "$MAVEN_LOG" "-Dmaven.main.skip=false"
 }
 
 test_validator_rejects_incomplete_main_jar() {
@@ -492,6 +694,41 @@ test_validator_rejects_incomplete_main_jar() {
     fail "JAR missing a Windows native entry was accepted"
   fi
   assert_contains "$OUTPUT_LOG" "Packaged JAR is missing native entry: $missing"
+}
+
+test_validator_requires_java_api_class() {
+  new_fixture
+  missing=org/apache/paimon/mosaic/MosaicReader.class
+  if FAKE_MISSING_JAR_ENTRY="$missing" \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "main JAR without the MosaicReader API class was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "Packaged JAR is missing required entry: $missing"
+}
+
+test_validator_requires_maven_metadata() {
+  for missing in \
+    META-INF/maven/org.apache.paimon/mosaic/pom.xml \
+    META-INF/maven/org.apache.paimon/mosaic/pom.properties
+  do
+    new_fixture
+    if FAKE_MISSING_JAR_ENTRY="$missing" \
+      run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      fail "main JAR without Maven metadata was accepted: $missing"
+    fi
+    assert_contains "$OUTPUT_LOG" "Packaged JAR is missing required entry: $missing"
+  done
+}
+
+test_validator_requires_legal_files() {
+  for missing in META-INF/LICENSE META-INF/NOTICE; do
+    new_fixture
+    if FAKE_MISSING_JAR_ENTRY="$missing" \
+      run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      fail "main JAR without required legal file was accepted: $missing"
+    fi
+    assert_contains "$OUTPUT_LOG" "Packaged JAR is missing required entry: $missing"
+  done
 }
 
 test_validator_requires_sources_and_javadoc_jars() {
@@ -587,6 +824,19 @@ test_git_replacement_refs_are_rejected() {
   assert_maven_not_invoked
 }
 
+test_repository_local_attributes_are_rejected() {
+  new_fixture
+  mkdir -p "$FIXTURE_DIR/.git/info"
+  printf 'java/pom.xml export-ignore\n' > "$FIXTURE_DIR/.git/info/attributes"
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "repository-local Git attributes were accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "repository-local Git attributes"
+  assert_not_contains "$GH_LOG" "run download"
+  assert_maven_not_invoked
+}
+
 run_test() {
   local name=$1
   "$name"
@@ -600,13 +850,23 @@ run_test test_workflow_run_tag_and_sha_must_match_checkout
 run_test test_release_tag_must_be_annotated
 run_test test_release_tag_signature_must_verify
 run_test test_signed_tag_object_name_must_match_release_tag
+run_test test_current_remote_tag_object_must_match_local_tag
 run_test test_downloads_four_native_artifacts_from_exact_run_and_repo
 run_test test_github_host_is_pinned
 run_test test_missing_native_artifact_stops_before_maven
 run_test test_dry_run_uses_one_unsigned_verify_lifecycle
+run_test test_real_deploy_requires_full_signing_fingerprint
+run_test test_real_deploy_requires_explicit_signing_fingerprint
+run_test test_real_deploy_requires_local_secret_key
+run_test test_real_deploy_requires_signing_key_in_asf_keys
+run_test test_real_deploy_downloads_pinned_asf_keys_by_default
+run_test test_real_deploy_forces_gpg_signer_and_scrubs_bc_key_env
 run_test test_real_deploy_uses_one_validated_signed_lifecycle
 run_test test_maven_and_jvm_environment_is_scrubbed
 run_test test_validator_rejects_incomplete_main_jar
+run_test test_validator_requires_java_api_class
+run_test test_validator_requires_maven_metadata
+run_test test_validator_requires_legal_files
 run_test test_validator_requires_sources_and_javadoc_jars
 run_test test_maven_failure_status_is_preserved
 run_test test_real_deploy_requires_official_repository_run
@@ -614,5 +874,6 @@ run_test test_dirty_release_input_stops_before_download
 run_test test_foreign_git_environment_cannot_redirect_checkout_checks
 run_test test_git_index_flags_are_rejected
 run_test test_git_replacement_refs_are_rejected
+run_test test_repository_local_attributes_are_rejected
 
 echo "All $TEST_COUNT deploy_java_staging tests passed with Bash $BASH_VERSION."

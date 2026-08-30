@@ -39,6 +39,8 @@ export GIT_CONFIG_NOSYSTEM=1
 export GIT_NO_REPLACE_OBJECTS=1
 
 MVN=${MVN:-mvn}
+GPG=${GPG:-gpg}
+CURL=${CURL:-curl}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
@@ -48,6 +50,8 @@ RC_NUMBER=
 RUN_ID=
 REPOSITORY=apache/paimon-mosaic
 MAVEN_SETTINGS=
+GPG_KEYNAME=
+KEYS_FILE=
 DRY_RUN=false
 GITHUB_HOST=github.com
 
@@ -68,6 +72,8 @@ Required:
 Options:
   --repo OWNER/REPO          Defaults to apache/paimon-mosaic.
   --maven-settings FILE      Maven settings.xml containing Nexus credentials.
+  --gpg-keyname FINGERPRINT  Full OpenPGP signing-key fingerprint.
+  --keys-file FILE           ASF Paimon KEYS file; otherwise download it.
   --dry-run                  Verify locally without signing or deploying.
   -h, --help                 Show this help.
 
@@ -111,6 +117,16 @@ while [[ $# -gt 0 ]]; do
     --maven-settings)
       require_option_value "$@"
       MAVEN_SETTINGS=$2
+      shift 2
+      ;;
+    --gpg-keyname)
+      require_option_value "$@"
+      GPG_KEYNAME=$2
+      shift 2
+      ;;
+    --keys-file)
+      require_option_value "$@"
+      KEYS_FILE=$2
       shift 2
       ;;
     --dry-run)
@@ -163,6 +179,21 @@ if [[ "$DRY_RUN" != true && "$REPOSITORY" != apache/paimon-mosaic ]]; then
   echo "Real Nexus deployment requires apache/paimon-mosaic workflow artifacts." >&2
   exit 1
 fi
+if [[ "$DRY_RUN" != true ]]; then
+  require_value "--gpg-keyname" "$GPG_KEYNAME"
+fi
+if [[ -n "$GPG_KEYNAME" ]]; then
+  case "$GPG_KEYNAME" in
+    *[!0-9A-Fa-f]*) GPG_KEYNAME_VALID=false ;;
+    *) GPG_KEYNAME_VALID=true ;;
+  esac
+  if [[ "$GPG_KEYNAME_VALID" != true ||
+        ( ${#GPG_KEYNAME} -ne 40 && ${#GPG_KEYNAME} -ne 64 ) ]]; then
+    echo "--gpg-keyname must be a full 40- or 64-hex OpenPGP fingerprint." >&2
+    exit 1
+  fi
+  GPG_KEYNAME=$(printf '%s' "$GPG_KEYNAME" | tr '[:lower:]' '[:upper:]')
+fi
 
 TAG="v${RELEASE_VERSION}-rc${RC_NUMBER}"
 STAGING_DESCRIPTION="Apache Paimon Mosaic ${RELEASE_VERSION} RC${RC_NUMBER}"
@@ -174,33 +205,48 @@ if [[ -n "$MAVEN_SETTINGS" ]]; then
   fi
   MAVEN_SETTINGS=$(cd "$(dirname "$MAVEN_SETTINGS")" && pwd)/$(basename "$MAVEN_SETTINGS")
 fi
+if [[ -n "$KEYS_FILE" ]]; then
+  if [[ ! -f "$KEYS_FILE" ]]; then
+    echo "--keys-file does not exist: $KEYS_FILE" >&2
+    exit 1
+  fi
+  KEYS_FILE=$(cd "$(dirname "$KEYS_FILE")" && pwd)/$(basename "$KEYS_FILE")
+fi
 
-for command in git gh "$MVN"; do
+for command in git gh tar "$MVN"; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Required command not found: $command" >&2
     exit 1
   fi
 done
-
-ARTIFACT_VALIDATOR="$SCRIPT_DIR/validate_java_staging_artifacts.sh"
-if [[ ! -x "$ARTIFACT_VALIDATOR" ]]; then
-  echo "Java staging artifact validator is not executable: $ARTIFACT_VALIDATOR" >&2
+if [[ "$DRY_RUN" != true ]] && ! command -v "$GPG" >/dev/null 2>&1; then
+  echo "Required command not found: $GPG" >&2
+  exit 1
+fi
+if [[ "$DRY_RUN" != true && -z "$KEYS_FILE" ]] &&
+  ! command -v "$CURL" >/dev/null 2>&1; then
+  echo "Required command not found: $CURL" >&2
   exit 1
 fi
 
-POM_VERSION=$(
-  awk '
-    /<\/parent>/ { after_parent = 1; next }
-    after_parent && match($0, /<version>[^<]+<\/version>/) {
-      value = substr($0, RSTART + 9, RLENGTH - 19)
-      print value
-      exit
-    }
-  ' "$REPO_DIR/java/pom.xml"
-)
-if [[ "$POM_VERSION" != "$RELEASE_VERSION" ]]; then
-  echo "java/pom.xml version is $POM_VERSION, expected $RELEASE_VERSION" >&2
-  exit 1
+validate_local_signing_key() {
+  local local_fingerprints
+
+  if ! local_fingerprints=$(
+    "$GPG" --batch --with-colons --list-secret-keys --fingerprint "$GPG_KEYNAME" |
+      awk -F: '$1 == "fpr" {print toupper($10)}'
+  ); then
+    echo "Unable to read local secret key $GPG_KEYNAME." >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$local_fingerprints" | grep -Fxq "$GPG_KEYNAME"; then
+    echo "Local GPG secret keys do not contain $GPG_KEYNAME." >&2
+    exit 1
+  fi
+}
+
+if [[ "$DRY_RUN" != true ]]; then
+  validate_local_signing_key
 fi
 
 if ! TAG_OBJECT=$(
@@ -255,6 +301,19 @@ if [[ -n "$REPLACEMENT_REFS" ]]; then
   exit 1
 fi
 
+ARCHIVE_ATTRIBUTES=$(
+  git -C "$REPO_DIR" rev-parse --git-path info/attributes
+)
+case "$ARCHIVE_ATTRIBUTES" in
+  /*) ;;
+  *) ARCHIVE_ATTRIBUTES="$REPO_DIR/$ARCHIVE_ATTRIBUTES" ;;
+esac
+if [[ -s "$ARCHIVE_ATTRIBUTES" ]]; then
+  echo "Non-empty repository-local Git attributes are not allowed during Java staging." >&2
+  echo "$ARCHIVE_ATTRIBUTES" >&2
+  exit 1
+fi
+
 INDEX_FLAGGED_PATHS=$(
   git -C "$REPO_DIR" ls-files -v |
     awk 'substr($0, 1, 1) == "S" || substr($0, 1, 1) ~ /[a-z]/'
@@ -294,6 +353,34 @@ check_checkout_clean
 
 gh_exact() {
   GH_HOST="$GITHUB_HOST" gh "$@"
+}
+
+validate_remote_tag_object() {
+  local remote_tag_output
+  local remote_tag_type
+  local remote_tag_object
+
+  if ! remote_tag_output=$(
+    gh_exact api \
+      "repos/$REPOSITORY/git/ref/tags/$TAG" \
+      --jq '.object.type, .object.sha'
+  ); then
+    echo "Failed to read the current remote tag object for $TAG." >&2
+    exit 1
+  fi
+
+  remote_tag_type=$(printf '%s\n' "$remote_tag_output" | sed -n '1p')
+  remote_tag_object=$(printf '%s\n' "$remote_tag_output" | sed -n '2p')
+  if [[ "$remote_tag_type" != tag ]]; then
+    echo "Current remote tag $TAG is not an annotated tag." >&2
+    exit 1
+  fi
+  if [[ "$remote_tag_object" != "$TAG_OBJECT" ]]; then
+    echo "The current remote tag object does not match the verified local tag." >&2
+    echo "remote: $remote_tag_object" >&2
+    echo "local:  $TAG_OBJECT" >&2
+    exit 1
+  fi
 }
 
 validate_github_run() {
@@ -347,13 +434,12 @@ validate_github_run() {
   fi
 }
 
+validate_remote_tag_object
 validate_github_run
 
 STAGING_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/paimon-mosaic-java-staging.XXXXXX")
-NATIVE_RESOURCE_DIR="$REPO_DIR/java/src/main/resources/native"
 
 cleanup() {
-  rm -rf -- "$NATIVE_RESOURCE_DIR"
   case "$STAGING_ROOT" in
     "${TMPDIR:-/tmp}"/paimon-mosaic-java-staging.*)
       rm -rf -- "$STAGING_ROOT"
@@ -364,6 +450,87 @@ cleanup() {
   esac
 }
 trap cleanup EXIT
+
+validate_asf_keys_membership() {
+  local curl_status
+  local keys_fingerprints
+
+  if [[ -z "$KEYS_FILE" ]]; then
+    KEYS_FILE="$STAGING_ROOT/PAIMON_KEYS"
+    if "$CURL" \
+      --proto '=https' \
+      --tlsv1.2 \
+      --location \
+      --fail \
+      --silent \
+      --show-error \
+      --retry 3 \
+      --retry-connrefused \
+      --connect-timeout 10 \
+      --max-time 300 \
+      --output "$KEYS_FILE" \
+      https://downloads.apache.org/paimon/KEYS; then
+      :
+    else
+      curl_status=$?
+      exit "$curl_status"
+    fi
+  fi
+
+  if ! keys_fingerprints=$(
+    "$GPG" \
+      --batch \
+      --with-colons \
+      --import-options show-only \
+      --import "$KEYS_FILE" |
+      awk -F: '$1 == "fpr" {print toupper($10)}'
+  ); then
+    echo "Unable to read OpenPGP fingerprints from $KEYS_FILE." >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$keys_fingerprints" | grep -Fxq "$GPG_KEYNAME"; then
+    echo "Signing key $GPG_KEYNAME is not present in the ASF Paimon KEYS file." >&2
+    exit 1
+  fi
+}
+
+if [[ "$DRY_RUN" != true ]]; then
+  validate_asf_keys_membership
+fi
+
+ARCHIVE_PREFIX="paimon-mosaic-${RELEASE_VERSION}"
+ARCHIVE_PATH="$STAGING_ROOT/source.tar"
+git -C "$REPO_DIR" \
+  -c core.attributesFile=/dev/null \
+  archive \
+  --format=tar \
+  "--prefix=${ARCHIVE_PREFIX}/" \
+  "$TAG_COMMIT" > "$ARCHIVE_PATH"
+tar -xf "$ARCHIVE_PATH" -C "$STAGING_ROOT"
+BUILD_REPO_DIR="$STAGING_ROOT/$ARCHIVE_PREFIX"
+
+ARTIFACT_VALIDATOR="$BUILD_REPO_DIR/tools/validate_java_staging_artifacts.sh"
+if [[ ! -x "$ARTIFACT_VALIDATOR" ]]; then
+  echo "Java staging artifact validator is not executable: $ARTIFACT_VALIDATOR" >&2
+  exit 1
+fi
+
+POM_VERSION=$(
+  awk '
+    /<\/parent>/ { after_parent = 1; next }
+    after_parent && match($0, /<version>[^<]+<\/version>/) {
+      value = substr($0, RSTART + 9, RLENGTH - 19)
+      print value
+      exit
+    }
+  ' "$BUILD_REPO_DIR/java/pom.xml"
+)
+if [[ "$POM_VERSION" != "$RELEASE_VERSION" ]]; then
+  echo "RC tag java/pom.xml version is $POM_VERSION, expected $RELEASE_VERSION" >&2
+  exit 1
+fi
+
+NATIVE_RESOURCE_DIR="$BUILD_REPO_DIR/java/src/main/resources/native"
 
 download_native() {
   local artifact=$1
@@ -441,11 +608,15 @@ else
   MAVEN_CMD+=(
     clean deploy -Prelease
     -Dgpg.skip=false
+    -Dgpg.signer=gpg
+    "-Dgpg.executable=$GPG"
+    "-Dgpg.keyname=${GPG_KEYNAME}!"
     "-DstagingDescription=$STAGING_DESCRIPTION"
   )
 fi
 MAVEN_CMD+=(
   -DskipTests
+  -Dmaven.main.skip=false
   "-DstagingValidationScript=$ARTIFACT_VALIDATOR"
   -Dexec.skip=false
   -DskipLocalStaging=false
@@ -469,7 +640,7 @@ fi
 
 MAVEN_STATUS=0
 (
-  cd "$REPO_DIR/java" || exit $?
+  cd "$BUILD_REPO_DIR/java" || exit $?
   if env \
     MAVEN_SKIP_RC=1 \
     MAVEN_ARGS= \
@@ -481,6 +652,9 @@ MAVEN_STATUS=0
     JAVA_TOOL_OPTIONS= \
     JDK_JAVA_OPTIONS= \
     _JAVA_OPTIONS= \
+    MAVEN_GPG_KEY= \
+    MAVEN_GPG_KEY_FINGERPRINT= \
+    MAVEN_GPG_PASSPHRASE= \
     "${MAVEN_CMD[@]}"; then
     :
   else
