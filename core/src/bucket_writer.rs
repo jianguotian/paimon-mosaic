@@ -54,6 +54,13 @@ pub struct ChildColumnMeta {
     pub num_elements: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DictTracking {
+    Pending,
+    Active,
+    Disabled,
+}
+
 pub struct BucketWriter {
     num_primary: usize,
     total_columns: usize,
@@ -68,6 +75,7 @@ pub struct BucketWriter {
 
     long_dict_maps: Vec<Option<HashMap<u64, usize>>>,
     byte_dict_maps: Vec<Option<HashMap<Vec<u8>, usize>>>,
+    dict_tracking: Vec<DictTracking>,
     dict_total_bytes: Vec<usize>,
     max_dict_total_bytes: usize,
     max_dict_entries: usize,
@@ -87,18 +95,6 @@ impl BucketWriter {
         let total_columns = physical_types.len();
         let fixed_widths: Vec<i32> = physical_types.iter().map(types::fixed_width).collect();
 
-        let mut long_dict_maps = Vec::with_capacity(total_columns);
-        let mut byte_dict_maps = Vec::with_capacity(total_columns);
-        for fw in &fixed_widths {
-            if uses_long_dict(*fw) {
-                long_dict_maps.push(Some(HashMap::new()));
-                byte_dict_maps.push(None);
-            } else {
-                long_dict_maps.push(None);
-                byte_dict_maps.push(Some(HashMap::new()));
-            }
-        }
-
         BucketWriter {
             num_primary,
             total_columns,
@@ -108,8 +104,9 @@ impl BucketWriter {
             non_null_counts: vec![0; total_columns],
             const_tracking: vec![true; total_columns],
             first_value_len: vec![0; total_columns],
-            long_dict_maps,
-            byte_dict_maps,
+            long_dict_maps: (0..total_columns).map(|_| None).collect(),
+            byte_dict_maps: (0..total_columns).map(|_| None).collect(),
+            dict_tracking: vec![DictTracking::Pending; total_columns],
             dict_total_bytes: vec![0; total_columns],
             max_dict_total_bytes,
             max_dict_entries,
@@ -339,40 +336,7 @@ impl BucketWriter {
                 let written = self.value_buffers[col].len() - before;
                 col_size += written;
 
-                if self.const_tracking[col] {
-                    if self.non_null_counts[col] == 1 {
-                        self.first_value_len[col] = written;
-                    } else if written != self.first_value_len[col]
-                        || !equals_first_value(&self.value_buffers[col], before, written)
-                    {
-                        self.const_tracking[col] = false;
-                    }
-                }
-
-                if let Some(ref mut dict) = self.long_dict_maps[col] {
-                    let key = values::extract_fixed_key(
-                        &self.value_buffers[col],
-                        before,
-                        self.fixed_widths[col],
-                    );
-                    let len = dict.len();
-                    dict.entry(key).or_insert(len);
-                    if dict.len() > self.max_dict_entries {
-                        self.long_dict_maps[col] = None;
-                    }
-                } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
-                    let slice = &self.value_buffers[col][before..before + written];
-                    if !dict.contains_key(slice) {
-                        let len = dict.len();
-                        dict.insert(slice.to_vec(), len);
-                        self.dict_total_bytes[col] += written;
-                    }
-                    if dict.len() > self.max_dict_entries
-                        || self.dict_total_bytes[col] > self.max_dict_total_bytes
-                    {
-                        self.byte_dict_maps[col] = None;
-                    }
-                }
+                self.track_encoding_value(col, before, written);
             }
         }
         Ok(col_size)
@@ -492,52 +456,14 @@ impl BucketWriter {
 
         let col_size = buf.len() - before_all;
         let fw = self.fixed_widths[col] as usize;
-        let prev_non_null = self.non_null_counts[col];
-        self.non_null_counts[col] += num_rows;
-
-        if self.const_tracking[col] {
-            if prev_non_null == 0 {
-                self.first_value_len[col] = fw;
-                for i in 1..num_rows {
-                    if !equals_first_value(buf, before_all + i * fw, fw) {
-                        self.const_tracking[col] = false;
-                        break;
-                    }
-                }
-            } else {
-                for i in 0..num_rows {
-                    if !equals_first_value(buf, before_all + i * fw, fw) {
-                        self.const_tracking[col] = false;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(ref mut dict) = self.long_dict_maps[col] {
+        if !self.const_tracking[col] && self.dict_tracking[col] == DictTracking::Disabled {
+            self.non_null_counts[col] += num_rows;
+        } else {
             for i in 0..num_rows {
-                let key =
-                    values::extract_fixed_key(buf, before_all + i * fw, self.fixed_widths[col]);
-                let len = dict.len();
-                dict.entry(key).or_insert(len);
-                if dict.len() > self.max_dict_entries {
-                    self.long_dict_maps[col] = None;
-                    break;
-                }
-            }
-        } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
-            for i in 0..num_rows {
-                let start = before_all + i * fw;
-                let slice = &buf[start..start + fw];
-                if !dict.contains_key(slice) {
-                    let len = dict.len();
-                    dict.insert(slice.to_vec(), len);
-                    self.dict_total_bytes[col] += fw;
-                }
-                if dict.len() > self.max_dict_entries
-                    || self.dict_total_bytes[col] > self.max_dict_total_bytes
-                {
-                    self.byte_dict_maps[col] = None;
+                self.non_null_counts[col] += 1;
+                self.track_encoding_value(col, before_all + i * fw, fw);
+                if !self.const_tracking[col] && self.dict_tracking[col] == DictTracking::Disabled {
+                    self.non_null_counts[col] += num_rows - i - 1;
                     break;
                 }
             }
@@ -547,6 +473,80 @@ impl BucketWriter {
         let _ = start_row;
 
         Ok(Some(col_size))
+    }
+
+    fn track_encoding_value(&mut self, col: usize, value_start: usize, value_len: usize) {
+        if self.non_null_counts[col] == 1 {
+            self.first_value_len[col] = value_len;
+            return;
+        }
+
+        if self.const_tracking[col] {
+            if value_len == self.first_value_len[col]
+                && equals_first_value(&self.value_buffers[col], value_start, value_len)
+            {
+                return;
+            }
+
+            self.const_tracking[col] = false;
+            self.activate_dict_tracking(col, value_start, value_len);
+        } else {
+            self.track_dict_value(col, value_start, value_len);
+        }
+    }
+
+    fn activate_dict_tracking(&mut self, col: usize, value_start: usize, value_len: usize) {
+        debug_assert_eq!(self.dict_tracking[col], DictTracking::Pending);
+        self.dict_total_bytes[col] = 0;
+        if uses_long_dict(self.fixed_widths[col]) {
+            self.long_dict_maps[col]
+                .get_or_insert_with(HashMap::new)
+                .clear();
+        } else {
+            self.byte_dict_maps[col]
+                .get_or_insert_with(HashMap::new)
+                .clear();
+        }
+        self.dict_tracking[col] = DictTracking::Active;
+
+        self.track_dict_value(col, 0, self.first_value_len[col]);
+        if self.dict_tracking[col] == DictTracking::Active {
+            self.track_dict_value(col, value_start, value_len);
+        }
+    }
+
+    fn track_dict_value(&mut self, col: usize, value_start: usize, value_len: usize) {
+        if self.dict_tracking[col] != DictTracking::Active {
+            return;
+        }
+
+        let disable = if let Some(ref mut dict) = self.long_dict_maps[col] {
+            let key = values::extract_fixed_key(
+                &self.value_buffers[col],
+                value_start,
+                self.fixed_widths[col],
+            );
+            let len = dict.len();
+            dict.entry(key).or_insert(len);
+            dict.len() > self.max_dict_entries
+        } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
+            let value = &self.value_buffers[col][value_start..value_start + value_len];
+            if !dict.contains_key(value) {
+                let len = dict.len();
+                dict.insert(value.to_vec(), len);
+                self.dict_total_bytes[col] += value_len;
+            }
+            dict.len() > self.max_dict_entries
+                || self.dict_total_bytes[col] > self.max_dict_total_bytes
+        } else {
+            unreachable!("active dictionary tracking must have a dictionary map")
+        };
+
+        if disable {
+            self.dict_tracking[col] = DictTracking::Disabled;
+            self.long_dict_maps[col] = None;
+            self.byte_dict_maps[col] = None;
+        }
     }
 
     fn compute_encodings(&self) -> (Vec<u8>, Vec<bool>) {
@@ -760,24 +760,19 @@ impl BucketWriter {
 
     pub fn reset(&mut self) {
         for i in 0..self.total_columns {
-            for b in &mut self.null_bitmaps[i] {
-                *b = 0;
-            }
+            self.null_bitmaps[i].fill(0);
             self.value_buffers[i].clear();
             self.non_null_counts[i] = 0;
             self.const_tracking[i] = true;
             self.first_value_len[i] = 0;
+            self.dict_tracking[i] = DictTracking::Pending;
             self.dict_total_bytes[i] = 0;
             if uses_long_dict(self.fixed_widths[i]) {
                 if let Some(ref mut dict) = self.long_dict_maps[i] {
                     dict.clear();
-                } else {
-                    self.long_dict_maps[i] = Some(HashMap::new());
                 }
             } else if let Some(ref mut dict) = self.byte_dict_maps[i] {
                 dict.clear();
-            } else {
-                self.byte_dict_maps[i] = Some(HashMap::new());
             }
         }
         self.num_rows = 0;
@@ -787,6 +782,9 @@ impl BucketWriter {
     }
 
     fn get_dict_size(&self, col: usize) -> usize {
+        if self.dict_tracking[col] != DictTracking::Active {
+            return 0;
+        }
         if let Some(ref dict) = self.long_dict_maps[col] {
             return dict.len();
         }
@@ -833,6 +831,9 @@ impl BucketWriter {
     }
 
     fn dict_encoded_size(&self, col: usize) -> usize {
+        if self.dict_tracking[col] != DictTracking::Active {
+            return usize::MAX;
+        }
         let (num_entries, entry_bytes) = if let Some(ref dict) = self.long_dict_maps[col] {
             (dict.len(), dict.len() * self.fixed_widths[col] as usize)
         } else if let Some(ref dict) = self.byte_dict_maps[col] {
@@ -1728,6 +1729,50 @@ mod tests {
         let data = writer.finish();
         let h = header_size(&data);
         assert_eq!(data[h] & 0x03, ENCODING_CONST);
+    }
+
+    #[test]
+    fn test_const_columns_do_not_build_dictionaries() {
+        let types = [DataType::Int32, DataType::Utf8];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let ints = Int32Array::from(vec![42; 100]);
+        let strings = StringArray::from(vec!["same"; 100]);
+        writer
+            .write_columns(&[&ints, &strings], &[&types[0], &types[1]])
+            .unwrap();
+
+        assert!(writer.long_dict_maps[0].is_none());
+        assert!(writer.byte_dict_maps[1].is_none());
+        assert_eq!(writer.dict_total_bytes[1], 0);
+    }
+
+    #[test]
+    fn test_dictionary_tracking_starts_on_first_non_const_value() {
+        let types = [DataType::Int32, DataType::Utf8];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let const_ints = Int32Array::from(vec![42; 50]);
+        let const_strings = StringArray::from(vec!["same"; 50]);
+        writer
+            .write_columns(&[&const_ints, &const_strings], &[&types[0], &types[1]])
+            .unwrap();
+
+        let varied_ints = Int32Array::from(vec![42, 7, 42, 7]);
+        let varied_strings = StringArray::from(vec!["same", "other", "same", "other"]);
+        writer
+            .write_columns(&[&varied_ints, &varied_strings], &[&types[0], &types[1]])
+            .unwrap();
+
+        assert_eq!(writer.dict_tracking, vec![DictTracking::Active; 2]);
+        assert_eq!(writer.long_dict_maps[0].as_ref().unwrap().len(), 2);
+        assert_eq!(writer.byte_dict_maps[1].as_ref().unwrap().len(), 2);
+
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        assert_eq!((data[0] >> 2) & 0x03, ENCODING_DICT);
     }
 
     #[test]
