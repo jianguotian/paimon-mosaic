@@ -23,6 +23,7 @@ TEST_SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOOLS_DIR=$(cd "$TEST_SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(cd "$TOOLS_DIR/.." && pwd)
 REAL_GIT=$(command -v git)
+PYTHON=${PYTHON:-python3}
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/paimon-mosaic-staging-test.XXXXXX")
 TEST_COUNT=0
 
@@ -518,10 +519,12 @@ new_fixture() {
   GH_TAG_COUNT="$FIXTURE_DIR/gh-tag-count.log"
   CURL_LOG="$FIXTURE_DIR/curl.log"
   NEXUS_CALLED_LOG="$FIXTURE_DIR/nexus-called.log"
-  SANITIZED_SETTINGS_COPY=$(mktemp "$TEST_ROOT/sanitized-settings.XXXXXX.xml")
+  SIGNING_SETTINGS_COPY=$(mktemp "$TEST_ROOT/signing-settings.XXXXXX.xml")
+  NEXUS_SETTINGS_COPY=$(mktemp "$TEST_ROOT/nexus-settings.XXXXXX.xml")
   EMPTY_GLOBAL_SETTINGS_COPY=$(
     mktemp "$TEST_ROOT/empty-global-settings.XXXXXX.xml"
   )
+  PLUGIN_SOURCE_DIR="$FIXTURE_DIR/plugin-source"
   OUTPUT_LOG="$FIXTURE_DIR/output.log"
   STAGING_PROFILE_ID=paimon-profile-123
   FAKE_WORKFLOW_ID=7001
@@ -541,8 +544,10 @@ new_fixture() {
     GH_TAG_COUNT \
     CURL_LOG \
     NEXUS_CALLED_LOG \
-    SANITIZED_SETTINGS_COPY \
+    SIGNING_SETTINGS_COPY \
+    NEXUS_SETTINGS_COPY \
     EMPTY_GLOBAL_SETTINGS_COPY \
+    PLUGIN_SOURCE_DIR \
     OUTPUT_LOG \
     STAGING_PROFILE_ID \
     FAKE_WORKFLOW_ID \
@@ -553,6 +558,7 @@ new_fixture() {
     "$FIXTURE_DIR/fake-bin" \
     "$FIXTURE_DIR/home/.m2" \
     "$FIXTURE_DIR/java/src/main/java/org/apache/paimon/mosaic" \
+    "$PLUGIN_SOURCE_DIR" \
     "$FIXTURE_DIR/tools"
 
   cp "$REPO_ROOT/LICENSE" "$FIXTURE_DIR/LICENSE"
@@ -560,10 +566,66 @@ new_fixture() {
     "$REPO_ROOT/java/src/main/java/." \
     "$FIXTURE_DIR/java/src/main/java/"
   cp "$TOOLS_DIR/deploy_java_staging.sh" "$FIXTURE_DIR/tools/"
+  cp "$TOOLS_DIR/prepare_java_staging_maven_plugins.py" "$FIXTURE_DIR/tools/"
   cp "$TOOLS_DIR/validate_java_staging_artifacts.sh" "$FIXTURE_DIR/tools/"
   chmod +x \
     "$FIXTURE_DIR/tools/deploy_java_staging.sh" \
     "$FIXTURE_DIR/tools/validate_java_staging_artifacts.sh"
+
+  "$PYTHON" - "$PLUGIN_SOURCE_DIR" "$FIXTURE_DIR/tools" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+
+source_root = Path(sys.argv[1])
+tools = Path(sys.argv[2])
+artifacts = tuple(sorted((
+    "org/apache/maven/plugins/maven-gpg-plugin/3.2.8/"
+    "maven-gpg-plugin-3.2.8.jar",
+    "org/apache/maven/plugins/maven-gpg-plugin/3.2.8/"
+    "maven-gpg-plugin-3.2.8.pom",
+    "org/sonatype/plugins/nexus-staging-maven-plugin/1.7.0/"
+    "nexus-staging-maven-plugin-1.7.0.jar",
+    "org/sonatype/plugins/nexus-staging-maven-plugin/1.7.0/"
+    "nexus-staging-maven-plugin-1.7.0.pom",
+    "org/example/pinned-dependency/1.0/pinned-dependency-1.0.jar",
+    "org/example/pinned-dependency/1.0/pinned-dependency-1.0.pom",
+)))
+lines = [
+    "# Licensed to the Apache Software Foundation (ASF) under one or more",
+    "# contributor license agreements. See the NOTICE file distributed with",
+    "# this work for additional information regarding copyright ownership.",
+    "# The ASF licenses this file to You under the Apache License, Version 2.0",
+    '# (the "License"); you may not use this file except in compliance with',
+    "# the License. You may obtain a copy of the License at",
+    "#",
+    "# https://www.apache.org/licenses/LICENSE-2.0",
+    "#",
+    "# Unless required by applicable law or agreed to in writing, software",
+    '# distributed under the License is distributed on an "AS IS" BASIS,',
+    "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.",
+    "# See the License for the specific language governing permissions and",
+    "# limitations under the License.",
+    "",
+]
+for relative in artifacts:
+    path = source_root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    contents = ("fixture Maven artifact: {}\n".format(relative)).encode()
+    path.write_bytes(contents)
+    lines.append(
+        "{} {} {}".format(
+            hashlib.sha256(contents).hexdigest(),
+            len(contents),
+            relative,
+        )
+    )
+(tools / "java-staging-maven-plugins.sha256").write_text(
+    "\n".join(lines) + "\n",
+    encoding="utf-8",
+)
+PY
 
   cat > "$FIXTURE_DIR/java/pom.xml" <<'EOF'
 <project>
@@ -785,6 +847,7 @@ packaging=
 classifier=unset
 staging_profile_id=
 staging_repository_id=unset
+maven_repo_local=
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -816,12 +879,18 @@ while [[ $# -gt 0 ]]; do
     -Dclassifier=*) classifier=${1#*=}; shift ;;
     -DstagingProfileId=*) staging_profile_id=${1#*=}; shift ;;
     -DstagingRepositoryId=*) staging_repository_id=${1#*=}; shift ;;
+    -Dmaven.repo.local=*) maven_repo_local=${1#*=}; shift ;;
     *) shift ;;
   esac
 done
+printf 'resolved-goal=%s maven-repo-local=%s\n' \
+  "$goal" "$maven_repo_local" >> "$FAKE_MVN_LOG"
 
 if [[ -n "$settings" ]]; then
-  cp "$settings" "$FAKE_SANITIZED_SETTINGS_COPY"
+  case "$goal" in
+    sign) cp "$settings" "$FAKE_SIGNING_SETTINGS_COPY" ;;
+    nexus) cp "$settings" "$FAKE_NEXUS_SETTINGS_COPY" ;;
+  esac
 fi
 if [[ -n "$global_settings" ]]; then
   cp "$global_settings" "$FAKE_EMPTY_GLOBAL_SETTINGS_COPY"
@@ -888,6 +957,56 @@ case "$goal" in
     fi
     if [[ "${FAKE_EXTRA_REPO_SYMLINK:-false}" == true ]]; then
       ln -s mosaic-0.3.0.jar "$version_dir/alias.jar"
+    fi
+    case "${FAKE_MUTATE_INPUT_AND_REPOSITORY:-}" in
+      "") ;;
+      main)
+        "$PYTHON" - "$file" <<'PY'
+import sys
+from pathlib import Path
+
+
+path = Path(sys.argv[1])
+contents = bytearray(path.read_bytes())
+contents[0] ^= 1
+path.write_bytes(contents)
+PY
+        cp "$file" "$version_dir/mosaic-0.3.0.jar"
+        ;;
+      *) exit 2 ;;
+    esac
+    if [[ -n "${FAKE_MUTATE_PINNED_PLUGIN_AFTER_SIGN:-}" ]]; then
+      "$PYTHON" - \
+        "$settings" \
+        "$FAKE_MUTATE_PINNED_PLUGIN_AFTER_SIGN" <<'PY'
+import sys
+import hashlib
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+settings = ET.parse(sys.argv[1]).getroot()
+relative = sys.argv[2]
+mirror_url = None
+for element in settings.iter():
+    if element.tag.rsplit("}", 1)[-1] == "url":
+        value = (element.text or "").strip()
+        if value.startswith("file://"):
+            mirror_url = value
+            break
+if mirror_url is None:
+    raise SystemExit("pinned plugin mirror was not found")
+repository = Path(urlparse(mirror_url).path)
+path = repository / relative
+contents = bytearray(path.read_bytes())
+contents[0] ^= 1
+path.write_bytes(contents)
+(Path(str(path) + ".sha1")).write_text(
+    hashlib.sha1(contents).hexdigest() + "\n",
+    encoding="utf-8",
+)
+PY
     fi
     if [[ "${FAKE_MUTATE_PROVENANCE_AFTER_SIGN:-false}" == true ]]; then
       printf 'changed\n' >> "$FAKE_PROVENANCE_PATH"
@@ -1000,10 +1119,15 @@ set -o pipefail
 
 printf 'args=%s\n' "$*" >> "$FAKE_CURL_LOG"
 output=
+config=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output)
       output=$2
+      shift 2
+      ;;
+    --config)
+      config=$2
       shift 2
       ;;
     *)
@@ -1011,6 +1135,51 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+if [[ -n "$config" ]]; then
+  "$PYTHON" - \
+    "$config" \
+    "$FAKE_PLUGIN_SOURCE_DIR" \
+    "${FAKE_PLUGIN_DOWNLOAD_MUTATION:-}" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+config = Path(sys.argv[1])
+source_root = Path(sys.argv[2])
+mutation = sys.argv[3]
+urls = []
+outputs = []
+for raw_line in config.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        continue
+    key, value = line.split("=", 1)
+    value = value.strip().strip('"')
+    if key.strip() == "url":
+        urls.append(value)
+    elif key.strip() == "output":
+        outputs.append(value)
+if len(urls) != len(outputs) or not urls:
+    raise SystemExit("invalid fake curl config")
+for url, output in zip(urls, outputs):
+    marker = "/maven2/"
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or marker not in parsed.path:
+        raise SystemExit("unexpected plugin URL: {}".format(url))
+    relative = parsed.path.split(marker, 1)[1]
+    source = source_root / relative
+    destination = Path(output)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    if relative == mutation:
+        contents = bytearray(destination.read_bytes())
+        contents[0] ^= 1
+        destination.write_bytes(contents)
+PY
+  exit 0
+fi
 if [[ -z "$output" ]]; then
   exit 2
 fi
@@ -1032,7 +1201,6 @@ EOF
   git -C "$FIXTURE_DIR" commit -q -m fixture
   git -C "$FIXTURE_DIR" tag -a v0.3.0-rc1 -m v0.3.0-rc1
 
-  PYTHON=${PYTHON:-python3}
   export PYTHON
   create_candidate_artifacts
   FAKE_ARTIFACT_ZIP=$ARTIFACT_ZIP
@@ -1073,8 +1241,10 @@ run_script() {
       FAKE_GH_RUN_COUNT="$GH_RUN_COUNT" \
       FAKE_GH_TAG_COUNT="$GH_TAG_COUNT" \
       FAKE_CURL_LOG="$CURL_LOG" \
-      FAKE_SANITIZED_SETTINGS_COPY="$SANITIZED_SETTINGS_COPY" \
+      FAKE_SIGNING_SETTINGS_COPY="$SIGNING_SETTINGS_COPY" \
+      FAKE_NEXUS_SETTINGS_COPY="$NEXUS_SETTINGS_COPY" \
       FAKE_EMPTY_GLOBAL_SETTINGS_COPY="$EMPTY_GLOBAL_SETTINGS_COPY" \
+      FAKE_PLUGIN_SOURCE_DIR="$PLUGIN_SOURCE_DIR" \
       FAKE_NEXUS_CALLED_LOG="$NEXUS_CALLED_LOG" \
       FAKE_PROVENANCE_PATH="$PROVENANCE_PATH" \
       FAKE_STAGING_PROFILE_ID="$STAGING_PROFILE_ID" \
@@ -1106,8 +1276,10 @@ run_script_without_manifest() {
       FAKE_GH_RUN_COUNT="$GH_RUN_COUNT" \
       FAKE_GH_TAG_COUNT="$GH_TAG_COUNT" \
       FAKE_CURL_LOG="$CURL_LOG" \
-      FAKE_SANITIZED_SETTINGS_COPY="$SANITIZED_SETTINGS_COPY" \
+      FAKE_SIGNING_SETTINGS_COPY="$SIGNING_SETTINGS_COPY" \
+      FAKE_NEXUS_SETTINGS_COPY="$NEXUS_SETTINGS_COPY" \
       FAKE_EMPTY_GLOBAL_SETTINGS_COPY="$EMPTY_GLOBAL_SETTINGS_COPY" \
+      FAKE_PLUGIN_SOURCE_DIR="$PLUGIN_SOURCE_DIR" \
       FAKE_NEXUS_CALLED_LOG="$NEXUS_CALLED_LOG" \
       FAKE_PROVENANCE_PATH="$PROVENANCE_PATH" \
       FAKE_STAGING_PROFILE_ID="$STAGING_PROFILE_ID" \
@@ -1786,7 +1958,10 @@ test_real_deploy_downloads_pinned_asf_keys_by_default() {
   assert_contains "$CURL_LOG" "https://downloads.apache.org/paimon/KEYS"
 }
 
-test_settings_and_bc_environment_cannot_rewrite_signing_inputs() {
+test_settings_and_environment_cannot_control_plugin_resolution_or_signing_inputs() {
+  local nexus_runtime_repository
+  local signing_runtime_repository
+
   new_fixture
   keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
   settings=$(mktemp "$TEST_ROOT/settings.XXXXXX.xml")
@@ -1845,16 +2020,30 @@ EOF
     fail "sanitized settings deployment failed"
   fi
 
-  assert_contains "$SANITIZED_SETTINGS_COPY" "apache.releases.https"
-  assert_contains "$SANITIZED_SETTINGS_COPY" "release-manager"
-  assert_contains "$SANITIZED_SETTINGS_COPY" "release-local-repository"
-  assert_contains "$SANITIZED_SETTINGS_COPY" "org.example.plugins"
-  assert_contains "$SANITIZED_SETTINGS_COPY" "mirror.invalid"
-  assert_contains "$SANITIZED_SETTINGS_COPY" "proxy.invalid"
-  assert_not_contains "$SANITIZED_SETTINGS_COPY" "other-server"
-  assert_not_contains "$SANITIZED_SETTINGS_COPY" "<profiles"
-  assert_not_contains "$SANITIZED_SETTINGS_COPY" "<activeProfiles"
-  assert_not_contains "$SANITIZED_SETTINGS_COPY" "evil.group"
+  assert_contains "$SIGNING_SETTINGS_COPY" "paimon-mosaic-pinned-plugins"
+  assert_contains "$SIGNING_SETTINGS_COPY" "file://$TEST_ROOT/"
+  assert_contains "$SIGNING_SETTINGS_COPY" \
+    "<mirrorOf>*,!local-staging</mirrorOf>"
+  assert_not_contains "$SIGNING_SETTINGS_COPY" "apache.releases.https"
+  assert_not_contains "$SIGNING_SETTINGS_COPY" "release-manager"
+  assert_not_contains "$SIGNING_SETTINGS_COPY" "release-local-repository"
+  assert_not_contains "$SIGNING_SETTINGS_COPY" "org.example.plugins"
+  assert_not_contains "$SIGNING_SETTINGS_COPY" "mirror.invalid"
+  assert_not_contains "$SIGNING_SETTINGS_COPY" "proxy.invalid"
+
+  assert_contains "$NEXUS_SETTINGS_COPY" "paimon-mosaic-pinned-plugins"
+  assert_contains "$NEXUS_SETTINGS_COPY" "file://$TEST_ROOT/"
+  assert_contains "$NEXUS_SETTINGS_COPY" "<mirrorOf>*</mirrorOf>"
+  assert_contains "$NEXUS_SETTINGS_COPY" "apache.releases.https"
+  assert_contains "$NEXUS_SETTINGS_COPY" "release-manager"
+  assert_contains "$NEXUS_SETTINGS_COPY" "proxy.invalid"
+  assert_not_contains "$NEXUS_SETTINGS_COPY" "other-server"
+  assert_not_contains "$NEXUS_SETTINGS_COPY" "release-local-repository"
+  assert_not_contains "$NEXUS_SETTINGS_COPY" "org.example.plugins"
+  assert_not_contains "$NEXUS_SETTINGS_COPY" "mirror.invalid"
+  assert_not_contains "$NEXUS_SETTINGS_COPY" "<profiles"
+  assert_not_contains "$NEXUS_SETTINGS_COPY" "<activeProfiles"
+  assert_not_contains "$NEXUS_SETTINGS_COPY" "evil.group"
   assert_not_contains "$EMPTY_GLOBAL_SETTINGS_COPY" "<server"
   assert_not_contains "$EMPTY_GLOBAL_SETTINGS_COPY" "<profile"
 
@@ -1875,6 +2064,54 @@ EOF
     "maven-gpg-key-fingerprint=89ABCDEF0123456789ABCDEF0123456789ABCDEF"
   assert_contains "$MAVEN_LOG" "maven-gpg-passphrase="
   assert_not_contains "$MAVEN_LOG" "maven-gpg-passphrase=ambient-passphrase"
+
+  signing_runtime_repository=$(
+    sed -n \
+      's/^resolved-goal=sign maven-repo-local=//p' \
+      "$MAVEN_LOG"
+  )
+  nexus_runtime_repository=$(
+    sed -n \
+      's/^resolved-goal=nexus maven-repo-local=//p' \
+      "$MAVEN_LOG"
+  )
+  case "$signing_runtime_repository" in
+    "$TEST_ROOT"/paimon-mosaic-java-staging.*/maven-signing-runtime) ;;
+    *)
+      fail "signing Maven did not use its isolated runtime repository: \
+$signing_runtime_repository"
+      ;;
+  esac
+  case "$nexus_runtime_repository" in
+    "$TEST_ROOT"/paimon-mosaic-java-staging.*/maven-nexus-runtime) ;;
+    *)
+      fail "Nexus Maven did not use its isolated runtime repository: \
+$nexus_runtime_repository"
+      ;;
+  esac
+  if [[ "$signing_runtime_repository" == "$nexus_runtime_repository" ]]; then
+    fail "signing and Nexus must use distinct isolated Maven repositories"
+  fi
+}
+
+test_pinned_plugin_download_digest_mismatch_stops_before_maven() {
+  local mutation
+
+  new_fixture
+  keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+  printf 'fake KEYS\n' > "$keys"
+  mutation=org/example/pinned-dependency/1.0/pinned-dependency-1.0.jar
+  if FAKE_PLUGIN_DOWNLOAD_MUTATION="$mutation" \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      --keys-file "$keys" \
+      > "$OUTPUT_LOG" 2>&1; then
+    fail "tampered pinned Maven dependency was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" \
+    "Pinned Maven plugin artifact digest mismatch"
+  assert_maven_not_invoked
+  assert_not_contains "$NEXUS_CALLED_LOG" "called"
 }
 
 test_real_deploy_uses_only_two_direct_plugin_goals() {
@@ -1962,6 +2199,45 @@ test_file_repository_payload_and_allowlist_gate_nexus() {
   fi
   assert_contains "$OUTPUT_LOG" "contains a symlink"
   assert_not_contains "$NEXUS_CALLED_LOG" "called"
+}
+
+test_signing_cannot_mutate_frozen_input_and_repository_together() {
+  new_fixture
+  keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+  printf 'fake KEYS\n' > "$keys"
+  if FAKE_MUTATE_INPUT_AND_REPOSITORY=main \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      --keys-file "$keys" \
+      > "$OUTPUT_LOG" 2>&1; then
+    fail "matching input and repository mutation after signing was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" \
+    "Frozen Java staging input changed after signing"
+  assert_not_contains "$NEXUS_CALLED_LOG" "called"
+}
+
+test_signing_cannot_mutate_pinned_plugin_closure_before_upload() {
+  local mutation
+
+  for mutation in \
+    org/sonatype/plugins/nexus-staging-maven-plugin/1.7.0/nexus-staging-maven-plugin-1.7.0.jar \
+    org/example/pinned-dependency/1.0/pinned-dependency-1.0.jar; do
+    new_fixture
+    keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+    printf 'fake KEYS\n' > "$keys"
+    if FAKE_MUTATE_PINNED_PLUGIN_AFTER_SIGN="$mutation" \
+      run_script \
+        --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+        --keys-file "$keys" \
+        > "$OUTPUT_LOG" 2>&1; then
+      fail "changed pinned Maven plugin closure was accepted after signing: \
+$mutation"
+    fi
+    assert_contains "$OUTPUT_LOG" \
+      "Pinned Maven plugin artifact digest mismatch"
+    assert_not_contains "$NEXUS_CALLED_LOG" "called"
+  done
 }
 
 test_missing_bad_or_wrong_key_signature_blocks_nexus() {
@@ -2244,9 +2520,12 @@ run_test test_dry_run_invokes_no_maven_or_gpg
 run_test test_real_deploy_requires_full_and_explicit_signing_fingerprint
 run_test test_real_deploy_requires_local_and_asf_signing_key
 run_test test_real_deploy_downloads_pinned_asf_keys_by_default
-run_test test_settings_and_bc_environment_cannot_rewrite_signing_inputs
+run_test test_settings_and_environment_cannot_control_plugin_resolution_or_signing_inputs
+run_test test_pinned_plugin_download_digest_mismatch_stops_before_maven
 run_test test_real_deploy_uses_only_two_direct_plugin_goals
 run_test test_file_repository_payload_and_allowlist_gate_nexus
+run_test test_signing_cannot_mutate_frozen_input_and_repository_together
+run_test test_signing_cannot_mutate_pinned_plugin_closure_before_upload
 run_test test_missing_bad_or_wrong_key_signature_blocks_nexus
 run_test test_final_provenance_boundary_runs_after_signatures
 run_test test_maven_and_jvm_environment_is_scrubbed

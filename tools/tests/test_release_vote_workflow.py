@@ -67,6 +67,8 @@ REQUIRED_GATE_PATHS = {
     "java/pom.xml",
     "tools/create_source_release.sh",
     "tools/deploy_java_staging.sh",
+    "tools/java-staging-maven-plugins.sha256",
+    "tools/prepare_java_staging_maven_plugins.py",
     "tools/update_branch_version.sh",
     "tools/validate_java_staging_artifacts.sh",
     "tools/verify_release_versions.py",
@@ -154,6 +156,7 @@ python3 tools/verify_source_archive.py verify \\
 """
 GATE_STATIC_COMMAND = """set -euo pipefail
 python -m compileall -q \\
+  tools/prepare_java_staging_maven_plugins.py \\
   tools/verify_release_versions.py \\
   tools/verify_source_archive.py \\
   tools/tests/test_create_source_release.py \\
@@ -907,9 +910,8 @@ def test_release_documentation_keeps_java_credentials_local() -> None:
         in source
     )
     assert 'STAGING_PROFILE_ID="PAIMON_NEXUS_STAGING_PROFILE_ID"' in source
-    assert (
-        "nexus-staging-maven-plugin:1.7.0:rc-list-profiles" in source
-    )
+    assert "https://repository.apache.org/#stagingProfiles" in source
+    assert "nexus-staging-maven-plugin:1.7.0:rc-list-profiles" not in source
     assert "maven-gpg-plugin:3.2.8:sign-and-deploy-file" in source
     assert (
         "nexus-staging-maven-plugin:1.7.0:deploy-staged-repository"

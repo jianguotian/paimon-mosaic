@@ -64,6 +64,9 @@ NEXUS_URL=https://repository.apache.org/
 NEXUS_SERVER_ID=apache.releases.https
 GPG_PLUGIN_GOAL=org.apache.maven.plugins:maven-gpg-plugin:3.2.8:sign-and-deploy-file
 NEXUS_PLUGIN_GOAL=org.sonatype.plugins:nexus-staging-maven-plugin:1.7.0:deploy-staged-repository
+MAVEN_CENTRAL_URL=https://repo.maven.apache.org/maven2
+MAVEN_PLUGIN_LOCK="$SCRIPT_DIR/java-staging-maven-plugins.sha256"
+PINNED_MAVEN_MIRROR_ID=paimon-mosaic-pinned-plugins
 
 usage() {
   cat <<'EOF'
@@ -306,7 +309,7 @@ if [[ "$DRY_RUN" != true ]]; then
     fi
   done
 fi
-if [[ "$DRY_RUN" != true && -z "$KEYS_FILE" ]] &&
+if [[ "$DRY_RUN" != true ]] &&
   ! command -v "$CURL" >/dev/null 2>&1; then
   echo "Required command not found: $CURL" >&2
   exit 1
@@ -1122,13 +1125,33 @@ validate_asf_keys_membership() {
 validate_local_signing_key
 validate_asf_keys_membership
 
-SANITIZED_MAVEN_SETTINGS="$STAGING_ROOT/maven-settings.xml"
+if [[ -L "$MAVEN_PLUGIN_LOCK" || ! -f "$MAVEN_PLUGIN_LOCK" ]]; then
+  echo "Pinned Maven plugin lock is missing or unsafe: $MAVEN_PLUGIN_LOCK" >&2
+  exit 1
+fi
+
+PINNED_MAVEN_REPOSITORY="$STAGING_ROOT/pinned-maven-plugins"
+install -d -m 700 "$PINNED_MAVEN_REPOSITORY"
+PINNED_MAVEN_REPOSITORY_URI=$(
+  "$PYTHON" \
+    "$SCRIPT_DIR/prepare_java_staging_maven_plugins.py" \
+    prepare \
+    "$MAVEN_PLUGIN_LOCK" \
+    "$PINNED_MAVEN_REPOSITORY" \
+    "$CURL"
+)
+
+SIGNING_MAVEN_SETTINGS="$STAGING_ROOT/maven-signing-settings.xml"
+NEXUS_MAVEN_SETTINGS="$STAGING_ROOT/maven-nexus-settings.xml"
 EMPTY_GLOBAL_MAVEN_SETTINGS="$STAGING_ROOT/maven-global-settings.xml"
 "$PYTHON" - \
   "$SOURCE_MAVEN_SETTINGS" \
-  "$SANITIZED_MAVEN_SETTINGS" \
+  "$SIGNING_MAVEN_SETTINGS" \
+  "$NEXUS_MAVEN_SETTINGS" \
   "$EMPTY_GLOBAL_MAVEN_SETTINGS" \
-  "$NEXUS_SERVER_ID" <<'PY'
+  "$NEXUS_SERVER_ID" \
+  "$PINNED_MAVEN_MIRROR_ID" \
+  "$PINNED_MAVEN_REPOSITORY_URI" <<'PY'
 import copy
 import os
 import sys
@@ -1142,9 +1165,12 @@ def fail(message):
 
 
 source = Path(sys.argv[1])
-destination = Path(sys.argv[2])
-global_destination = Path(sys.argv[3])
-server_id = sys.argv[4]
+signing_destination = Path(sys.argv[2])
+nexus_destination = Path(sys.argv[3])
+global_destination = Path(sys.argv[4])
+server_id = sys.argv[5]
+mirror_id = sys.argv[6]
+mirror_url = sys.argv[7]
 if source.is_symlink() or not source.is_file():
     fail("Maven settings source is missing or unsafe: {}".format(source))
 try:
@@ -1205,25 +1231,34 @@ if len(matches) != 1:
         )
     )
 
-sanitized = ET.Element(original.tag, dict(original.attrib))
-for name in ("localRepository", "pluginGroups"):
-    if name in children:
-        sanitized.append(copy.deepcopy(children[name]))
-
-sanitized_servers = ET.SubElement(
-    sanitized,
+signing = ET.Element(original.tag, dict(original.attrib))
+nexus = ET.Element(original.tag, dict(original.attrib))
+nexus_servers = ET.SubElement(
+    nexus,
     qualified("servers"),
     dict(servers.attrib),
 )
-sanitized_servers.append(copy.deepcopy(matches[0]))
+nexus_servers.append(copy.deepcopy(matches[0]))
 
-for name in ("mirrors", "proxies"):
-    if name in children:
-        sanitized.append(copy.deepcopy(children[name]))
+
+def add_pinned_mirror(root, mirror_of):
+    mirrors = ET.SubElement(root, qualified("mirrors"))
+    mirror = ET.SubElement(mirrors, qualified("mirror"))
+    ET.SubElement(mirror, qualified("id")).text = mirror_id
+    ET.SubElement(mirror, qualified("url")).text = mirror_url
+    ET.SubElement(mirror, qualified("mirrorOf")).text = mirror_of
+
+
+add_pinned_mirror(signing, "*,!local-staging")
+add_pinned_mirror(nexus, "*")
+
+if "proxies" in children:
+    nexus.append(copy.deepcopy(children["proxies"]))
 
 empty_global = ET.Element(original.tag, dict(original.attrib))
 for output, root in (
-    (destination, sanitized),
+    (signing_destination, signing),
+    (nexus_destination, nexus),
     (global_destination, empty_global),
 ):
     try:
@@ -1245,7 +1280,13 @@ PY
 
 MAVEN_TOOL_DIR="$STAGING_ROOT/maven-tool"
 LOCAL_MAVEN_REPO="$STAGING_ROOT/file-repository"
-install -d -m 700 "$MAVEN_TOOL_DIR" "$LOCAL_MAVEN_REPO"
+SIGNING_MAVEN_RUNTIME_REPO="$STAGING_ROOT/maven-signing-runtime"
+NEXUS_MAVEN_RUNTIME_REPO="$STAGING_ROOT/maven-nexus-runtime"
+install -d -m 700 \
+  "$MAVEN_TOOL_DIR" \
+  "$LOCAL_MAVEN_REPO" \
+  "$SIGNING_MAVEN_RUNTIME_REPO" \
+  "$NEXUS_MAVEN_RUNTIME_REPO"
 MAVEN_TOOL_POM="$MAVEN_TOOL_DIR/pom.xml"
 cat > "$MAVEN_TOOL_POM" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1261,14 +1302,58 @@ chmod 600 "$MAVEN_TOOL_POM"
 MAIN_JAR="$JAVA_PACKAGE_DIR/mosaic-${RELEASE_VERSION}.jar"
 SOURCES_JAR="$JAVA_PACKAGE_DIR/mosaic-${RELEASE_VERSION}-sources.jar"
 JAVADOC_JAR="$JAVA_PACKAGE_DIR/mosaic-${RELEASE_VERSION}-javadoc.jar"
+FROZEN_JAVA_PAYLOADS=$(
+  "$PYTHON" - \
+    "$MAIN_JAR" \
+    "$SOURCES_JAR" \
+    "$JAVADOC_JAR" \
+    "$SIGNED_POM" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
 
-MAVEN_BASE=(
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            value.update(chunk)
+    return value.hexdigest()
+
+
+labels = ("main", "sources", "javadoc", "pom")
+for label, value in zip(labels, sys.argv[1:5]):
+    path = Path(value)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+        fail("Frozen Java staging input is missing or unsafe: {}".format(path))
+    print("{}\t{}\t{}".format(label, path.stat().st_size, digest(path)))
+PY
+)
+
+MAVEN_COMMON=(
   "$MVN"
   -B
   -ntp
   -f "$MAVEN_TOOL_POM"
-  -s "$SANITIZED_MAVEN_SETTINGS"
   -gs "$EMPTY_GLOBAL_MAVEN_SETTINGS"
+)
+SIGNING_MAVEN_BASE=(
+  "${MAVEN_COMMON[@]}"
+  -s "$SIGNING_MAVEN_SETTINGS"
+  "-Dmaven.repo.local=$SIGNING_MAVEN_RUNTIME_REPO"
+)
+NEXUS_MAVEN_BASE=(
+  "${MAVEN_COMMON[@]}"
+  -s "$NEXUS_MAVEN_SETTINGS"
+  "-Dmaven.repo.local=$NEXUS_MAVEN_RUNTIME_REPO"
 )
 
 run_maven() {
@@ -1294,7 +1379,7 @@ run_maven() {
 
 echo "Signing the frozen CI Java candidate into a private file:// repository."
 run_maven \
-  "${MAVEN_BASE[@]}" \
+  "${SIGNING_MAVEN_BASE[@]}" \
   "$GPG_PLUGIN_GOAL" \
   -DgroupId=org.apache.paimon \
   -DartifactId=mosaic \
@@ -1316,13 +1401,15 @@ run_maven \
 
 LOCAL_VERSION_DIR="$LOCAL_MAVEN_REPO/org/apache/paimon/mosaic/$RELEASE_VERSION"
 
-"$PYTHON" - \
-  "$LOCAL_MAVEN_REPO" \
-  "$RELEASE_VERSION" \
-  "$MAIN_JAR" \
-  "$SOURCES_JAR" \
-  "$JAVADOC_JAR" \
-  "$SIGNED_POM" <<'PY'
+verify_frozen_java_payloads() {
+  "$PYTHON" - \
+    "$FROZEN_JAVA_PAYLOADS" \
+    "$LOCAL_MAVEN_REPO" \
+    "$RELEASE_VERSION" \
+    "$MAIN_JAR" \
+    "$SOURCES_JAR" \
+    "$JAVADOC_JAR" \
+    "$SIGNED_POM" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
@@ -1344,11 +1431,32 @@ def digest(path):
     return value.hexdigest()
 
 
-root = Path(sys.argv[1])
-version = sys.argv[2]
-inputs = tuple(Path(value) for value in sys.argv[3:7])
+frozen_lines = sys.argv[1].splitlines()
+root = Path(sys.argv[2])
+version = sys.argv[3]
+inputs = tuple(Path(value) for value in sys.argv[4:8])
 if root.is_symlink() or not root.is_dir():
     fail("Private Maven repository is missing or unsafe")
+
+labels = ("main", "sources", "javadoc", "pom")
+frozen = {}
+for line in frozen_lines:
+    parts = line.split("\t")
+    if len(parts) != 3:
+        fail("Frozen Java staging payload manifest is malformed")
+    label, size_text, expected_digest = parts
+    if (
+        label not in labels
+        or label in frozen
+        or not size_text.isdigit()
+        or int(size_text) <= 0
+        or len(expected_digest) != 64
+        or any(character not in "0123456789abcdef" for character in expected_digest)
+    ):
+        fail("Frozen Java staging payload manifest is malformed")
+    frozen[label] = (int(size_text), expected_digest)
+if set(frozen) != set(labels):
+    fail("Frozen Java staging payload manifest is incomplete")
 
 artifact_dir = Path("org/apache/paimon/mosaic")
 version_dir = artifact_dir / version
@@ -1439,21 +1547,33 @@ if seen_payloads != payload_set or seen_signatures != signature_set:
     )
 
 repository_payloads = tuple(root / version_dir / name for name in payload_names)
-for source, deployed in zip(inputs, repository_payloads):
+for label, source, deployed in zip(labels, inputs, repository_payloads):
+    expected_size, expected_digest = frozen[label]
     if (
         source.is_symlink()
-        or deployed.is_symlink()
         or not source.is_file()
+        or source.stat().st_size != expected_size
+        or digest(source) != expected_digest
+    ):
+        fail(
+            "Frozen Java staging input changed after signing: {}".format(
+                source.name
+            )
+        )
+    if (
+        deployed.is_symlink()
         or not deployed.is_file()
-        or source.stat().st_size == 0
-        or deployed.stat().st_size == 0
-        or digest(source) != digest(deployed)
+        or deployed.stat().st_size != expected_size
+        or digest(deployed) != expected_digest
     ):
         fail(
             "Private Maven repository payload differs from frozen input: {}"
             .format(deployed.name)
         )
 PY
+}
+
+verify_frozen_java_payloads
 
 verify_local_signature() {
   local payload=$1
@@ -1509,10 +1629,16 @@ verify_local_signature "$LOCAL_VERSION_DIR/mosaic-${RELEASE_VERSION}.pom"
 # discards the private repository through the EXIT trap and stops here.
 validate_frozen_provenance
 check_checkout_clean
+verify_frozen_java_payloads
+"$PYTHON" \
+  "$SCRIPT_DIR/prepare_java_staging_maven_plugins.py" \
+  verify \
+  "$MAVEN_PLUGIN_LOCK" \
+  "$PINNED_MAVEN_REPOSITORY"
 
 echo "Uploading the verified private repository to Apache Nexus staging."
 run_maven \
-  "${MAVEN_BASE[@]}" \
+  "${NEXUS_MAVEN_BASE[@]}" \
   "$NEXUS_PLUGIN_GOAL" \
   "-DrepositoryDirectory=$LOCAL_MAVEN_REPO" \
   "-DnexusUrl=$NEXUS_URL" \

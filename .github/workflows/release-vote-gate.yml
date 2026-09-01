@@ -28,6 +28,8 @@ on:
       - "java/pom.xml"
       - "tools/create_source_release.sh"
       - "tools/deploy_java_staging.sh"
+      - "tools/java-staging-maven-plugins.sha256"
+      - "tools/prepare_java_staging_maven_plugins.py"
       - "tools/update_branch_version.sh"
       - "tools/validate_java_staging_artifacts.sh"
       - "tools/verify_release_versions.py"
@@ -48,6 +50,8 @@ on:
       - "java/pom.xml"
       - "tools/create_source_release.sh"
       - "tools/deploy_java_staging.sh"
+      - "tools/java-staging-maven-plugins.sha256"
+      - "tools/prepare_java_staging_maven_plugins.py"
       - "tools/update_branch_version.sh"
       - "tools/validate_java_staging_artifacts.sh"
       - "tools/verify_release_versions.py"
@@ -116,6 +120,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m compileall -q \
+            tools/prepare_java_staging_maven_plugins.py \
             tools/verify_release_versions.py \
             tools/verify_source_archive.py \
             tools/tests/test_create_source_release.py \
