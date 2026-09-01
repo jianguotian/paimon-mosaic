@@ -19,6 +19,8 @@ use std::collections::HashMap;
 
 const TOKEN_BASE: usize = 0x80;
 const MAX_RULES: usize = 128;
+const PAIR_TABLE_SIZE: usize = 1 << 16;
+const DENSE_PAIR_THRESHOLD: usize = 4_096;
 
 pub fn is_ascii_only(names: &[&[u8]]) -> bool {
     names.iter().all(|name| name.iter().all(|&b| b & 0x80 == 0))
@@ -31,21 +33,22 @@ pub fn build_vocabulary(names: &[&[u8]]) -> Vec<[u8; 2]> {
         .collect();
 
     let mut rules = Vec::new();
+    let use_dense_counter = tokens
+        .iter()
+        .map(|seq| seq.len().saturating_sub(1))
+        .sum::<usize>()
+        >= DENSE_PAIR_THRESHOLD;
+    let mut pair_counts = use_dense_counter.then(|| vec![0u32; PAIR_TABLE_SIZE]);
+    let mut touched_pairs = Vec::new();
 
     for _ in 0..MAX_RULES {
-        let mut pair_counts: HashMap<u32, u32> = HashMap::new();
-        for seq in &tokens {
-            for w in seq.windows(2) {
-                let pair = (w[0] as u32) << 16 | w[1] as u32;
-                *pair_counts.entry(pair).or_default() += 1;
-            }
-        }
-
-        let best = pair_counts.iter().max_by_key(|&(&k, &v)| (v, k));
+        let best = if let Some(pair_counts) = &mut pair_counts {
+            most_frequent_pair_dense(&tokens, pair_counts, &mut touched_pairs)
+        } else {
+            most_frequent_pair_hashmap(&tokens)
+        };
         match best {
-            Some((&pair, &count)) if count > 1 => {
-                let left = (pair >> 16) as u16;
-                let right = (pair & 0xFFFF) as u16;
+            Some((left, right, count)) if count > 1 => {
                 let new_token = (TOKEN_BASE + rules.len()) as u16;
                 rules.push([left as u8, right as u8]);
 
@@ -58,6 +61,57 @@ pub fn build_vocabulary(names: &[&[u8]]) -> Vec<[u8; 2]> {
     }
 
     rules
+}
+
+fn most_frequent_pair_dense(
+    tokens: &[Vec<u16>],
+    pair_counts: &mut [u32],
+    touched_pairs: &mut Vec<u16>,
+) -> Option<(u16, u16, u32)> {
+    debug_assert_eq!(pair_counts.len(), PAIR_TABLE_SIZE);
+    for pair in touched_pairs.drain(..) {
+        pair_counts[pair as usize] = 0;
+    }
+
+    let mut best_pair = 0usize;
+    let mut best_count = 0u32;
+    for seq in tokens {
+        for pair in seq.windows(2) {
+            debug_assert!(pair[0] <= u8::MAX as u16);
+            debug_assert!(pair[1] <= u8::MAX as u16);
+            let pair = ((pair[0] as usize) << 8) | pair[1] as usize;
+            if pair_counts[pair] == 0 {
+                touched_pairs.push(pair as u16);
+            }
+            pair_counts[pair] += 1;
+            let count = pair_counts[pair];
+            if count > best_count || (count == best_count && pair > best_pair) {
+                best_pair = pair;
+                best_count = count;
+            }
+        }
+    }
+
+    (best_count != 0).then_some((
+        (best_pair >> 8) as u16,
+        (best_pair & 0xff) as u16,
+        best_count,
+    ))
+}
+
+fn most_frequent_pair_hashmap(tokens: &[Vec<u16>]) -> Option<(u16, u16, u32)> {
+    let mut pair_counts: HashMap<u32, u32> = HashMap::new();
+    for seq in tokens {
+        for pair in seq.windows(2) {
+            let pair = (pair[0] as u32) << 16 | pair[1] as u32;
+            *pair_counts.entry(pair).or_default() += 1;
+        }
+    }
+
+    pair_counts
+        .into_iter()
+        .max_by_key(|&(pair, count)| (count, pair))
+        .map(|(pair, count)| ((pair >> 16) as u16, pair as u16, count))
 }
 
 fn replace_pair(seq: &mut Vec<u16>, left: u16, right: u16, new_token: u16) {
@@ -111,6 +165,42 @@ fn expand(token: usize, rules: &[[u8; 2]], out: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    fn reference_build_vocabulary(names: &[&[u8]]) -> Vec<[u8; 2]> {
+        let mut tokens: Vec<Vec<u16>> = names
+            .iter()
+            .map(|name| name.iter().map(|&b| b as u16).collect())
+            .collect();
+        let mut rules = Vec::new();
+
+        for _ in 0..MAX_RULES {
+            let mut pair_counts: HashMap<u32, u32> = HashMap::new();
+            for seq in &tokens {
+                for pair in seq.windows(2) {
+                    let pair = (pair[0] as u32) << 16 | pair[1] as u32;
+                    *pair_counts.entry(pair).or_default() += 1;
+                }
+            }
+
+            match pair_counts
+                .iter()
+                .max_by_key(|&(&pair, &count)| (count, pair))
+            {
+                Some((&pair, &count)) if count > 1 => {
+                    let left = (pair >> 16) as u16;
+                    let right = pair as u16;
+                    let new_token = (TOKEN_BASE + rules.len()) as u16;
+                    rules.push([left as u8, right as u8]);
+                    for seq in &mut tokens {
+                        replace_pair(seq, left, right, new_token);
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        rules
+    }
+
     #[test]
     fn test_bpe_encode() {
         let names: Vec<&[u8]> = vec![
@@ -132,5 +222,44 @@ mod tests {
     fn test_ascii_only() {
         assert!(is_ascii_only(&[b"hello", b"world"]));
         assert!(!is_ascii_only(&[b"hello", &[0x80, 0x81]]));
+    }
+
+    #[test]
+    fn test_dense_pair_counter_reuses_storage_and_preserves_tie_breaking() {
+        let mut counts = vec![0; 1 << 16];
+        let mut touched = Vec::new();
+
+        let first = vec![vec![1, 2, 1, 3]];
+        assert_eq!(
+            most_frequent_pair_dense(&first, &mut counts, &mut touched),
+            Some((2, 1, 1))
+        );
+
+        let second = vec![vec![255, 254, 255, 254]];
+        assert_eq!(
+            most_frequent_pair_dense(&second, &mut counts, &mut touched),
+            Some((255, 254, 2))
+        );
+    }
+
+    #[test]
+    fn test_dense_pair_counter_matches_hashmap_reference() {
+        let mut state = 1u64;
+        for _ in 0..32 {
+            let mut names = Vec::new();
+            for _ in 0..256 {
+                let len = 4 + (state as usize % 28);
+                let mut name = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    name.push(b'a' + ((state >> 32) % 26) as u8);
+                }
+                names.push(name);
+            }
+            let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+            assert_eq!(build_vocabulary(&refs), reference_build_vocabulary(&refs));
+        }
     }
 }
