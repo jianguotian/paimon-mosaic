@@ -17,7 +17,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use jni::errors::Error as JniError;
 use jni::objects::{
     GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JThrowable, JValue,
 };
-use jni::sys::{jint, jlong, jlongArray};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jlongArray};
 use jni::JNIEnv;
 use jni::JavaVM;
 
@@ -37,6 +37,8 @@ use arrow_schema::Schema;
 use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess, RowGroupReader};
 use mosaic_core::spec::*;
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+
+mod columnar_json;
 
 fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<String>() {
@@ -196,6 +198,57 @@ impl OutputFile for JniOutputFile {
     fn pos(&self) -> u64 {
         self.pos
     }
+}
+
+impl Write for JniOutputFile {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        OutputFile::write(self, data)?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        OutputFile::flush(self)
+    }
+}
+
+fn new_jni_output_file(
+    env: &mut JNIEnv<'_>,
+    stream: &JObject<'_>,
+) -> Result<JniOutputFile, String> {
+    let stream_ref = env
+        .new_global_ref(stream)
+        .map_err(|error| format!("failed to create output global ref: {}", error))?;
+    if env
+        .exception_check()
+        .map_err(|error| format!("failed to check output global ref exception: {}", error))?
+    {
+        return Err("failed to create output global ref: Java exception was thrown".to_string());
+    }
+    if stream_ref.as_obj().is_null() {
+        return Err("failed to create output global ref: NewGlobalRef returned null".to_string());
+    }
+
+    let write_mid = env
+        .get_method_id("java/io/OutputStream", "write", "([BII)V")
+        .map_err(|error| format!("cannot find OutputStream.write: {}", error))?;
+    let flush_mid = env
+        .get_method_id("java/io/OutputStream", "flush", "()V")
+        .map_err(|error| format!("cannot find OutputStream.flush: {}", error))?;
+    let jvm = env
+        .get_java_vm()
+        .map(Arc::new)
+        .map_err(|error| format!("cannot get JavaVM: {}", error))?;
+
+    Ok(JniOutputFile {
+        jvm,
+        stream_ref,
+        write_mid,
+        flush_mid,
+        pos: 0,
+        cached_array: None,
+        cached_array_len: 0,
+        pending_exception: None,
+    })
 }
 
 // ======================== JniInputFile ========================
@@ -848,6 +901,22 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderFree(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSchemaFingerprint(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jbyteArray {
+    if handle == 0 {
+        return ptr::null_mut();
+    }
+    let rh = unsafe { &*(handle as *const ReaderHandle) };
+    match env.byte_array_from_slice(rh.reader.schema_fingerprint()) {
+        Ok(fingerprint) => fingerprint.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExportSchema(
     _env: JNIEnv,
     _class: JClass,
@@ -1202,6 +1271,203 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
             let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
             throw(&mut env, &panic_message(&e));
             -1
+        }
+    }
+}
+
+// ======================== Geely Columnar JSON ========================
+
+fn format_columnar_json_doubles(
+    env: &mut JNIEnv<'_>,
+    class: &JClass<'_>,
+    bits: &[u64],
+) -> Result<Vec<Vec<u8>>, String> {
+    if bits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bits_array = env
+        .new_long_array(bits.len() as i32)
+        .map_err(|error| format!("failed to allocate DOUBLE bits array: {}", error))?;
+    let java_bits: Vec<jlong> = bits.iter().map(|bits| *bits as jlong).collect();
+    env.set_long_array_region(&bits_array, 0, &java_bits)
+        .map_err(|error| format!("failed to populate DOUBLE bits array: {}", error))?;
+
+    let result = env
+        .call_static_method(
+            class,
+            "formatColumnarJsonDoubles",
+            "([J)[Ljava/lang/String;",
+            &[JValue::Object(bits_array.as_ref())],
+        )
+        .map_err(|error| format!("failed to format DOUBLE values in Java: {}", error))?
+        .l()
+        .map_err(|error| format!("Java DOUBLE formatter returned a non-object: {}", error))?;
+    if result.is_null() {
+        return Err("Java DOUBLE formatter returned null".to_string());
+    }
+    let values_array = JObjectArray::from(result);
+    let length = env
+        .get_array_length(&values_array)
+        .map_err(|error| format!("failed to read Java DOUBLE strings length: {}", error))?;
+    if length as usize != bits.len() {
+        return Err(format!(
+            "Java DOUBLE formatter returned {} strings for {} values",
+            length,
+            bits.len()
+        ));
+    }
+
+    let mut values = Vec::with_capacity(bits.len());
+    for index in 0..length {
+        let object = env
+            .get_object_array_element(&values_array, index)
+            .map_err(|error| format!("failed to read Java DOUBLE string: {}", error))?;
+        if object.is_null() {
+            return Err(format!(
+                "Java DOUBLE formatter returned null at index {}",
+                index
+            ));
+        }
+        let string = JString::from(object);
+        // SAFETY: formatColumnarJsonDoubles has the JNI return type String[], and the element was
+        // checked for null above. Avoid get_string's per-element class local references.
+        let value: String = unsafe { env.get_string_unchecked(&string) }
+            .map_err(|error| format!("failed to copy Java DOUBLE string: {}", error))?
+            .into();
+        env.delete_local_ref(string)
+            .map_err(|error| format!("failed to release Java DOUBLE string: {}", error))?;
+        values.push(value.into_bytes());
+    }
+    Ok(values)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteGeelyColumnarJson(
+    env: JNIEnv,
+    class: JClass,
+    handle: jlong,
+    output: JObject,
+) -> jboolean {
+    write_geely_columnar_json(env, class, handle, output, false)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteGeelyColumnarJsonTrusted(
+    env: JNIEnv,
+    class: JClass,
+    handle: jlong,
+    output: JObject,
+) -> jboolean {
+    write_geely_columnar_json(env, class, handle, output, true)
+}
+
+fn write_geely_columnar_json(
+    mut env: JNIEnv,
+    class: JClass,
+    handle: jlong,
+    output: JObject,
+    trusted: bool,
+) -> jboolean {
+    const JSON_BUFFER_BYTES: usize = 1024 * 1024;
+
+    let raw_env = env.get_raw();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle == 0 {
+            throw(&mut env, "null row group handle");
+            return 0;
+        }
+
+        let row_group = unsafe { &*(handle as *const RowGroupReaderHandle) };
+        let preflight_result = if trusted {
+            columnar_json::prepare_encoded_trusted(&row_group.inner)
+        } else {
+            columnar_json::prepare_encoded(&row_group.inner)
+        };
+        let preflight = match preflight_result {
+            Ok(None) => return 0,
+            Ok(Some(preflight)) => preflight,
+            Err(error) => {
+                throw_io_error(
+                    &mut env,
+                    &error,
+                    &format!("Geely columnar JSON compatibility check failed: {}", error),
+                );
+                return 0;
+            }
+        };
+        let double_values =
+            match format_columnar_json_doubles(&mut env, &class, preflight.java_double_bits()) {
+                Ok(values) => values,
+                Err(error) => {
+                    throw(
+                        &mut env,
+                        &format!("Geely columnar JSON DOUBLE formatting failed: {}", error),
+                    );
+                    return 0;
+                }
+            };
+        let plan_result = if trusted {
+            preflight.complete_trusted(double_values)
+        } else {
+            preflight.complete(double_values)
+        };
+        let plan = match plan_result {
+            Ok(plan) => plan,
+            Err(error) => {
+                throw(
+                    &mut env,
+                    &format!("Geely columnar JSON DOUBLE validation failed: {}", error),
+                );
+                return 0;
+            }
+        };
+
+        let output = match new_jni_output_file(&mut env, &output) {
+            Ok(output) => output,
+            Err(error) => {
+                throw(&mut env, &error);
+                return 0;
+            }
+        };
+        let mut buffered = BufWriter::with_capacity(JSON_BUFFER_BYTES, output);
+        if let Err(error) =
+            columnar_json::write_encoded_supported(&row_group.inner, &plan, &mut buffered)
+        {
+            let (mut output, _) = buffered.into_parts();
+            let pending = output.take_pending_exception();
+            match pending {
+                Some(exception) => rethrow(&mut env, &exception),
+                None => throw(
+                    &mut env,
+                    &format!("Geely columnar JSON write failed: {}", error),
+                ),
+            }
+            return 0;
+        }
+
+        match buffered.into_inner() {
+            Ok(_) => 1,
+            Err(error) => {
+                let message = error.error().to_string();
+                let (mut output, _) = error.into_inner().into_parts();
+                let pending = output.take_pending_exception();
+                match pending {
+                    Some(exception) => rethrow(&mut env, &exception),
+                    None => throw(
+                        &mut env,
+                        &format!("Geely columnar JSON output failed: {}", message),
+                    ),
+                }
+                0
+            }
+        }
+    }));
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            let mut env = unsafe { JNIEnv::from_raw(raw_env).unwrap() };
+            throw(&mut env, &panic_message(&error));
+            0
         }
     }
 }

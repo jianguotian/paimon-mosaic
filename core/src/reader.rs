@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema};
+use sha2::{Digest, Sha256};
 
 use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
 pub use crate::bucket_reader::{EncodedColumn, EncodedColumnValues, EncodedValueRef};
@@ -278,6 +279,7 @@ pub struct RowGroupMeta {
 
 pub trait ReaderAccess {
     fn schema(&self) -> &MosaicSchema;
+    fn schema_fingerprint(&self) -> &[u8; 32];
     fn num_row_groups(&self) -> usize;
     fn row_group_reader(&self, rg_index: usize) -> io::Result<RowGroupReader>;
     fn row_group_reader_projected(
@@ -315,6 +317,7 @@ pub trait ReaderAccess {
 pub struct MosaicReader<I: InputFile> {
     input: I,
     schema: MosaicSchema,
+    schema_fingerprint: [u8; 32],
     row_group_metas: Vec<RowGroupMeta>,
     compression: u8,
     num_buckets: usize,
@@ -410,6 +413,7 @@ impl<I: InputFile> MosaicReader<I> {
             }
         };
 
+        let schema_fingerprint: [u8; 32] = Sha256::digest(&schema_raw).into();
         let schema = MosaicSchema::deserialize(&schema_raw)?;
 
         if schema.num_buckets != num_buckets {
@@ -505,6 +509,7 @@ impl<I: InputFile> MosaicReader<I> {
         Ok(MosaicReader {
             input,
             schema,
+            schema_fingerprint,
             row_group_metas,
             compression,
             num_buckets,
@@ -534,6 +539,14 @@ impl<I: InputFile> MosaicReader<I> {
 
     pub fn input(&self) -> &I {
         &self.input
+    }
+
+    /// SHA-256 of the serialized schema block read from the file footer.
+    ///
+    /// Language bindings can use this compact value as a cache key without rebuilding or
+    /// exporting an Arrow schema.
+    pub fn schema_fingerprint(&self) -> &[u8; 32] {
+        &self.schema_fingerprint
     }
 
     /// Footer compression code (`spec::COMPRESSION_*`).
@@ -911,6 +924,10 @@ impl<I: InputFile> MosaicReader<I> {
 impl<I: InputFile> ReaderAccess for MosaicReader<I> {
     fn schema(&self) -> &MosaicSchema {
         &self.schema
+    }
+
+    fn schema_fingerprint(&self) -> &[u8; 32] {
+        &self.schema_fingerprint
     }
 
     fn num_row_groups(&self) -> usize {
@@ -1436,9 +1453,25 @@ enum BucketState {
     },
 }
 
+fn build_global_to_local(num_columns: usize, bucket_to_global: &[Vec<usize>]) -> Vec<usize> {
+    let mut global_to_local = vec![usize::MAX; num_columns];
+    for global_indices in bucket_to_global {
+        for (local_index, &global_index) in global_indices.iter().enumerate() {
+            if global_index < num_columns {
+                debug_assert_eq!(global_to_local[global_index], usize::MAX);
+                global_to_local[global_index] = local_index;
+            } else {
+                debug_assert!(false, "global column index out of bounds");
+            }
+        }
+    }
+    global_to_local
+}
+
 pub struct RowGroupReader {
     bucket_states: Vec<Option<BucketState>>,
     bucket_to_global: Vec<Vec<usize>>,
+    global_to_local: Vec<usize>,
     active_buckets: Vec<usize>,
     schema: MosaicSchema,
     num_rows: usize,
@@ -1462,9 +1495,11 @@ impl RowGroupReader {
             .enumerate()
             .filter_map(|(i, s)| if s.is_some() { Some(i) } else { None })
             .collect();
+        let global_to_local = build_global_to_local(num_columns, &bucket_to_global);
         RowGroupReader {
             bucket_states,
             bucket_to_global,
+            global_to_local,
             active_buckets,
             schema,
             num_rows,
@@ -1477,9 +1512,10 @@ impl RowGroupReader {
     /// Dictionary entries for a projected column, or `None` if not dict-encoded.
     pub fn take_dictionary(&self, global_col: usize) -> Option<Vec<Value>> {
         let bucket = self.schema.columns[global_col].bucket_id;
-        let local = self.bucket_to_global[bucket]
-            .iter()
-            .position(|&g| g == global_col)?;
+        let local = *self.global_to_local.get(global_col)?;
+        if local == usize::MAX {
+            return None;
+        }
         match self.bucket_states[bucket].as_ref()? {
             BucketState::Paged { column_readers } => {
                 let d = column_readers[local].as_ref()?.dict_values();
@@ -1542,9 +1578,11 @@ impl RowGroupReader {
 
             let column = &self.schema.columns[global_index];
             let bucket_id = column.bucket_id;
-            let local_index = self.bucket_to_global[bucket_id]
-                .iter()
-                .position(|&index| index == global_index)
+            let local_index = self
+                .global_to_local
+                .get(global_index)
+                .copied()
+                .filter(|&index| index != usize::MAX)
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,

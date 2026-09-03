@@ -119,6 +119,7 @@ final class NativeLib {
     // Reader
     static native long nativeReaderOpen(Object inputFile, long fileLength);
     static native void nativeReaderFree(long handle);
+    static native byte[] nativeReaderSchemaFingerprint(long handle);
     static native int nativeReaderExportSchema(long handle, long schemaAddr);
     static native int nativeReaderNumRowGroups(long handle);
     static native long nativeReaderOpenRowGroup(long handle, int rgIndex);
@@ -127,7 +128,21 @@ final class NativeLib {
     // RowGroupReader
     static native int nativeRowGroupReaderNumRows(long handle);
     static native int nativeRowGroupReaderReadColumns(long handle, long arrayAddr, long schemaAddr);
+    static native boolean nativeRowGroupReaderWriteGeelyColumnarJson(
+            long handle, OutputStream output) throws IOException;
+    static native boolean nativeRowGroupReaderWriteGeelyColumnarJsonTrusted(
+            long handle, OutputStream output) throws IOException;
     static native void nativeRowGroupReaderFree(long handle);
+
+    // Called from jni/src/lib.rs by this exact name and JNI signature. Double.toString keeps the
+    // native output byte-for-byte aligned with the Java fallback on the current JVM.
+    private static String[] formatColumnarJsonDoubles(long[] bits) {
+        String[] values = new String[bits.length];
+        for (int index = 0; index < bits.length; index++) {
+            values[index] = Double.toString(Double.longBitsToDouble(bits[index]));
+        }
+        return values;
+    }
 
     // Row group num rows
     static native int nativeReaderRowGroupNumRows(long handle, int rgIndex);

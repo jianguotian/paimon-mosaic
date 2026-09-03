@@ -20,6 +20,7 @@
 package org.apache.paimon.mosaic;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -35,15 +36,35 @@ public class MosaicReader implements AutoCloseable {
 
     private long handle;
     private final Schema schema;
+    private boolean projected;
 
-    private MosaicReader(long handle, BufferAllocator allocator) {
+    private MosaicReader(long handle, BufferAllocator allocator, SchemaCache schemaCache) {
         this.handle = handle;
+        if (schemaCache != null) {
+            byte[] bytes = NativeLib.nativeReaderSchemaFingerprint(handle);
+            if (bytes == null) {
+                throw new RuntimeException("failed to read schema fingerprint");
+            }
+            SchemaFingerprint fingerprint = new SchemaFingerprint(bytes);
+            Schema cached = schemaCache.get(fingerprint);
+            if (cached != null) {
+                this.schema = cached;
+                return;
+            }
+            this.schema = exportSchema(handle, allocator);
+            schemaCache.put(fingerprint, this.schema);
+            return;
+        }
+        this.schema = exportSchema(handle, allocator);
+    }
+
+    private static Schema exportSchema(long handle, BufferAllocator allocator) {
         try (ArrowSchema cSchema = ArrowSchema.allocateNew(allocator)) {
             int rc = NativeLib.nativeReaderExportSchema(handle, cSchema.memoryAddress());
             if (rc != 0) {
                 throw new RuntimeException("failed to export schema");
             }
-            this.schema = Data.importSchema(allocator, cSchema, null);
+            return Data.importSchema(allocator, cSchema, null);
         }
     }
 
@@ -60,10 +81,89 @@ public class MosaicReader implements AutoCloseable {
             throw new RuntimeException("failed to open reader");
         }
         try {
-            return new MosaicReader(handle, allocator);
+            return new MosaicReader(handle, allocator, null);
         } catch (RuntimeException | Error e) {
             NativeLib.nativeReaderFree(handle);
             throw e;
+        }
+    }
+
+    /**
+     * Opens a Mosaic reader and resolves its Arrow schema through the supplied cache.
+     *
+     * <p>The native reader returns a compact SHA-256 fingerprint first. On a cache hit, Arrow C
+     * Data schema export and Java field construction are skipped.
+     */
+    public static MosaicReader open(
+            InputFile inputFile,
+            long fileLength,
+            BufferAllocator allocator,
+            SchemaCache schemaCache)
+            throws IOException {
+        if (schemaCache == null) {
+            throw new NullPointerException("schemaCache");
+        }
+        long handle = NativeLib.nativeReaderOpen(inputFile, fileLength);
+        if (handle == 0) {
+            throw new RuntimeException("failed to open reader");
+        }
+        try {
+            return new MosaicReader(handle, allocator, schemaCache);
+        } catch (RuntimeException | Error e) {
+            NativeLib.nativeReaderFree(handle);
+            throw e;
+        }
+    }
+
+    /** Caller-owned cache used by the schema-first reader-open path. */
+    public interface SchemaCache {
+        Schema get(SchemaFingerprint fingerprint);
+
+        void put(SchemaFingerprint fingerprint, Schema schema);
+    }
+
+    /** Immutable SHA-256 identity of one serialized Mosaic schema block. */
+    public static final class SchemaFingerprint {
+        private static final int LENGTH = 32;
+
+        private final byte[] bytes;
+        private final int hashCode;
+
+        private SchemaFingerprint(byte[] bytes) {
+            if (bytes.length != LENGTH) {
+                throw new IllegalArgumentException(
+                        "schema fingerprint must be " + LENGTH + " bytes");
+            }
+            this.bytes = bytes.clone();
+            this.hashCode = Arrays.hashCode(this.bytes);
+        }
+
+        public static SchemaFingerprint fromBytes(byte[] bytes) {
+            if (bytes == null) {
+                throw new NullPointerException("bytes");
+            }
+            return new SchemaFingerprint(bytes);
+        }
+
+        public byte[] bytes() {
+            return bytes.clone();
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof SchemaFingerprint)) {
+                return false;
+            }
+            SchemaFingerprint that = (SchemaFingerprint) other;
+            return Arrays.equals(bytes, that.bytes);
+        }
+
+        @Override
+        public int hashCode() {
+            return hashCode;
         }
     }
 
@@ -77,6 +177,31 @@ public class MosaicReader implements AutoCloseable {
 
     public void project(String[] columns) {
         NativeLib.nativeReaderSetProjection(handle, columns);
+        projected = true;
+    }
+
+    /**
+     * Opens one row group for reusable encoded or Arrow access.
+     *
+     * <p>The caller must close the returned reader.
+     *
+     * @throws IOException if {@link InputFile#readFully(long, byte[], int, int)} throws one while
+     *     preparing row-group data; the original exception is propagated
+     */
+    public MosaicRowGroupReader openRowGroup(int rgIndex) throws IOException {
+        if (handle == 0) {
+            throw new IllegalStateException("reader is closed");
+        }
+        long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
+        if (rgHandle == 0) {
+            throw new RuntimeException("failed to open row group " + rgIndex);
+        }
+        try {
+            return new MosaicRowGroupReader(rgHandle, !projected);
+        } catch (RuntimeException | Error e) {
+            NativeLib.nativeRowGroupReaderFree(rgHandle);
+            throw e;
+        }
     }
 
     /**
@@ -86,26 +211,8 @@ public class MosaicReader implements AutoCloseable {
      *     reading row-group data; the original exception is propagated
      */
     public VectorSchemaRoot readRowGroup(int rgIndex, BufferAllocator allocator) throws IOException {
-        long rgHandle = NativeLib.nativeReaderOpenRowGroup(handle, rgIndex);
-        if (rgHandle == 0) {
-            throw new RuntimeException("failed to open row group " + rgIndex);
-        }
-        try {
-            return readRowGroupHandle(rgHandle, allocator);
-        } finally {
-            NativeLib.nativeRowGroupReaderFree(rgHandle);
-        }
-    }
-
-    private VectorSchemaRoot readRowGroupHandle(long rgHandle, BufferAllocator allocator) {
-        try (ArrowArray arrowArray = ArrowArray.allocateNew(allocator);
-             ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
-            int rc = NativeLib.nativeRowGroupReaderReadColumns(
-                    rgHandle, arrowArray.memoryAddress(), arrowSchema.memoryAddress());
-            if (rc != 0) {
-                throw new RuntimeException("readColumns failed");
-            }
-            return Data.importVectorSchemaRoot(allocator, arrowArray, arrowSchema, null);
+        try (MosaicRowGroupReader rowGroup = openRowGroup(rgIndex)) {
+            return rowGroup.readColumns(allocator);
         }
     }
 

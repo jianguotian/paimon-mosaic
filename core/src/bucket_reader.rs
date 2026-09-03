@@ -133,6 +133,44 @@ impl<'a> EncodedColumn<'a> {
             done: false,
         }
     }
+
+    /// Visits each dictionary entry exactly once and validates every encoded row index.
+    ///
+    /// Returns `Ok(false)` when this column is not dictionary-encoded. Null rows do not carry a
+    /// dictionary index and are skipped while validating the index stream.
+    pub fn visit_dictionary<F>(&self, mut visitor: F) -> io::Result<bool>
+    where
+        F: FnMut(EncodedValueRef<'a>) -> io::Result<()>,
+    {
+        if self.encoding != ENCODING_DICT {
+            return Ok(false);
+        }
+
+        for value in self.dict_values {
+            visitor(encoded_value_ref(self.data_type, value)?)?;
+        }
+
+        let mut bit_offset = 0usize;
+        for row in 0..self.num_rows {
+            if self.is_null(row) {
+                continue;
+            }
+            let index = read_bit_packed_checked(
+                self.data,
+                self.data_cursor,
+                bit_offset,
+                self.dict_bit_width,
+            )?;
+            bit_offset += self.dict_bit_width;
+            if index >= self.dict_values.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "corrupt dict index",
+                ));
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// Borrowed scalar value returned by [`EncodedColumnValues`].
@@ -2915,6 +2953,10 @@ mod encoded_column_tests {
             truncated.values().next().unwrap().unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        assert_eq!(
+            truncated.visit_dictionary(|_| Ok(())).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
 
         let out_of_range = EncodedColumn::new(
             &data_type,
@@ -2932,6 +2974,54 @@ mod encoded_column_tests {
             out_of_range.values().next().unwrap().unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        assert_eq!(
+            out_of_range
+                .visit_dictionary(|_| Ok(()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn visits_dictionary_entries_once_and_checks_the_last_index() {
+        let data_type = DataType::Utf8;
+        let placeholder = Value::Null;
+        let dict_values = [
+            Value::String(b"alpha".to_vec()),
+            Value::String(b"beta".to_vec()),
+            Value::String(b"gamma".to_vec()),
+        ];
+        let column = EncodedColumn::new(
+            &data_type,
+            ENCODING_DICT,
+            false,
+            &[],
+            &placeholder,
+            &dict_values,
+            2,
+            &[0x24, 0x03],
+            0,
+            5,
+        );
+
+        let mut entries = Vec::new();
+        let error = column
+            .visit_dictionary(|value| {
+                let EncodedValueRef::Utf8(value) = value else {
+                    panic!("unexpected dictionary value: {value:?}");
+                };
+                entries.push(value.to_vec());
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            entries,
+            [b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+        );
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("corrupt dict index"));
     }
 
     #[test]
