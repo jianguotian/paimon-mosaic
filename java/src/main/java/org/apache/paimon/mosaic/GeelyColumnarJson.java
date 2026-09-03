@@ -46,4 +46,21 @@ public final class GeelyColumnarJson {
         Objects.requireNonNull(output, "output");
         return rowGroup.writeGeelyColumnarJson(output) ? Status.WRITTEN : Status.UNSUPPORTED;
     }
+
+    /**
+     * Attempts the native protocol after the caller has matched the complete physical schema.
+     *
+     * <p>This variant avoids pre-reading non-DOUBLE values: integers, decimals, and strings are
+     * decoded once while generating JSON. Unsupported type or encoding structure still leaves
+     * {@code output} untouched. DOUBLE text is prepared before output to preserve Java formatting.
+     * If decoding or I/O fails after writing begins, the caller must discard the partial output.
+     */
+    public static Status writeTrusted(MosaicRowGroupReader rowGroup, OutputStream output)
+            throws IOException {
+        Objects.requireNonNull(rowGroup, "rowGroup");
+        Objects.requireNonNull(output, "output");
+        return rowGroup.writeTrustedGeelyColumnarJson(output)
+                ? Status.WRITTEN
+                : Status.UNSUPPORTED;
+    }
 }

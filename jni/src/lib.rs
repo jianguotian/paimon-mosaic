@@ -26,7 +26,7 @@ use jni::errors::Error as JniError;
 use jni::objects::{
     GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JThrowable, JValue,
 };
-use jni::sys::{jboolean, jint, jlong, jlongArray};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jlongArray};
 use jni::JNIEnv;
 use jni::JavaVM;
 
@@ -901,6 +901,22 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderFree(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSchemaFingerprint(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jbyteArray {
+    if handle == 0 {
+        return ptr::null_mut();
+    }
+    let rh = unsafe { &*(handle as *const ReaderHandle) };
+    match env.byte_array_from_slice(rh.reader.schema_fingerprint()) {
+        Ok(fingerprint) => fingerprint.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExportSchema(
     _env: JNIEnv,
     _class: JClass,
@@ -1327,12 +1343,32 @@ fn format_columnar_json_doubles(
 
 #[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteGeelyColumnarJson(
-    mut env: JNIEnv,
+    env: JNIEnv,
     class: JClass,
     handle: jlong,
     output: JObject,
 ) -> jboolean {
-    const JSON_BUFFER_BYTES: usize = 256 * 1024;
+    write_geely_columnar_json(env, class, handle, output, false)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteGeelyColumnarJsonTrusted(
+    env: JNIEnv,
+    class: JClass,
+    handle: jlong,
+    output: JObject,
+) -> jboolean {
+    write_geely_columnar_json(env, class, handle, output, true)
+}
+
+fn write_geely_columnar_json(
+    mut env: JNIEnv,
+    class: JClass,
+    handle: jlong,
+    output: JObject,
+    trusted: bool,
+) -> jboolean {
+    const JSON_BUFFER_BYTES: usize = 1024 * 1024;
 
     let raw_env = env.get_raw();
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -1342,7 +1378,12 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
         }
 
         let row_group = unsafe { &*(handle as *const RowGroupReaderHandle) };
-        let preflight = match columnar_json::prepare_encoded(&row_group.inner) {
+        let preflight_result = if trusted {
+            columnar_json::prepare_encoded_trusted(&row_group.inner)
+        } else {
+            columnar_json::prepare_encoded(&row_group.inner)
+        };
+        let preflight = match preflight_result {
             Ok(None) => return 0,
             Ok(Some(preflight)) => preflight,
             Err(error) => {
@@ -1365,7 +1406,12 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
                     return 0;
                 }
             };
-        let plan = match preflight.complete(double_values) {
+        let plan_result = if trusted {
+            preflight.complete_trusted(double_values)
+        } else {
+            preflight.complete(double_values)
+        };
+        let plan = match plan_result {
             Ok(plan) => plan,
             Err(error) => {
                 throw(

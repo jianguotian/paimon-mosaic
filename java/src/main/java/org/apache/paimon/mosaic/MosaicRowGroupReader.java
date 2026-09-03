@@ -82,13 +82,25 @@ public final class MosaicRowGroupReader implements AutoCloseable {
     }
 
     boolean writeGeelyColumnarJson(OutputStream output) throws IOException {
+        return writeGeelyColumnarJson(output, false);
+    }
+
+    boolean writeTrustedGeelyColumnarJson(OutputStream output) throws IOException {
+        return writeGeelyColumnarJson(output, true);
+    }
+
+    private boolean writeGeelyColumnarJson(OutputStream output, boolean trusted)
+            throws IOException {
         long currentHandle = beginUse();
         try {
             if (!columnarJsonAllowed) {
                 throw new IllegalStateException(
                         "Geely columnar JSON requires an unprojected Mosaic row group");
             }
-            return NativeLib.nativeRowGroupReaderWriteGeelyColumnarJson(currentHandle, output);
+            return trusted
+                    ? NativeLib.nativeRowGroupReaderWriteGeelyColumnarJsonTrusted(
+                            currentHandle, output)
+                    : NativeLib.nativeRowGroupReaderWriteGeelyColumnarJson(currentHandle, output);
         } finally {
             endUse();
         }

@@ -29,7 +29,9 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -1662,6 +1664,11 @@ public class MosaicRoundtripTest {
             assertEquals(
                     GeelyColumnarJson.Status.WRITTEN,
                     GeelyColumnarJson.write(rowGroup, output));
+            ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
+            assertArrayEquals(output.toByteArray(), trustedOutput.toByteArray());
             assertEquals(
                     "{\"i\\\"8\":\"-1,,9\",\"i16\":\"0,-7,12\","
                             + "\"i32\":\"-2147483648,0,2147483647\","
@@ -1747,6 +1754,11 @@ public class MosaicRoundtripTest {
             assertEquals(
                     GeelyColumnarJson.Status.WRITTEN,
                     GeelyColumnarJson.write(rowGroup, output));
+            ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
+            assertArrayEquals(output.toByteArray(), trustedOutput.toByteArray());
             String actual =
                     new String(
                             output.toByteArray(),
@@ -1887,6 +1899,13 @@ public class MosaicRoundtripTest {
                     GeelyColumnarJson.Status.UNSUPPORTED,
                     GeelyColumnarJson.write(rowGroup, output));
             assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+            ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
+            trustedOutput.write(9);
+            assertEquals(
+                    GeelyColumnarJson.Status.UNSUPPORTED,
+                    GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
+            assertArrayEquals(new byte[] {9}, trustedOutput.toByteArray());
         }
     }
 
@@ -2125,6 +2144,11 @@ public class MosaicRoundtripTest {
             assertEquals(
                     GeelyColumnarJson.Status.WRITTEN,
                     GeelyColumnarJson.write(rowGroup, output));
+            ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
+            assertEquals(
+                    GeelyColumnarJson.Status.WRITTEN,
+                    GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
+            assertArrayEquals(output.toByteArray(), trustedOutput.toByteArray());
             try (VectorSchemaRoot arrow = rowGroup.readColumns(allocator)) {
                 assertEquals(
                         renderDecimalColumnarJson(arrow),
@@ -2276,6 +2300,13 @@ public class MosaicRoundtripTest {
                         GeelyColumnarJson.Status.UNSUPPORTED,
                         GeelyColumnarJson.write(rowGroup, output));
                 assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+                ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
+                trustedOutput.write(9);
+                assertEquals(
+                        GeelyColumnarJson.Status.UNSUPPORTED,
+                        GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
+                assertArrayEquals(new byte[] {9}, trustedOutput.toByteArray());
             }
         }
     }
@@ -2546,7 +2577,7 @@ public class MosaicRoundtripTest {
                         Arrays.asList(
                                 Field.notNullable(
                                         "value", new ArrowType.Int(32, true))));
-        int rowCount = 100_000;
+        int rowCount = 500_000;
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             IntVector values = (IntVector) root.getVector("value");
@@ -3042,6 +3073,66 @@ public class MosaicRoundtripTest {
             assertFalse(readSchema.getFields().get(1).isNullable());
             assertTrue(readSchema.getFields().get(0).isNullable());
         }
+    }
+
+    @Test
+    public void testSchemaCacheHitSkipsArrowSchemaExport() throws IOException {
+        Schema arrowSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable("value", new ArrowType.Int(32, true)),
+                                Field.nullable("name", ArrowType.Utf8.INSTANCE)));
+        byte[] data = writeToBytes(arrowSchema, writer -> {});
+        Map<MosaicReader.SchemaFingerprint, Schema> schemas = new HashMap<>();
+        MosaicReader.SchemaCache cache =
+                new MosaicReader.SchemaCache() {
+                    @Override
+                    public Schema get(MosaicReader.SchemaFingerprint fingerprint) {
+                        return schemas.get(fingerprint);
+                    }
+
+                    @Override
+                    public void put(MosaicReader.SchemaFingerprint fingerprint, Schema schema) {
+                        schemas.put(fingerprint, schema);
+                    }
+                };
+        InputFile firstInput =
+                (position, buffer, offset, length) ->
+                        System.arraycopy(data, (int) position, buffer, offset, length);
+
+        Schema cached;
+        try (MosaicReader reader =
+                MosaicReader.open(firstInput, data.length, allocator, cache)) {
+            cached = reader.getSchema();
+        }
+        assertEquals(1, schemas.size());
+
+        BufferAllocator closedAllocator = new RootAllocator();
+        closedAllocator.close();
+        InputFile repeatedInput =
+                (position, buffer, offset, length) ->
+                        System.arraycopy(data, (int) position, buffer, offset, length);
+        try (MosaicReader reader =
+                MosaicReader.open(repeatedInput, data.length, closedAllocator, cache)) {
+            assertSame(cached, reader.getSchema());
+        }
+    }
+
+    @Test
+    public void testSchemaFingerprintDefensivelyCopiesBytes() {
+        byte[] bytes = new byte[32];
+        bytes[0] = 7;
+        MosaicReader.SchemaFingerprint fingerprint =
+                MosaicReader.SchemaFingerprint.fromBytes(bytes);
+
+        bytes[0] = 9;
+        byte[] exposed = fingerprint.bytes();
+        exposed[0] = 11;
+
+        assertEquals(7, fingerprint.bytes()[0]);
+        assertEquals(
+                fingerprint,
+                MosaicReader.SchemaFingerprint.fromBytes(fingerprint.bytes()));
     }
 
     @Test

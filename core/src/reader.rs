@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema};
+use sha2::{Digest, Sha256};
 
 use crate::bucket_reader::{read_typed_value, read_variable_value, BucketReader, ColumnPageReader};
 pub use crate::bucket_reader::{EncodedColumn, EncodedColumnValues, EncodedValueRef};
@@ -278,6 +279,7 @@ pub struct RowGroupMeta {
 
 pub trait ReaderAccess {
     fn schema(&self) -> &MosaicSchema;
+    fn schema_fingerprint(&self) -> &[u8; 32];
     fn num_row_groups(&self) -> usize;
     fn row_group_reader(&self, rg_index: usize) -> io::Result<RowGroupReader>;
     fn row_group_reader_projected(
@@ -315,6 +317,7 @@ pub trait ReaderAccess {
 pub struct MosaicReader<I: InputFile> {
     input: I,
     schema: MosaicSchema,
+    schema_fingerprint: [u8; 32],
     row_group_metas: Vec<RowGroupMeta>,
     compression: u8,
     num_buckets: usize,
@@ -410,6 +413,7 @@ impl<I: InputFile> MosaicReader<I> {
             }
         };
 
+        let schema_fingerprint: [u8; 32] = Sha256::digest(&schema_raw).into();
         let schema = MosaicSchema::deserialize(&schema_raw)?;
 
         if schema.num_buckets != num_buckets {
@@ -505,6 +509,7 @@ impl<I: InputFile> MosaicReader<I> {
         Ok(MosaicReader {
             input,
             schema,
+            schema_fingerprint,
             row_group_metas,
             compression,
             num_buckets,
@@ -534,6 +539,14 @@ impl<I: InputFile> MosaicReader<I> {
 
     pub fn input(&self) -> &I {
         &self.input
+    }
+
+    /// SHA-256 of the serialized schema block read from the file footer.
+    ///
+    /// Language bindings can use this compact value as a cache key without rebuilding or
+    /// exporting an Arrow schema.
+    pub fn schema_fingerprint(&self) -> &[u8; 32] {
+        &self.schema_fingerprint
     }
 
     /// Footer compression code (`spec::COMPRESSION_*`).
@@ -911,6 +924,10 @@ impl<I: InputFile> MosaicReader<I> {
 impl<I: InputFile> ReaderAccess for MosaicReader<I> {
     fn schema(&self) -> &MosaicSchema {
         &self.schema
+    }
+
+    fn schema_fingerprint(&self) -> &[u8; 32] {
+        &self.schema_fingerprint
     }
 
     fn num_row_groups(&self) -> usize {

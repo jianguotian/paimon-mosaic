@@ -119,6 +119,7 @@ final class NativeLib {
     // Reader
     static native long nativeReaderOpen(Object inputFile, long fileLength);
     static native void nativeReaderFree(long handle);
+    static native byte[] nativeReaderSchemaFingerprint(long handle);
     static native int nativeReaderExportSchema(long handle, long schemaAddr);
     static native int nativeReaderNumRowGroups(long handle);
     static native long nativeReaderOpenRowGroup(long handle, int rgIndex);
@@ -128,6 +129,8 @@ final class NativeLib {
     static native int nativeRowGroupReaderNumRows(long handle);
     static native int nativeRowGroupReaderReadColumns(long handle, long arrayAddr, long schemaAddr);
     static native boolean nativeRowGroupReaderWriteGeelyColumnarJson(
+            long handle, OutputStream output) throws IOException;
+    static native boolean nativeRowGroupReaderWriteGeelyColumnarJsonTrusted(
             long handle, OutputStream output) throws IOException;
     static native void nativeRowGroupReaderFree(long handle);
 

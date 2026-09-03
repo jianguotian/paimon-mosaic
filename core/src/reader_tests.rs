@@ -5171,3 +5171,50 @@ fn test_unknown_paged_encoding_returns_invalid_data_without_panicking() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("unsupported encoding 255"));
 }
+
+#[test]
+fn reader_schema_fingerprint_is_stable_and_distinguishes_schema() {
+    fn write_file(column_name: &str) -> Vec<u8> {
+        let schema = Schema::new(vec![Field::new(column_name, DataType::Int32, true)]);
+        let mut writer = MosaicWriter::new(
+            MemOutputFile::new(),
+            &schema,
+            WriterOptions {
+                compression: COMPRESSION_ZSTD,
+                num_buckets: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(vec![Some(1), Some(2)]))],
+        )
+        .unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.close().unwrap();
+        writer.output().buf.clone()
+    }
+
+    let first_data = write_file("value");
+    let first = MosaicReader::new(
+        ByteArrayInputFile::new(first_data.clone()),
+        first_data.len() as u64,
+    )
+    .unwrap();
+    let repeated = MosaicReader::new(
+        ByteArrayInputFile::new(first_data.clone()),
+        first_data.len() as u64,
+    )
+    .unwrap();
+    let different_data = write_file("other_value");
+    let different = MosaicReader::new(
+        ByteArrayInputFile::new(different_data.clone()),
+        different_data.len() as u64,
+    )
+    .unwrap();
+
+    assert_eq!(first.schema_fingerprint().len(), 32);
+    assert_eq!(first.schema_fingerprint(), repeated.schema_fingerprint());
+    assert_ne!(first.schema_fingerprint(), different.schema_fingerprint());
+}
