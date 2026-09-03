@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-const TOKEN_BASE: usize = 0x80;
+const TOKEN_BASE: u8 = 0x80;
 const MAX_RULES: usize = 128;
 const PAIR_TABLE_SIZE: usize = 1 << 16;
 const DENSE_PAIR_THRESHOLD: usize = 4_096;
@@ -27,10 +27,11 @@ pub fn is_ascii_only(names: &[&[u8]]) -> bool {
 }
 
 pub fn build_vocabulary(names: &[&[u8]]) -> Vec<[u8; 2]> {
-    let mut tokens: Vec<Vec<u16>> = names
-        .iter()
-        .map(|name| name.iter().map(|&b| b as u16).collect())
-        .collect();
+    build_vocabulary_and_encode(names).0
+}
+
+pub(crate) fn build_vocabulary_and_encode(names: &[&[u8]]) -> (Vec<[u8; 2]>, Vec<Vec<u8>>) {
+    let mut tokens: Vec<Vec<u8>> = names.iter().map(|name| name.to_vec()).collect();
 
     let mut rules = Vec::new();
     let use_dense_counter = tokens
@@ -49,8 +50,8 @@ pub fn build_vocabulary(names: &[&[u8]]) -> Vec<[u8; 2]> {
         };
         match best {
             Some((left, right, count)) if count > 1 => {
-                let new_token = (TOKEN_BASE + rules.len()) as u16;
-                rules.push([left as u8, right as u8]);
+                let new_token = TOKEN_BASE + rules.len() as u8;
+                rules.push([left, right]);
 
                 for seq in &mut tokens {
                     replace_pair(seq, left, right, new_token);
@@ -60,14 +61,14 @@ pub fn build_vocabulary(names: &[&[u8]]) -> Vec<[u8; 2]> {
         }
     }
 
-    rules
+    (rules, tokens)
 }
 
 fn most_frequent_pair_dense(
-    tokens: &[Vec<u16>],
+    tokens: &[Vec<u8>],
     pair_counts: &mut [u32],
     touched_pairs: &mut Vec<u16>,
-) -> Option<(u16, u16, u32)> {
+) -> Option<(u8, u8, u32)> {
     debug_assert_eq!(pair_counts.len(), PAIR_TABLE_SIZE);
     for pair in touched_pairs.drain(..) {
         pair_counts[pair as usize] = 0;
@@ -77,8 +78,6 @@ fn most_frequent_pair_dense(
     let mut best_count = 0u32;
     for seq in tokens {
         for pair in seq.windows(2) {
-            debug_assert!(pair[0] <= u8::MAX as u16);
-            debug_assert!(pair[1] <= u8::MAX as u16);
             let pair = ((pair[0] as usize) << 8) | pair[1] as usize;
             if pair_counts[pair] == 0 {
                 touched_pairs.push(pair as u16);
@@ -92,18 +91,14 @@ fn most_frequent_pair_dense(
         }
     }
 
-    (best_count != 0).then_some((
-        (best_pair >> 8) as u16,
-        (best_pair & 0xff) as u16,
-        best_count,
-    ))
+    (best_count != 0).then_some(((best_pair >> 8) as u8, (best_pair & 0xff) as u8, best_count))
 }
 
-fn most_frequent_pair_hashmap(tokens: &[Vec<u16>]) -> Option<(u16, u16, u32)> {
-    let mut pair_counts: HashMap<u32, u32> = HashMap::new();
+fn most_frequent_pair_hashmap(tokens: &[Vec<u8>]) -> Option<(u8, u8, u32)> {
+    let mut pair_counts: HashMap<u16, u32> = HashMap::new();
     for seq in tokens {
         for pair in seq.windows(2) {
-            let pair = (pair[0] as u32) << 16 | pair[1] as u32;
+            let pair = (pair[0] as u16) << 8 | pair[1] as u16;
             *pair_counts.entry(pair).or_default() += 1;
         }
     }
@@ -111,10 +106,10 @@ fn most_frequent_pair_hashmap(tokens: &[Vec<u16>]) -> Option<(u16, u16, u32)> {
     pair_counts
         .into_iter()
         .max_by_key(|&(pair, count)| (count, pair))
-        .map(|(pair, count)| ((pair >> 16) as u16, pair as u16, count))
+        .map(|(pair, count)| ((pair >> 8) as u8, pair as u8, count))
 }
 
-fn replace_pair(seq: &mut Vec<u16>, left: u16, right: u16, new_token: u16) {
+fn replace_pair(seq: &mut Vec<u8>, left: u8, right: u8, new_token: u8) {
     let mut i = 0;
     let mut out = 0;
     while i < seq.len() {
@@ -131,16 +126,16 @@ fn replace_pair(seq: &mut Vec<u16>, left: u16, right: u16, new_token: u16) {
 }
 
 pub fn encode(name: &[u8], rules: &[[u8; 2]]) -> Vec<u8> {
-    let mut tokens: Vec<u16> = name.iter().map(|&b| b as u16).collect();
+    let mut tokens = name.to_vec();
 
     for (r, rule) in rules.iter().enumerate() {
-        let left = rule[0] as u16;
-        let right = rule[1] as u16;
-        let new_token = (TOKEN_BASE + r) as u16;
+        let left = rule[0];
+        let right = rule[1];
+        let new_token = TOKEN_BASE + r as u8;
         replace_pair(&mut tokens, left, right, new_token);
     }
 
-    tokens.iter().map(|&t| t as u8).collect()
+    tokens
 }
 
 pub fn decode(encoded: &[u8], rules: &[[u8; 2]]) -> Vec<u8> {
@@ -152,10 +147,10 @@ pub fn decode(encoded: &[u8], rules: &[[u8; 2]]) -> Vec<u8> {
 }
 
 fn expand(token: usize, rules: &[[u8; 2]], out: &mut Vec<u8>) {
-    if token < TOKEN_BASE {
+    if token < TOKEN_BASE as usize {
         out.push(token as u8);
     } else {
-        let idx = token - TOKEN_BASE;
+        let idx = token - TOKEN_BASE as usize;
         expand(rules[idx][0] as usize, rules, out);
         expand(rules[idx][1] as usize, rules, out);
     }
@@ -164,6 +159,22 @@ fn expand(token: usize, rules: &[[u8; 2]], out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_replace_pair(seq: &mut Vec<u16>, left: u16, right: u16, new_token: u16) {
+        let mut i = 0;
+        let mut out = 0;
+        while i < seq.len() {
+            if i + 1 < seq.len() && seq[i] == left && seq[i + 1] == right {
+                seq[out] = new_token;
+                i += 2;
+            } else {
+                seq[out] = seq[i];
+                i += 1;
+            }
+            out += 1;
+        }
+        seq.truncate(out);
+    }
 
     fn reference_build_vocabulary(names: &[&[u8]]) -> Vec<[u8; 2]> {
         let mut tokens: Vec<Vec<u16>> = names
@@ -188,10 +199,10 @@ mod tests {
                 Some((&pair, &count)) if count > 1 => {
                     let left = (pair >> 16) as u16;
                     let right = pair as u16;
-                    let new_token = (TOKEN_BASE + rules.len()) as u16;
+                    let new_token = TOKEN_BASE as u16 + rules.len() as u16;
                     rules.push([left as u8, right as u8]);
                     for seq in &mut tokens {
-                        replace_pair(seq, left, right, new_token);
+                        reference_replace_pair(seq, left, right, new_token);
                     }
                 }
                 _ => break,
@@ -216,6 +227,29 @@ mod tests {
             let encoded = encode(name, &rules);
             assert!(encoded.len() <= name.len());
         }
+    }
+
+    #[test]
+    fn test_build_vocabulary_and_encode_matches_separate_encoding() {
+        let mut owned_names = vec![b"aaaaa".to_vec()];
+        owned_names.extend((0..128).map(|i| {
+            format!(
+                "vehicle_data_collection_powertrain_group_{:03}_signal_measurement_{i:05}_value",
+                i % 17
+            )
+            .into_bytes()
+        }));
+        let names: Vec<&[u8]> = owned_names.iter().map(Vec::as_slice).collect();
+
+        let (rules, encoded) = build_vocabulary_and_encode(&names);
+        assert_eq!(rules, reference_build_vocabulary(&names));
+        assert_eq!(
+            encoded,
+            names
+                .iter()
+                .map(|name| encode(name, &rules))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

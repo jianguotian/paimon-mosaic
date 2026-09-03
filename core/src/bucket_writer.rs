@@ -315,13 +315,31 @@ impl BucketWriter {
         }
 
         let typed = downcast_array(array, dt)?;
+        let null_count = array.null_count();
 
-        if array.null_count() == 0 {
+        if null_count == num_new_rows {
+            let nulls = array
+                .nulls()
+                .expect("an all-null array must have a physical null buffer");
+            append_null_bitmap(&mut self.null_bitmaps[col], start_row, nulls);
+            return Ok(0);
+        }
+
+        if null_count == 0 {
             if let Some(col_size) =
                 self.append_no_null_batch(col, &typed, start_row, num_new_rows)?
             {
                 return Ok(col_size);
             }
+        }
+
+        if let TypedArrayRef::TimestampMillis(array) = &typed {
+            return Ok(self.append_nullable_timestamp_millis_batch(
+                col,
+                array,
+                start_row,
+                num_new_rows,
+            ));
         }
 
         let mut col_size = 0usize;
@@ -473,6 +491,42 @@ impl BucketWriter {
         let _ = start_row;
 
         Ok(Some(col_size))
+    }
+
+    fn append_nullable_timestamp_millis_batch(
+        &mut self,
+        col: usize,
+        array: &TimestampMillisecondArray,
+        start_row: usize,
+        num_rows: usize,
+    ) -> usize {
+        let nulls = array
+            .nulls()
+            .expect("nullable timestamp batch must have a physical null buffer");
+        debug_assert!(nulls.null_count() > 0);
+        debug_assert!(nulls.null_count() < num_rows);
+
+        append_null_bitmap(&mut self.null_bitmaps[col], start_row, nulls);
+
+        let valid_count = num_rows - nulls.null_count();
+        self.value_buffers[col].reserve(valid_count * 8);
+        let values = array.values();
+        let mut track_encoding =
+            self.const_tracking[col] || self.dict_tracking[col] != DictTracking::Disabled;
+
+        for row in nulls.valid_indices() {
+            let before = self.value_buffers[col].len();
+            self.value_buffers[col].extend_from_slice(&values[row].to_be_bytes());
+            self.non_null_counts[col] += 1;
+
+            if track_encoding {
+                self.track_encoding_value(col, before, 8);
+                track_encoding =
+                    self.const_tracking[col] || self.dict_tracking[col] != DictTracking::Disabled;
+            }
+        }
+
+        valid_count * 8
     }
 
     fn track_encoding_value(&mut self, col: usize, value_start: usize, value_len: usize) {
@@ -889,6 +943,41 @@ impl BucketWriter {
             }
         }
         size
+    }
+}
+
+fn append_null_bitmap(bitmap: &mut [u8], start_row: usize, nulls: &NullBuffer) {
+    debug_assert!(start_row + nulls.len() <= bitmap.len() * 8);
+
+    let chunks = nulls.inner().bit_chunks();
+    for (chunk, valid_bits) in chunks.iter().enumerate() {
+        or_null_bits(bitmap, start_row + chunk * 64, !valid_bits, 64);
+    }
+
+    let remainder_len = nulls.len() % 64;
+    if remainder_len != 0 {
+        let remainder_mask = (1u64 << remainder_len) - 1;
+        let null_bits = !chunks.remainder_bits() & remainder_mask;
+        or_null_bits(
+            bitmap,
+            start_row + nulls.len() - remainder_len,
+            null_bits,
+            remainder_len,
+        );
+    }
+}
+
+#[inline]
+fn or_null_bits(bitmap: &mut [u8], mut bit_offset: usize, mut bits: u64, mut len: usize) {
+    while len != 0 {
+        let byte_offset = bit_offset / 8;
+        let bit_in_byte = bit_offset % 8;
+        let take = len.min(8 - bit_in_byte);
+        let mask = ((1u16 << take) - 1) as u8;
+        bitmap[byte_offset] |= ((bits as u8) & mask) << bit_in_byte;
+        bits >>= take;
+        bit_offset += take;
+        len -= take;
     }
 }
 
@@ -1773,6 +1862,83 @@ mod tests {
         let data = writer.finish();
         assert_eq!(data[0] & 0x03, ENCODING_DICT);
         assert_eq!((data[0] >> 2) & 0x03, ENCODING_DICT);
+    }
+
+    #[test]
+    fn test_append_null_bitmap_handles_source_and_destination_offsets() {
+        let validity = BooleanBuffer::from(vec![
+            true, false, true, false, false, true, true, false, true, false, true,
+        ]);
+        let nulls = NullBuffer::new(validity).slice(2, 7);
+        let mut bitmap = vec![0b0000_0101, 0, 0];
+
+        append_null_bitmap(&mut bitmap, 3, &nulls);
+
+        assert_eq!(bitmap, vec![0b0011_0101, 0b0000_0001, 0]);
+    }
+
+    #[test]
+    fn test_append_null_bitmap_matches_scalar_copy_across_chunk_boundaries() {
+        for source_offset in 0..8 {
+            for destination_offset in 0..16 {
+                for len in [1, 7, 8, 9, 63, 64, 65, 127, 128, 129] {
+                    let validity: Vec<bool> = (0..source_offset + len)
+                        .map(|i| i % 3 != 0 && i % 11 != 0)
+                        .collect();
+                    let nulls = NullBuffer::new(BooleanBuffer::from(validity.clone()))
+                        .slice(source_offset, len);
+                    let mut actual = vec![0u8; (destination_offset + len).div_ceil(8) + 1];
+                    let mut expected = actual.clone();
+
+                    for row in 0..len {
+                        if !validity[source_offset + row] {
+                            let bit = destination_offset + row;
+                            expected[bit / 8] |= 1 << (bit % 8);
+                        }
+                    }
+                    append_null_bitmap(&mut actual, destination_offset, &nulls);
+
+                    assert_eq!(
+                        actual, expected,
+                        "source_offset={source_offset}, destination_offset={destination_offset}, len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nullable_timestamp_millis_batch_preserves_slices_and_append_offsets() {
+        let data_type = DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None);
+        let mut writer = BucketWriter::new(&[&data_type], 32768, 255);
+
+        let source = TimestampMillisecondArray::from(vec![
+            Some(99),
+            Some(10),
+            None,
+            Some(10),
+            Some(20),
+            None,
+        ]);
+        let first = source.slice(1, 4);
+        writer.write_columns(&[&first], &[&data_type]).unwrap();
+
+        let second = TimestampMillisecondArray::from(vec![None, Some(20), None]);
+        writer.write_columns(&[&second], &[&data_type]).unwrap();
+
+        assert_eq!(writer.num_rows, 7);
+        assert_eq!(writer.non_null_counts[0], 4);
+        assert_eq!(writer.null_bitmaps[0][0], 0b0101_0010);
+        assert_eq!(
+            writer.value_buffers[0],
+            [10_i64, 10, 20, 20]
+                .into_iter()
+                .flat_map(i64::to_be_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert!(!writer.const_tracking[0]);
+        assert_eq!(writer.dict_tracking[0], DictTracking::Active);
+        assert_eq!(writer.long_dict_maps[0].as_ref().unwrap().len(), 2);
     }
 
     #[test]
