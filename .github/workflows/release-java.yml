@@ -62,6 +62,8 @@ jobs:
             lib_name: paimon_mosaic_jni.dll
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
 
       - name: Setup Rust toolchain
         run: |

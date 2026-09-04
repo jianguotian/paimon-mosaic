@@ -883,8 +883,12 @@ while [[ $# -gt 0 ]]; do
     *) shift ;;
   esac
 done
-printf 'resolved-goal=%s maven-repo-local=%s\n' \
-  "$goal" "$maven_repo_local" >> "$FAKE_MVN_LOG"
+if [[ -z "$global_settings" || ! -f "$global_settings" ]]; then
+  echo "Maven invocation is missing isolated global settings" >&2
+  exit 2
+fi
+printf 'resolved-goal=%s maven-repo-local=%s global-settings=%s\n' \
+  "$goal" "$maven_repo_local" "$global_settings" >> "$FAKE_MVN_LOG"
 
 if [[ -n "$settings" ]]; then
   case "$goal" in
@@ -1458,6 +1462,25 @@ test_workflow_run_tag_and_sha_must_match_checkout() {
   assert_maven_not_invoked
 }
 
+test_clean_checkout_must_match_release_tag() {
+  local tag_commit
+
+  new_fixture
+  tag_commit=$(git -C "$FIXTURE_DIR" rev-parse "v0.3.0-rc1^{commit}")
+  printf 'clean divergent checkout\n' > "$FIXTURE_DIR/clean-divergence"
+  git -C "$FIXTURE_DIR" add clean-divergence
+  git -C "$FIXTURE_DIR" commit -q -m "advance clean checkout"
+
+  if FAKE_RUN_SHA="$tag_commit" \
+    FAKE_ARTIFACT_SHA="$tag_commit" \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "clean checkout newer than the release tag was accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "Current checkout does not match v0.3.0-rc1"
+  assert_not_contains "$GH_LOG" "actions/runs"
+  assert_maven_not_invoked
+}
+
 test_release_tag_must_be_annotated() {
   new_fixture
   git -C "$FIXTURE_DIR" tag -d v0.3.0-rc1 >/dev/null
@@ -1959,7 +1982,9 @@ test_real_deploy_downloads_pinned_asf_keys_by_default() {
 }
 
 test_settings_and_environment_cannot_control_plugin_resolution_or_signing_inputs() {
+  local nexus_global_settings
   local nexus_runtime_repository
+  local signing_global_settings
   local signing_runtime_repository
 
   new_fixture
@@ -2065,14 +2090,42 @@ EOF
   assert_contains "$MAVEN_LOG" "maven-gpg-passphrase="
   assert_not_contains "$MAVEN_LOG" "maven-gpg-passphrase=ambient-passphrase"
 
+  signing_global_settings=$(
+    sed -n \
+      's/^resolved-goal=sign .* global-settings=//p' \
+      "$MAVEN_LOG"
+  )
+  nexus_global_settings=$(
+    sed -n \
+      's/^resolved-goal=nexus .* global-settings=//p' \
+      "$MAVEN_LOG"
+  )
+  case "$signing_global_settings" in
+    "$TEST_ROOT"/paimon-mosaic-java-staging.*/maven-global-settings.xml) ;;
+    *)
+      fail "signing Maven did not use isolated global settings: \
+$signing_global_settings"
+      ;;
+  esac
+  case "$nexus_global_settings" in
+    "$TEST_ROOT"/paimon-mosaic-java-staging.*/maven-global-settings.xml) ;;
+    *)
+      fail "Nexus Maven did not use isolated global settings: \
+$nexus_global_settings"
+      ;;
+  esac
+  if [[ "$signing_global_settings" != "$nexus_global_settings" ]]; then
+    fail "signing and Nexus Maven must use the same isolated global settings"
+  fi
+
   signing_runtime_repository=$(
     sed -n \
-      's/^resolved-goal=sign maven-repo-local=//p' \
+      's/^resolved-goal=sign maven-repo-local=\([^ ]*\) global-settings=.*/\1/p' \
       "$MAVEN_LOG"
   )
   nexus_runtime_repository=$(
     sed -n \
-      's/^resolved-goal=nexus maven-repo-local=//p' \
+      's/^resolved-goal=nexus maven-repo-local=\([^ ]*\) global-settings=.*/\1/p' \
       "$MAVEN_LOG"
   )
   case "$signing_runtime_repository" in
@@ -2498,6 +2551,7 @@ run_test test_failed_job_rerun_can_reuse_earlier_java_candidate
 run_test test_rerun_during_candidate_validation_stops_before_maven
 run_test test_retag_during_candidate_validation_stops_before_maven
 run_test test_workflow_run_tag_and_sha_must_match_checkout
+run_test test_clean_checkout_must_match_release_tag
 run_test test_release_tag_must_be_annotated
 run_test test_release_tag_signature_must_verify
 run_test test_signed_tag_object_name_must_match_release_tag

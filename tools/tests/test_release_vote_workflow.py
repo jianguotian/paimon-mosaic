@@ -420,7 +420,19 @@ def test_manual_rust_dispatch_cannot_publish() -> None:
 
 
 def assert_java_release_contract(workflow: dict) -> None:
+    build_native_job = workflow["jobs"]["build-native"]
     package_job = workflow["jobs"]["package-java"]
+
+    assert needs(build_native_job) == {"release-preflight"}
+    build_native_checkout_steps = [
+        step
+        for step in build_native_job["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    ]
+    assert len(build_native_checkout_steps) == 1
+    assert build_native_checkout_steps[0]["with"] == {
+        "ref": "${{ needs.release-preflight.outputs.commit }}",
+    }
 
     assert package_job["if"] == JAVA_PACKAGE_CONDITION
     assert needs(package_job) == {"release-preflight", "build-native"}
@@ -533,6 +545,7 @@ def test_java_pom_does_not_control_candidate_validation_or_deploy_order() -> Non
 @pytest.mark.parametrize(
     "mutation",
     (
+        "native-mutable-checkout",
         "mutable-checkout",
         "shallow-checkout",
         "mutable-tag-object",
@@ -546,7 +559,13 @@ def test_java_pom_does_not_control_candidate_validation_or_deploy_order() -> Non
 )
 def test_java_candidate_contract_rejects_mutations(mutation: str) -> None:
     workflow = copy.deepcopy(load_workflow(JAVA_RELEASE_WORKFLOW))
+    build_native_job = workflow["jobs"]["build-native"]
     package_job = workflow["jobs"]["package-java"]
+    build_native_checkout = next(
+        step
+        for step in build_native_job["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    )
     checkout = next(
         step
         for step in package_job["steps"]
@@ -555,7 +574,9 @@ def test_java_candidate_contract_rejects_mutations(mutation: str) -> None:
     candidate = java_package_step(workflow, "Freeze exact Java candidate")
     upload = java_package_step(workflow, "Upload Java artifacts")
 
-    if mutation == "mutable-checkout":
+    if mutation == "native-mutable-checkout":
+        build_native_checkout["with"]["ref"] = "main"
+    elif mutation == "mutable-checkout":
         checkout["with"]["ref"] = "${{ github.ref }}"
     elif mutation == "shallow-checkout":
         checkout["with"]["fetch-depth"] = "1"
