@@ -314,15 +314,18 @@ if [[ "$DRY_RUN" != true ]] &&
   exit 1
 fi
 
+GIT_TRUSTED=(git -c core.fsmonitor=false)
+
 if ! TAG_OBJECT=$(
-  git -C "$REPO_DIR" rev-parse -q --verify "refs/tags/$TAG^{tag}"
+  "${GIT_TRUSTED[@]}" \
+    -C "$REPO_DIR" rev-parse -q --verify "refs/tags/$TAG^{tag}"
 ); then
   echo "Tag $TAG must be an annotated tag." >&2
   echo "Run: git fetch --tags && git checkout $TAG" >&2
   exit 1
 fi
 if ! TAG_OBJECT_NAME=$(
-  git -C "$REPO_DIR" cat-file tag "$TAG_OBJECT" |
+  "${GIT_TRUSTED[@]}" -C "$REPO_DIR" cat-file tag "$TAG_OBJECT" |
     awk '
       /^$/ { exit }
       /^tag / {
@@ -344,12 +347,15 @@ if [[ "$TAG_OBJECT_NAME" != "$TAG" ]]; then
   echo "Tag $TAG signed tag object is for $TAG_OBJECT_NAME, not $TAG." >&2
   exit 1
 fi
-if ! git -C "$REPO_DIR" -c gpg.program=gpg verify-tag "$TAG_OBJECT"; then
+if ! "${GIT_TRUSTED[@]}" \
+  -C "$REPO_DIR" -c gpg.program=gpg verify-tag "$TAG_OBJECT"; then
   echo "Tag $TAG signature verification failed." >&2
   exit 1
 fi
-TAG_COMMIT=$(git -C "$REPO_DIR" rev-parse "$TAG_OBJECT^{commit}")
-HEAD_COMMIT=$(git -C "$REPO_DIR" rev-parse HEAD)
+TAG_COMMIT=$(
+  "${GIT_TRUSTED[@]}" -C "$REPO_DIR" rev-parse "$TAG_OBJECT^{commit}"
+)
+HEAD_COMMIT=$("${GIT_TRUSTED[@]}" -C "$REPO_DIR" rev-parse HEAD)
 if [[ "$HEAD_COMMIT" != "$TAG_COMMIT" ]]; then
   echo "Current checkout does not match $TAG." >&2
   echo "HEAD: $HEAD_COMMIT" >&2
@@ -358,7 +364,8 @@ if [[ "$HEAD_COMMIT" != "$TAG_COMMIT" ]]; then
 fi
 
 REPLACEMENT_REFS=$(
-  git -C "$REPO_DIR" for-each-ref --format='%(refname)' refs/replace
+  "${GIT_TRUSTED[@]}" \
+    -C "$REPO_DIR" for-each-ref --format='%(refname)' refs/replace
 )
 if [[ -n "$REPLACEMENT_REFS" ]]; then
   echo "Git replacement refs are not allowed during Java staging." >&2
@@ -367,7 +374,8 @@ if [[ -n "$REPLACEMENT_REFS" ]]; then
 fi
 
 ARCHIVE_ATTRIBUTES=$(
-  git -C "$REPO_DIR" rev-parse --git-path info/attributes
+  "${GIT_TRUSTED[@]}" \
+    -C "$REPO_DIR" rev-parse --git-path info/attributes
 )
 case "$ARCHIVE_ATTRIBUTES" in
   /*) ;;
@@ -380,7 +388,7 @@ if [[ -s "$ARCHIVE_ATTRIBUTES" ]]; then
 fi
 
 INDEX_FLAGGED_PATHS=$(
-  git -C "$REPO_DIR" ls-files -v |
+  "${GIT_TRUSTED[@]}" -C "$REPO_DIR" ls-files -v |
     awk 'substr($0, 1, 1) == "S" || substr($0, 1, 1) ~ /[a-z]/'
 )
 if [[ -n "$INDEX_FLAGGED_PATHS" ]]; then
@@ -394,8 +402,7 @@ check_checkout_clean() {
   local ignored
 
   status=$(
-    git -C "$REPO_DIR" \
-      -c core.fsmonitor=false \
+    "${GIT_TRUSTED[@]}" -C "$REPO_DIR" \
       status --porcelain=v1 --untracked-files=all
   )
   if [[ -n "$status" ]]; then
@@ -405,7 +412,7 @@ check_checkout_clean() {
   fi
 
   ignored=$(
-    git -C "$REPO_DIR" \
+    "${GIT_TRUSTED[@]}" -C "$REPO_DIR" \
       ls-files --others --ignored --exclude-standard -- java |
       sed \
         -e '\#^java/target/#d' \
@@ -756,7 +763,7 @@ fi
 
 ARCHIVE_PREFIX="paimon-mosaic-${RELEASE_VERSION}"
 ARCHIVE_PATH="$STAGING_ROOT/source.tar"
-git -C "$REPO_DIR" \
+"${GIT_TRUSTED[@]}" -C "$REPO_DIR" \
   -c core.attributesFile=/dev/null \
   archive \
   --format=tar \

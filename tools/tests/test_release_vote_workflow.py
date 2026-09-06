@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import copy
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -32,6 +33,7 @@ GATE_WORKFLOW = ROOT / ".github/workflows/release-vote-gate.yml"
 RUST_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-rust.yml"
 JAVA_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-java.yml"
 JAVA_POM = ROOT / "java/pom.xml"
+JAVA_STAGING_VALIDATOR = ROOT / "tools/validate_java_staging_artifacts.sh"
 PYTHON_PUBLISH_WORKFLOW = ROOT / ".github/workflows/release-python-publish.yml"
 RELEASE_DOCUMENTATION = ROOT / "docs/creating-a-release.html"
 RELEASE_LEAF_WORKFLOWS = (
@@ -62,9 +64,15 @@ PYTHON_PUBLISH_CONDITION = (
 REQUIRED_GATE_PATHS = {
     ".gitattributes",
     ".github/workflows/**",
+    "Cargo.lock",
+    "Cargo.toml",
+    "core/**",
     "docs/creating-a-release.html",
     "docs/verifying-a-release-candidate.html",
     "java/pom.xml",
+    "java/src/main/java/**",
+    "jni/**",
+    "rust-toolchain.toml",
     "tools/create_source_release.sh",
     "tools/deploy_java_staging.sh",
     "tools/java-staging-maven-plugins.sha256",
@@ -133,6 +141,26 @@ GATE_TEST_COMMAND = """python -m pytest -q \\
   tools/tests/test_verify_source_archive.py
 """
 GATE_JAVA_STAGING_COMMAND = "bash tools/tests/deploy_java_staging_test.sh"
+GATE_JAVA_CLASS_COMMAND = """set -euo pipefail
+mvn --batch-mode --no-transfer-progress \\
+  --file java/pom.xml \\
+  -DskipTests \\
+  clean compile
+bash tools/validate_java_staging_artifacts.sh \\
+  --validate-java-class-set \\
+  java/target/classes
+"""
+EXPECTED_JAVA_CLASS_ENTRIES = {
+    "org/apache/paimon/mosaic/ColumnStatistics.class",
+    "org/apache/paimon/mosaic/InputFile.class",
+    "org/apache/paimon/mosaic/MosaicReader.class",
+    "org/apache/paimon/mosaic/MosaicWriter$1.class",
+    "org/apache/paimon/mosaic/MosaicWriter$RootArrayExporter.class",
+    "org/apache/paimon/mosaic/MosaicWriter$RootArrayPrivateData.class",
+    "org/apache/paimon/mosaic/MosaicWriter.class",
+    "org/apache/paimon/mosaic/NativeLib.class",
+    "org/apache/paimon/mosaic/WriterOptions.class",
+}
 JAVA_CANDIDATE_PATHS = """${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}.jar
 ${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-sources.jar
 ${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-javadoc.jar
@@ -234,12 +262,16 @@ def assert_gate_contract(workflow: dict) -> None:
     install_step = gate_step(workflow, "Install test dependencies")
     test_step = gate_step(workflow, "Run release vote tests")
     staging_step = gate_step(workflow, "Test local Java staging")
+    java_setup_step = gate_step(workflow, "Set up Java")
+    java_class_step = gate_step(workflow, "Verify Java class contract")
     source_tree_step = gate_step(workflow, "Verify current source tree")
     static_step = gate_step(workflow, "Run static checks")
     for step in (
         install_step,
         test_step,
         staging_step,
+        java_setup_step,
+        java_class_step,
         source_tree_step,
         static_step,
     ):
@@ -250,6 +282,15 @@ def assert_gate_contract(workflow: dict) -> None:
     assert test_step["run"] == GATE_TEST_COMMAND
     assert staging_step["shell"] == "bash"
     assert staging_step["run"] == GATE_JAVA_STAGING_COMMAND
+    assert java_setup_step["uses"] == "actions/setup-java@v4"
+    assert java_setup_step["with"] == {
+        "distribution": "temurin",
+        "java-version": "8",
+        "cache": "maven",
+        "cache-dependency-path": "java/pom.xml",
+    }
+    assert java_class_step["shell"] == "bash"
+    assert java_class_step["run"] == GATE_JAVA_CLASS_COMMAND
     assert source_tree_step["shell"] == "bash"
     assert source_tree_step["run"] == GATE_SOURCE_TREE_COMMAND
     assert static_step["shell"] == "bash"
@@ -989,6 +1030,73 @@ def test_release_vote_gate_verifies_current_source_tree() -> None:
     assert "continue-on-error" not in step
     assert step["shell"] == "bash"
     assert step["run"] == GATE_SOURCE_TREE_COMMAND
+
+
+def test_java_class_contract_rejects_unreviewed_compiled_class(
+    tmp_path: Path,
+) -> None:
+    classes = tmp_path / "classes"
+    for entry in EXPECTED_JAVA_CLASS_ENTRIES:
+        path = classes / entry
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"class")
+
+    accepted = subprocess.run(
+        [
+            "bash",
+            str(JAVA_STAGING_VALIDATOR),
+            "--validate-java-class-set",
+            str(classes),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+
+    extra = classes / "org/apache/paimon/mosaic/NewApi.class"
+    extra.write_bytes(b"class")
+    rejected = subprocess.run(
+        [
+            "bash",
+            str(JAVA_STAGING_VALIDATOR),
+            "--validate-java-class-set",
+            str(classes),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "Compiled Java class set is invalid" in rejected.stderr
+
+
+@pytest.mark.parametrize("nested", (False, True))
+def test_java_class_contract_rejects_symlinked_classes_directory(
+    tmp_path: Path,
+    nested: bool,
+) -> None:
+    classes = tmp_path / "classes"
+    classes.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    if nested:
+        linked_classes = classes
+        (classes / "linked").symlink_to(external, target_is_directory=True)
+    else:
+        linked_classes = tmp_path / "linked-classes"
+        linked_classes.symlink_to(classes, target_is_directory=True)
+
+    rejected = subprocess.run(
+        [
+            "bash",
+            str(JAVA_STAGING_VALIDATOR),
+            "--validate-java-class-set",
+            str(linked_classes),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "symbolic link" in rejected.stderr
 
 
 @pytest.mark.parametrize("event", ("pull_request", "push"))

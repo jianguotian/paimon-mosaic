@@ -24,16 +24,22 @@ PYTHON=${PYTHON:-python3}
 usage() {
   cat >&2 <<'EOF'
 Usage: validate_java_staging_artifacts.sh TARGET_DIR VERSION
+       validate_java_staging_artifacts.sh --validate-java-class-set CLASSES_DIR
 EOF
 }
 
-if [[ $# -ne 2 ]]; then
+MODE=artifacts
+if [[ $# -eq 2 && "$1" == "--validate-java-class-set" ]]; then
+  MODE=java-class-set
+  TARGET_DIR=$2
+  VERSION=
+elif [[ $# -eq 2 ]]; then
+  TARGET_DIR=$1
+  VERSION=$2
+else
   usage
   exit 1
 fi
-
-TARGET_DIR=$1
-VERSION=$2
 
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
   echo "python3 is required to validate Java staging artifacts" >&2
@@ -46,7 +52,9 @@ REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 "$PYTHON" - \
   "$REPO_DIR" \
   "$TARGET_DIR" \
-  "$VERSION" <<'PY'
+  "$VERSION" \
+  "$MODE" <<'PY'
+import os
 import posixpath
 import re
 import shutil
@@ -65,6 +73,7 @@ MAX_TOTAL_SIZE = 1024 * 1024 * 1024
 MIN_NATIVE_SIZE = 64 * 1024
 MAX_NATIVE_SYMBOLS = 64 * 1024
 MAX_NATIVE_SYMBOL_LENGTH = 4096
+MAX_COMPILED_TREE_ENTRIES = 4096
 READ_CHUNK_SIZE = 1024 * 1024
 JAVA_CLASS = "org/apache/paimon/mosaic/MosaicReader.class"
 JAVA_CLASS_NAME = "org.apache.paimon.mosaic.MosaicReader"
@@ -218,6 +227,43 @@ def required_bytes(archive, entries, archive_path, name):
         )
 
 
+def validate_java_class_set(actual_classes, description):
+    if actual_classes != EXPECTED_CLASS_ENTRIES:
+        fail(
+            "{} is invalid: expected {}, found {}".format(
+                description,
+                sorted(EXPECTED_CLASS_ENTRIES),
+                sorted(actual_classes),
+            )
+        )
+
+
+def compiled_java_classes(root):
+    actual_classes = set()
+    visited_entries = 0
+    for directory, subdirectories, files in os.walk(
+        str(root),
+        followlinks=False,
+    ):
+        for entry in subdirectories + files:
+            visited_entries += 1
+            if visited_entries > MAX_COMPILED_TREE_ENTRIES:
+                fail("Compiled Java classes directory is too large")
+            path = Path(directory) / entry
+            if path.is_symlink():
+                fail(
+                    "Compiled Java classes directory contains a symbolic link: {}"
+                    .format(path.relative_to(root))
+                )
+        for filename in files:
+            if not filename.endswith(".class"):
+                continue
+            path = Path(directory) / filename
+            if path.is_file():
+                actual_classes.add(path.relative_to(root).as_posix())
+    return actual_classes
+
+
 def validate_java_classes(main_jar, archive, entries):
     javap = shutil.which("javap")
     if javap is None:
@@ -228,13 +274,7 @@ def validate_java_classes(main_jar, archive, entries):
         for name, info in entries.items()
         if name.endswith(".class") and not info.is_dir()
     }
-    if actual_classes != EXPECTED_CLASS_ENTRIES:
-        fail(
-            "Packaged Java class set is invalid: expected {}, found {}".format(
-                sorted(EXPECTED_CLASS_ENTRIES),
-                sorted(actual_classes),
-            )
-        )
+    validate_java_class_set(actual_classes, "Packaged Java class set")
 
     javap_outputs = {}
     for entry in sorted(EXPECTED_CLASS_ENTRIES):
@@ -293,6 +333,39 @@ def bounded_c_string(data, offset, limit, description, name):
     return data[offset:end]
 
 
+def elf_sysv_hash(symbol):
+    value = 0
+    for byte in symbol:
+        value = (value << 4) + byte
+        high = value & 0xF0000000
+        if high:
+            value ^= high >> 24
+            value &= ~high
+    return value & 0xFFFFFFFF
+
+
+def elf_gnu_hash(symbol):
+    value = 5381
+    for byte in symbol:
+        value = (value * 33 + byte) & 0xFFFFFFFF
+    return value
+
+
+def macho_uleb128(data, offset, limit, description, name):
+    value = 0
+    for index in range(10):
+        if offset >= limit:
+            fail("{} is truncated: {}".format(description, name))
+        byte = data[offset]
+        offset += 1
+        if index == 9 and byte > 1:
+            fail("{} overflows 64 bits: {}".format(description, name))
+        value |= (byte & 0x7F) << (index * 7)
+        if not byte & 0x80:
+            return value, offset
+    fail("{} overflows 64 bits: {}".format(description, name))
+
+
 def validate_elf(data, expected_machine, name):
     if (
         len(data) < MIN_NATIVE_SIZE
@@ -324,14 +397,14 @@ def validate_elf(data, expected_machine, name):
     ):
         fail("Packaged ELF program headers are invalid: {}".format(name))
 
-    has_load = False
-    has_executable_load = False
-    has_dynamic = False
+    load_segments = []
+    dynamic_segments = []
     for index in range(program_count):
         offset = program_offset + index * program_entry_size
         segment_type = struct.unpack_from("<I", data, offset)[0]
         flags = struct.unpack_from("<I", data, offset + 4)[0]
         file_offset = struct.unpack_from("<Q", data, offset + 8)[0]
+        virtual_address = struct.unpack_from("<Q", data, offset + 16)[0]
         file_size = struct.unpack_from("<Q", data, offset + 32)[0]
         memory_size = struct.unpack_from("<Q", data, offset + 40)[0]
         if (
@@ -341,12 +414,100 @@ def validate_elf(data, expected_machine, name):
         ):
             fail("Packaged ELF segment is out of bounds: {}".format(name))
         if segment_type == 1 and file_size > 0:
-            has_load = True
-            has_executable_load = has_executable_load or bool(flags & 0x1)
+            load_segments.append(
+                (
+                    virtual_address,
+                    file_size,
+                    memory_size,
+                    file_offset,
+                    flags,
+                )
+            )
         elif segment_type == 2 and file_size > 0:
-            has_dynamic = True
-    if not (has_load and has_executable_load and has_dynamic):
+            dynamic_segments.append(
+                (virtual_address, file_offset, file_size)
+            )
+    if (
+        not load_segments
+        or not any(segment[4] & 0x1 for segment in load_segments)
+        or len(dynamic_segments) != 1
+    ):
         fail("Packaged ELF is missing load or dynamic segments: {}".format(name))
+
+    def virtual_to_file_offset(address, size, description):
+        matches = set()
+        for (
+            virtual_address,
+            file_size,
+            _,
+            file_offset,
+            _,
+        ) in load_segments:
+            if address < virtual_address:
+                continue
+            delta = address - virtual_address
+            if delta <= file_size and size <= file_size - delta:
+                matches.add(file_offset + delta)
+        if len(matches) != 1:
+            fail("{} is not loader-visible: {}".format(description, name))
+        return matches.pop()
+
+    dynamic_address, dynamic_offset, dynamic_size = dynamic_segments[0]
+    if (
+        virtual_to_file_offset(
+            dynamic_address,
+            dynamic_size,
+            "Packaged ELF dynamic segment",
+        )
+        != dynamic_offset
+    ):
+        fail("Packaged ELF dynamic segment is not loader-visible: {}".format(name))
+    if dynamic_size % 16 != 0:
+        fail("Packaged ELF dynamic segment is invalid: {}".format(name))
+    dynamic_tag_names = {
+        4: "DT_HASH",
+        5: "DT_STRTAB",
+        6: "DT_SYMTAB",
+        10: "DT_STRSZ",
+        11: "DT_SYMENT",
+        0x6FFFFEF5: "DT_GNU_HASH",
+        0x6FFFFFF0: "DT_VERSYM",
+    }
+    dynamic_values = {}
+    has_dynamic_end = False
+    for offset in range(
+        dynamic_offset,
+        dynamic_offset + dynamic_size,
+        16,
+    ):
+        tag, value = struct.unpack_from("<qQ", data, offset)
+        if tag == 0:
+            has_dynamic_end = True
+            break
+        if tag not in dynamic_tag_names:
+            continue
+        if tag in dynamic_values:
+            fail(
+                "Packaged ELF dynamic segment has duplicate {}: {}".format(
+                    dynamic_tag_names[tag],
+                    name,
+                )
+            )
+        dynamic_values[tag] = value
+    required_dynamic_tags = {5, 6, 10, 11}
+    if (
+        not has_dynamic_end
+        or not required_dynamic_tags <= set(dynamic_values)
+        or not ({4, 0x6FFFFEF5} & set(dynamic_values))
+        or dynamic_values[5] == 0
+        or dynamic_values[6] == 0
+        or dynamic_values[10] == 0
+        or dynamic_values[11] != 24
+    ):
+        fail(
+            "Packaged ELF dynamic symbol table is not loader-visible: {}"
+            .format(name)
+        )
 
     section_offset = struct.unpack_from("<Q", data, 40)[0]
     section_entry_size = struct.unpack_from("<H", data, 58)[0]
@@ -365,6 +526,8 @@ def validate_elf(data, expected_machine, name):
     for index in range(section_count):
         offset = section_offset + index * section_entry_size
         section_type = struct.unpack_from("<I", data, offset + 4)[0]
+        section_flags = struct.unpack_from("<Q", data, offset + 8)[0]
+        virtual_address = struct.unpack_from("<Q", data, offset + 16)[0]
         file_offset = struct.unpack_from("<Q", data, offset + 24)[0]
         file_size = struct.unpack_from("<Q", data, offset + 32)[0]
         link = struct.unpack_from("<I", data, offset + 40)[0]
@@ -378,56 +541,375 @@ def validate_elf(data, expected_machine, name):
         ):
             fail("Packaged ELF section is out of bounds: {}".format(name))
         sections.append(
-            (section_type, file_offset, file_size, link, entry_size)
+            (
+                section_type,
+                section_flags,
+                virtual_address,
+                file_offset,
+                file_size,
+                link,
+                entry_size,
+            )
         )
 
-    exports = set()
-    dynamic_symbol_tables = 0
-    for section_type, file_offset, file_size, link, entry_size in sections:
+    dynamic_string_address = dynamic_values[5]
+    dynamic_symbol_address = dynamic_values[6]
+    dynamic_string_size = dynamic_values[10]
+    dynamic_symbol_entry_size = dynamic_values[11]
+    dynamic_string_offset = virtual_to_file_offset(
+        dynamic_string_address,
+        dynamic_string_size,
+        "Packaged ELF dynamic string table",
+    )
+
+    loader_symbol_tables = []
+    for section in sections:
+        (
+            section_type,
+            _,
+            virtual_address,
+            file_offset,
+            file_size,
+            link,
+            entry_size,
+        ) = section
         if section_type != 11:
             continue
-        dynamic_symbol_tables += 1
         if (
-            entry_size != 24
+            entry_size != dynamic_symbol_entry_size
             or file_size % entry_size != 0
             or link >= len(sections)
         ):
             fail("Packaged ELF dynamic symbol table is invalid: {}".format(name))
-        string_type, string_offset, string_size, _, _ = sections[link]
-        symbol_count = file_size // entry_size
+        (
+            string_type,
+            _,
+            string_address,
+            string_offset,
+            string_size,
+            _,
+            _,
+        ) = sections[link]
         if (
-            string_type != 3
-            or string_size == 0
-            or symbol_count > MAX_NATIVE_SYMBOLS
-        ):
-            fail("Packaged ELF dynamic string table is invalid: {}".format(name))
-        string_limit = string_offset + string_size
-        for index in range(symbol_count):
-            offset = file_offset + index * entry_size
-            string_index = struct.unpack_from("<I", data, offset)[0]
-            symbol_info = data[offset + 4]
-            symbol_visibility = data[offset + 5] & 0x3
-            section_index = struct.unpack_from("<H", data, offset + 6)[0]
-            symbol_binding = symbol_info >> 4
-            if (
-                string_index == 0
-                or string_index >= string_size
-                or section_index == 0
-                or symbol_binding not in (1, 2)
-                or symbol_visibility not in (0, 3)
-            ):
-                continue
-            exports.add(
-                bounded_c_string(
-                    data,
-                    string_offset + string_index,
-                    string_limit,
-                    "Packaged ELF dynamic symbol",
-                    name,
-                )
+            virtual_address != dynamic_symbol_address
+            or file_offset
+            != virtual_to_file_offset(
+                dynamic_symbol_address,
+                file_size,
+                "Packaged ELF dynamic symbol table",
             )
-    if dynamic_symbol_tables == 0:
-        fail("Packaged ELF has no dynamic symbol table: {}".format(name))
+            or string_type != 3
+            or string_address != dynamic_string_address
+            or string_offset != dynamic_string_offset
+            or string_size != dynamic_string_size
+        ):
+            continue
+        loader_symbol_tables.append(section)
+
+    if len(loader_symbol_tables) != 1:
+        fail(
+            "Packaged ELF dynamic symbol table is not loader-visible: {}"
+            .format(name)
+        )
+
+    (
+        _,
+        _,
+        _,
+        file_offset,
+        file_size,
+        link,
+        entry_size,
+    ) = loader_symbol_tables[0]
+    (
+        _,
+        _,
+        _,
+        string_offset,
+        string_size,
+        _,
+        _,
+    ) = sections[link]
+    symbol_count = file_size // entry_size
+    if symbol_count == 0 or symbol_count > MAX_NATIVE_SYMBOLS:
+        fail("Packaged ELF dynamic symbol table is invalid: {}".format(name))
+
+    loader_hashes = []
+    if 4 in dynamic_values:
+        hash_offset = virtual_to_file_offset(
+            dynamic_values[4],
+            8,
+            "Packaged ELF DT_HASH table",
+        )
+        bucket_count, chain_count = struct.unpack_from(
+            "<II", data, hash_offset
+        )
+        if (
+            bucket_count == 0
+            or bucket_count > MAX_NATIVE_SYMBOLS
+            or chain_count != symbol_count
+        ):
+            fail("Packaged ELF DT_HASH table is invalid: {}".format(name))
+        hash_size = 8 + (bucket_count + chain_count) * 4
+        if (
+            virtual_to_file_offset(
+                dynamic_values[4],
+                hash_size,
+                "Packaged ELF DT_HASH table",
+            )
+            != hash_offset
+        ):
+            fail(
+                "Packaged ELF DT_HASH table has inconsistent mapping: {}"
+                .format(name)
+            )
+        buckets_offset = hash_offset + 8
+        chains_offset = buckets_offset + bucket_count * 4
+        buckets = struct.unpack_from(
+            "<{}I".format(bucket_count),
+            data,
+            buckets_offset,
+        )
+        chains = struct.unpack_from(
+            "<{}I".format(chain_count),
+            data,
+            chains_offset,
+        )
+        if (
+            chains[0] != 0
+            or any(index >= symbol_count for index in buckets)
+            or any(index >= symbol_count for index in chains)
+        ):
+            fail("Packaged ELF DT_HASH table is invalid: {}".format(name))
+        for bucket in buckets:
+            seen = set()
+            index = bucket
+            while index:
+                if index in seen:
+                    fail(
+                        "Packaged ELF DT_HASH table contains a cycle: {}"
+                        .format(name)
+                    )
+                seen.add(index)
+                index = chains[index]
+
+        def sysv_contains(
+            symbol_index,
+            symbol,
+            buckets=buckets,
+            chains=chains,
+        ):
+            index = buckets[elf_sysv_hash(symbol) % len(buckets)]
+            while index:
+                if index == symbol_index:
+                    return True
+                index = chains[index]
+            return False
+
+        loader_hashes.append(sysv_contains)
+
+    if 0x6FFFFEF5 in dynamic_values:
+        gnu_hash_offset = virtual_to_file_offset(
+            dynamic_values[0x6FFFFEF5],
+            16,
+            "Packaged ELF DT_GNU_HASH table",
+        )
+        (
+            bucket_count,
+            symbol_offset,
+            bloom_count,
+            bloom_shift,
+        ) = struct.unpack_from("<IIII", data, gnu_hash_offset)
+        if (
+            bucket_count == 0
+            or bucket_count > MAX_NATIVE_SYMBOLS
+            or bloom_count == 0
+            or bloom_count > MAX_NATIVE_SYMBOLS
+            or symbol_offset > symbol_count
+        ):
+            fail("Packaged ELF DT_GNU_HASH table is invalid: {}".format(name))
+        chain_count = symbol_count - symbol_offset
+        gnu_hash_size = (
+            16
+            + bloom_count * 8
+            + bucket_count * 4
+            + chain_count * 4
+        )
+        if (
+            virtual_to_file_offset(
+                dynamic_values[0x6FFFFEF5],
+                gnu_hash_size,
+                "Packaged ELF DT_GNU_HASH table",
+            )
+            != gnu_hash_offset
+        ):
+            fail(
+                "Packaged ELF DT_GNU_HASH table has inconsistent mapping: {}"
+                .format(name)
+            )
+        bloom_offset = gnu_hash_offset + 16
+        buckets_offset = bloom_offset + bloom_count * 8
+        chains_offset = buckets_offset + bucket_count * 4
+        bloom = struct.unpack_from(
+            "<{}Q".format(bloom_count),
+            data,
+            bloom_offset,
+        )
+        buckets = struct.unpack_from(
+            "<{}I".format(bucket_count),
+            data,
+            buckets_offset,
+        )
+        chains = struct.unpack_from(
+            "<{}I".format(chain_count),
+            data,
+            chains_offset,
+        )
+        for bucket in buckets:
+            if bucket == 0:
+                continue
+            if bucket < symbol_offset or bucket >= symbol_count:
+                fail(
+                    "Packaged ELF DT_GNU_HASH bucket is invalid: {}"
+                    .format(name)
+                )
+            chain_index = bucket - symbol_offset
+            while True:
+                if chain_index >= chain_count:
+                    fail(
+                        "Packaged ELF DT_GNU_HASH chain is unterminated: {}"
+                        .format(name)
+                    )
+                if chains[chain_index] & 1:
+                    break
+                chain_index += 1
+
+        def gnu_contains(
+            symbol_index,
+            symbol,
+            symbol_offset=symbol_offset,
+            bloom_shift=bloom_shift,
+            bloom=bloom,
+            buckets=buckets,
+            chains=chains,
+        ):
+            symbol_hash = elf_gnu_hash(symbol)
+            bloom_word = bloom[(symbol_hash // 64) % len(bloom)]
+            bloom_mask = (1 << (symbol_hash % 64)) | (
+                1 << ((symbol_hash >> bloom_shift) % 64)
+            )
+            if bloom_word & bloom_mask != bloom_mask:
+                return False
+            index = buckets[symbol_hash % len(buckets)]
+            if (
+                index == 0
+                or symbol_index < index
+                or symbol_index < symbol_offset
+            ):
+                return False
+            while True:
+                chain_index = index - symbol_offset
+                if chain_index >= len(chains):
+                    return False
+                chain_hash = chains[chain_index]
+                if index == symbol_index:
+                    return (chain_hash | 1) == (symbol_hash | 1)
+                if chain_hash & 1:
+                    return False
+                index += 1
+
+        loader_hashes.append(gnu_contains)
+
+    version_offset = None
+    if 0x6FFFFFF0 in dynamic_values:
+        version_offset = virtual_to_file_offset(
+            dynamic_values[0x6FFFFFF0],
+            symbol_count * 2,
+            "Packaged ELF DT_VERSYM table",
+        )
+
+    def is_executable_symbol(section_index, value, size):
+        if section_index == 0 or section_index >= len(sections):
+            return False
+        (
+            section_type,
+            section_flags,
+            section_address,
+            _,
+            section_size,
+            _,
+            _,
+        ) = sections[section_index]
+        extent = max(size, 1)
+        if (
+            section_type == 8
+            or not section_flags & 0x2
+            or not section_flags & 0x4
+            or value < section_address
+            or value - section_address > section_size
+            or extent > section_size - (value - section_address)
+        ):
+            return False
+        for (
+            segment_address,
+            segment_file_size,
+            _,
+            _,
+            segment_flags,
+        ) in load_segments:
+            if not segment_flags & 0x1 or value < segment_address:
+                continue
+            delta = value - segment_address
+            if (
+                delta <= segment_file_size
+                and extent <= segment_file_size - delta
+            ):
+                return True
+        return False
+
+    exports = set()
+    string_limit = string_offset + string_size
+    for index in range(symbol_count):
+        offset = file_offset + index * entry_size
+        string_index = struct.unpack_from("<I", data, offset)[0]
+        symbol_info = data[offset + 4]
+        symbol_visibility = data[offset + 5] & 0x3
+        section_index = struct.unpack_from("<H", data, offset + 6)[0]
+        symbol_value = struct.unpack_from("<Q", data, offset + 8)[0]
+        symbol_size = struct.unpack_from("<Q", data, offset + 16)[0]
+        symbol_binding = symbol_info >> 4
+        symbol_type = symbol_info & 0xF
+        if (
+            string_index == 0
+            or string_index >= string_size
+            or symbol_binding not in (1, 2)
+            or symbol_type not in (0, 2, 10)
+            or symbol_visibility not in (0, 3)
+            or not is_executable_symbol(
+                section_index,
+                symbol_value,
+                symbol_size,
+            )
+        ):
+            continue
+        symbol = bounded_c_string(
+            data,
+            string_offset + string_index,
+            string_limit,
+            "Packaged ELF dynamic symbol",
+            name,
+        )
+        if not all(
+            contains(index, symbol) for contains in loader_hashes
+        ):
+            continue
+        if version_offset is not None:
+            symbol_version = struct.unpack_from(
+                "<H", data, version_offset + index * 2
+            )[0]
+            if symbol_version & 0x8000 or symbol_version & 0x7FFF == 0:
+                continue
+        exports.add(symbol)
     return exports
 
 
@@ -458,6 +940,10 @@ def validate_macho(data, expected_cpu, name):
     has_executable_segment = False
     has_dylib_id = False
     symbol_table = None
+    sections = []
+    file_backed_segments = []
+    dyld_info_export_trie = None
+    dedicated_export_trie = None
     offset = command_start
     for _ in range(command_count):
         if offset + 8 > command_end:
@@ -469,16 +955,66 @@ def validate_macho(data, expected_cpu, name):
         if command == 0x19:
             if size < 72:
                 fail("Packaged Mach-O segment command is invalid: {}".format(name))
+            virtual_address = struct.unpack_from("<Q", data, offset + 24)[0]
+            virtual_size = struct.unpack_from("<Q", data, offset + 32)[0]
             file_offset = struct.unpack_from("<Q", data, offset + 40)[0]
             file_size = struct.unpack_from("<Q", data, offset + 48)[0]
             initial_protection = struct.unpack_from("<I", data, offset + 60)[0]
+            section_count = struct.unpack_from("<I", data, offset + 64)[0]
             if (
                 file_offset > len(data)
                 or file_size > len(data) - file_offset
+                or section_count > 255
+                or size != 72 + section_count * 80
             ):
                 fail("Packaged Mach-O segment is out of bounds: {}".format(name))
             if file_size > 0 and initial_protection & 0x4:
                 has_executable_segment = True
+            if file_size > 0:
+                file_backed_segments.append(
+                    (
+                        virtual_address,
+                        virtual_size,
+                        file_offset,
+                        file_size,
+                    )
+                )
+            section_offset = offset + 72
+            for _ in range(section_count):
+                section_address = struct.unpack_from(
+                    "<Q", data, section_offset + 32
+                )[0]
+                section_size = struct.unpack_from(
+                    "<Q", data, section_offset + 40
+                )[0]
+                section_file_offset = struct.unpack_from(
+                    "<I", data, section_offset + 48
+                )[0]
+                section_flags = struct.unpack_from(
+                    "<I", data, section_offset + 64
+                )[0]
+                executable = bool(
+                    initial_protection & 0x4
+                    and section_flags & 0x80000400
+                )
+                if executable and (
+                    section_address < virtual_address
+                    or section_address - virtual_address > virtual_size
+                    or section_size
+                    > virtual_size - (section_address - virtual_address)
+                    or section_file_offset < file_offset
+                    or section_file_offset - file_offset > file_size
+                    or section_size
+                    > file_size - (section_file_offset - file_offset)
+                ):
+                    fail(
+                        "Packaged Mach-O executable section is out of bounds: {}"
+                        .format(name)
+                    )
+                sections.append(
+                    (section_address, section_size, executable)
+                )
+                section_offset += 80
         elif command == 0xD:
             if size < 24:
                 fail("Packaged Mach-O dylib id is invalid: {}".format(name))
@@ -496,6 +1032,18 @@ def validate_macho(data, expected_cpu, name):
             if size != 24 or symbol_table is not None:
                 fail("Packaged Mach-O symbol table is invalid: {}".format(name))
             symbol_table = struct.unpack_from("<IIII", data, offset + 8)
+        elif command in (0x22, 0x80000022):
+            if size != 48 or dyld_info_export_trie is not None:
+                fail("Packaged Mach-O dyld info is invalid: {}".format(name))
+            dyld_info_export_trie = struct.unpack_from(
+                "<II", data, offset + 40
+            )
+        elif command == 0x80000033:
+            if size != 16 or dedicated_export_trie is not None:
+                fail("Packaged Mach-O export trie is invalid: {}".format(name))
+            dedicated_export_trie = struct.unpack_from(
+                "<II", data, offset + 8
+            )
         offset += size
     if offset != command_end or not (has_executable_segment and has_dylib_id):
         fail(
@@ -516,20 +1064,30 @@ def validate_macho(data, expected_cpu, name):
     ):
         fail("Packaged Mach-O symbol table is out of bounds: {}".format(name))
 
-    exports = set()
+    callable_symbols = {}
     string_limit = string_offset + string_size
     for index in range(symbol_count):
         offset = symbol_offset + index * 16
         string_index, symbol_type, section_index = struct.unpack_from(
             "<IBB", data, offset
         )
+        symbol_value = struct.unpack_from("<Q", data, offset + 8)[0]
         if (
             string_index == 0
             or string_index >= string_size
             or symbol_type & 0xE0
             or not symbol_type & 0x01
-            or symbol_type & 0x0E == 0
+            or symbol_type & 0x10
+            or symbol_type & 0x0E != 0x0E
             or section_index == 0
+            or section_index > len(sections)
+        ):
+            continue
+        section_address, section_size, executable = sections[section_index - 1]
+        if (
+            not executable
+            or symbol_value < section_address
+            or symbol_value - section_address >= section_size
         ):
             continue
         symbol = bounded_c_string(
@@ -539,6 +1097,183 @@ def validate_macho(data, expected_cpu, name):
             "Packaged Mach-O dynamic symbol",
             name,
         )
+        if symbol in callable_symbols and callable_symbols[symbol] != symbol_value:
+            fail("Packaged Mach-O symbol table is ambiguous: {}".format(name))
+        callable_symbols[symbol] = symbol_value
+
+    export_trie = (
+        dedicated_export_trie
+        if dedicated_export_trie is not None
+        else dyld_info_export_trie
+    )
+    if export_trie is None:
+        fail("Packaged Mach-O has no loader export trie: {}".format(name))
+    trie_offset, trie_size = export_trie
+    if (
+        trie_size == 0
+        or trie_offset > len(data)
+        or trie_size > len(data) - trie_offset
+    ):
+        fail("Packaged Mach-O export trie is out of bounds: {}".format(name))
+    if not file_backed_segments:
+        fail("Packaged Mach-O has no file-backed segment: {}".format(name))
+    image_base = min(segment[0] for segment in file_backed_segments)
+
+    def is_executable_address(address):
+        return any(
+            executable
+            and section_address <= address
+            and address - section_address < section_size
+            for section_address, section_size, executable in sections
+        )
+
+    trie_limit = trie_offset + trie_size
+    trie_exports = {}
+    active_nodes = set()
+    visited_nodes = set()
+    stack = [(False, 0, b"")]
+    while stack:
+        leaving, node_offset, prefix = stack.pop()
+        if leaving:
+            active_nodes.remove(node_offset)
+            continue
+        if node_offset in active_nodes:
+            fail("Packaged Mach-O export trie contains a cycle: {}".format(name))
+        if node_offset in visited_nodes:
+            fail(
+                "Packaged Mach-O export trie reuses a node: {}".format(name)
+            )
+        if node_offset >= trie_size:
+            fail(
+                "Packaged Mach-O export trie child is out of bounds: {}"
+                .format(name)
+            )
+        if len(visited_nodes) >= MAX_NATIVE_SYMBOLS:
+            fail("Packaged Mach-O export trie is too large: {}".format(name))
+        active_nodes.add(node_offset)
+        visited_nodes.add(node_offset)
+        stack.append((True, node_offset, b""))
+
+        cursor = trie_offset + node_offset
+        terminal_size, cursor = macho_uleb128(
+            data,
+            cursor,
+            trie_limit,
+            "Packaged Mach-O export trie terminal size",
+            name,
+        )
+        if terminal_size > trie_limit - cursor:
+            fail(
+                "Packaged Mach-O export trie terminal is out of bounds: {}"
+                .format(name)
+            )
+        terminal_end = cursor + terminal_size
+        if terminal_size:
+            flags, cursor = macho_uleb128(
+                data,
+                cursor,
+                terminal_end,
+                "Packaged Mach-O export trie flags",
+                name,
+            )
+            if flags & 0x03 == 0x03 or (
+                flags & 0x08 and flags & 0x10
+            ):
+                fail(
+                    "Packaged Mach-O export trie flags are invalid: {}"
+                    .format(name)
+                )
+            if flags & 0x08:
+                _, cursor = macho_uleb128(
+                    data,
+                    cursor,
+                    terminal_end,
+                    "Packaged Mach-O re-export ordinal",
+                    name,
+                )
+                imported_name = bounded_c_string(
+                    data,
+                    cursor,
+                    terminal_end,
+                    "Packaged Mach-O re-export name",
+                    name,
+                )
+                cursor += len(imported_name) + 1
+            else:
+                address, cursor = macho_uleb128(
+                    data,
+                    cursor,
+                    terminal_end,
+                    "Packaged Mach-O export address",
+                    name,
+                )
+                if flags & 0x10:
+                    _, cursor = macho_uleb128(
+                        data,
+                        cursor,
+                        terminal_end,
+                        "Packaged Mach-O resolver address",
+                        name,
+                    )
+                absolute_address = image_base + address
+                if (
+                    flags & 0x03 == 0
+                    and absolute_address <= 0xFFFFFFFFFFFFFFFF
+                    and is_executable_address(absolute_address)
+                ):
+                    trie_exports[prefix] = absolute_address
+            if cursor != terminal_end:
+                fail(
+                    "Packaged Mach-O export trie terminal has trailing data: {}"
+                    .format(name)
+                )
+
+        cursor = terminal_end
+        if cursor >= trie_limit:
+            fail(
+                "Packaged Mach-O export trie child count is out of bounds: {}"
+                .format(name)
+            )
+        child_count = data[cursor]
+        cursor += 1
+        child_edges = set()
+        children = []
+        for child_index in range(child_count):
+            edge = bounded_c_string(
+                data,
+                cursor,
+                trie_limit,
+                "Packaged Mach-O export trie child edge",
+                name,
+            )
+            cursor += len(edge) + 1
+            if not edge or edge in child_edges:
+                fail(
+                    "Packaged Mach-O export trie child edge is invalid: {}"
+                    .format(name)
+                )
+            child_edges.add(edge)
+            child_offset, cursor = macho_uleb128(
+                data,
+                cursor,
+                trie_limit,
+                "Packaged Mach-O export trie child offset",
+                name,
+            )
+            child_prefix = prefix + edge
+            if len(child_prefix) > MAX_NATIVE_SYMBOL_LENGTH:
+                fail(
+                    "Packaged Mach-O export symbol is too long: {}"
+                    .format(name)
+                )
+            children.append((child_offset, child_prefix))
+        for child_offset, child_prefix in reversed(children):
+            stack.append((False, child_offset, child_prefix))
+
+    exports = set()
+    for symbol, address in trie_exports.items():
+        if callable_symbols.get(symbol) != address:
+            continue
         if symbol.startswith(b"_"):
             symbol = symbol[1:]
         exports.add(symbol)
@@ -598,11 +1333,24 @@ def validate_pe(data, expected_machine, name):
             has_executable_section = True
         mapped_size = max(virtual_size, raw_size)
         sections.append(
-            (virtual_address, mapped_size, raw_offset, raw_size)
+            (
+                virtual_address,
+                mapped_size,
+                raw_offset,
+                raw_size,
+                characteristics,
+            )
         )
 
-    def rva_to_offset(rva, size, description):
-        for virtual_address, mapped_size, raw_offset, raw_size in sections:
+    def rva_to_location(rva, size, description):
+        matches = []
+        for (
+            virtual_address,
+            mapped_size,
+            raw_offset,
+            raw_size,
+            characteristics,
+        ) in sections:
             if virtual_address <= rva:
                 delta = rva - virtual_address
                 if (
@@ -611,8 +1359,21 @@ def validate_pe(data, expected_machine, name):
                     and delta <= raw_size
                     and size <= raw_size - delta
                 ):
-                    return raw_offset + delta
-        fail("{} is out of bounds: {}".format(description, name))
+                    matches.append(
+                        (
+                            raw_offset + delta,
+                            raw_offset + raw_size,
+                            characteristics,
+                        )
+                    )
+        if len(matches) != 1:
+            fail("{} has an invalid or ambiguous mapping: {}".format(
+                description, name
+            ))
+        return matches[0]
+
+    def rva_to_offset(rva, size, description):
+        return rva_to_location(rva, size, description)[0]
 
     export_offset = rva_to_offset(
         export_rva, export_size, "Packaged PE export directory"
@@ -661,6 +1422,7 @@ def validate_pe(data, expected_machine, name):
     )
 
     exports = set()
+    previous_symbol = None
     for index in range(name_count):
         symbol_rva = struct.unpack_from("<I", data, names_offset + index * 4)[0]
         ordinal = struct.unpack_from(
@@ -673,25 +1435,36 @@ def validate_pe(data, expected_machine, name):
         )[0]
         if function_rva == 0:
             fail("Packaged PE export address is invalid: {}".format(name))
-        symbol_offset = rva_to_offset(
+        callable_export = not (
+            export_rva <= function_rva < export_rva + export_size
+        )
+        if callable_export:
+            _, _, function_characteristics = rva_to_location(
+                function_rva,
+                1,
+                "Packaged PE export address",
+            )
+            callable_export = bool(
+                function_characteristics & 0x20000000
+            )
+        symbol_offset, section_limit, _ = rva_to_location(
             symbol_rva, 1, "Packaged PE export name"
         )
-        section_limit = None
-        for _, _, raw_offset, raw_size in sections:
-            if raw_offset <= symbol_offset < raw_offset + raw_size:
-                section_limit = raw_offset + raw_size
-                break
-        if section_limit is None:
-            fail("Packaged PE export name is out of bounds: {}".format(name))
-        exports.add(
-            bounded_c_string(
-                data,
-                symbol_offset,
-                section_limit,
-                "Packaged PE export name",
-                name,
-            )
+        symbol = bounded_c_string(
+            data,
+            symbol_offset,
+            section_limit,
+            "Packaged PE export name",
+            name,
         )
+        if previous_symbol is not None and symbol <= previous_symbol:
+            fail(
+                "Packaged PE export names are not strictly sorted: {}"
+                .format(name)
+            )
+        previous_symbol = symbol
+        if callable_export:
+            exports.add(symbol)
     return exports
 
 
@@ -742,8 +1515,25 @@ def parse_properties(contents):
 
 
 repository = Path(sys.argv[1]).resolve()
-target_dir = Path(sys.argv[2]).resolve()
+target_dir_argument = Path(sys.argv[2])
+if target_dir_argument.is_symlink():
+    fail("Java staging validation target must not be a symbolic link")
+target_dir = target_dir_argument.resolve()
 version = sys.argv[3]
+mode = sys.argv[4]
+
+if mode == "java-class-set":
+    if target_dir.is_symlink() or not target_dir.is_dir():
+        fail(
+            "Compiled Java classes directory does not exist: {}".format(
+                target_dir
+            )
+        )
+    actual_classes = compiled_java_classes(target_dir)
+    validate_java_class_set(actual_classes, "Compiled Java class set")
+    raise SystemExit(0)
+if mode != "artifacts":
+    fail("Unknown Java staging validation mode: {}".format(mode))
 
 if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
     fail("Invalid Java staging version: {}".format(version))

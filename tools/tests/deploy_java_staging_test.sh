@@ -155,6 +155,12 @@ symbol_blob = b"\x00".join(symbol_names)
 
 
 def elf(machine):
+    def gnu_hash(symbol):
+        value = 5381
+        for byte in symbol:
+            value = (value * 33 + byte) & 0xFFFFFFFF
+        return value
+
     data = bytearray(64 * 1024)
     data[:4] = b"\x7fELF"
     data[4] = 2
@@ -170,7 +176,7 @@ def elf(machine):
     section_offset = 0x5000
     struct.pack_into("<Q", data, 40, section_offset)
     struct.pack_into("<H", data, 58, 64)
-    struct.pack_into("<H", data, 60, 3)
+    struct.pack_into("<H", data, 60, 7)
     struct.pack_into("<I", data, 64, 1)
     struct.pack_into("<I", data, 68, 5)
     struct.pack_into("<Q", data, 72, 0)
@@ -180,10 +186,11 @@ def elf(machine):
     struct.pack_into("<I", data, 120, 2)
     struct.pack_into("<I", data, 124, 6)
     struct.pack_into("<Q", data, 128, 4096)
+    struct.pack_into("<Q", data, 136, 4096)
     struct.pack_into("<Q", data, 152, 512)
     struct.pack_into("<Q", data, 160, 512)
     struct.pack_into("<Q", data, 168, 8)
-    data[8192 : 8192 + len(symbol_blob)] = symbol_blob
+    data[0x7000 : 0x7000 + len(symbol_blob)] = symbol_blob
 
     dynamic_strings = bytearray(b"\x00")
     string_indexes = []
@@ -192,6 +199,22 @@ def elf(machine):
         dynamic_strings.extend(symbol + b"\x00")
     string_offset = 0x3000
     symbol_offset = 0x4000
+    text_offset = 0x6000
+    hash_offset = 0x2800
+    gnu_hash_offset = 0x2900
+    version_offset = 0x2C00
+    dynamic_entries = (
+        (4, hash_offset),
+        (5, string_offset),
+        (6, symbol_offset),
+        (10, len(dynamic_strings)),
+        (11, 24),
+        (0x6FFFFEF5, gnu_hash_offset),
+        (0x6FFFFFF0, version_offset),
+        (0, 0),
+    )
+    for index, (tag, value) in enumerate(dynamic_entries):
+        struct.pack_into("<qQ", data, 0x1000 + index * 16, tag, value)
     data[
         string_offset : string_offset + len(dynamic_strings)
     ] = dynamic_strings
@@ -203,18 +226,66 @@ def elf(machine):
             string_index,
             0x12,
             0,
-            1,
-            0x1000 + index * 16,
+            3,
+            text_offset + index * 16,
             16,
+        )
+        data[
+            text_offset + index * 16 : text_offset + index * 16 + 16
+        ] = b"\x90" * 16
+    symbol_count = len(symbol_names) + 1
+    struct.pack_into("<II", data, hash_offset, 1, symbol_count)
+    struct.pack_into("<I", data, hash_offset + 8, 1)
+    for index in range(1, symbol_count):
+        next_index = index + 1 if index + 1 < symbol_count else 0
+        struct.pack_into(
+            "<I",
+            data,
+            hash_offset + 12 + index * 4,
+            next_index,
+        )
+    for index in range(symbol_count):
+        struct.pack_into("<H", data, version_offset + index * 2, 1)
+    bloom_shift = 5
+    bloom = 0
+    hashes = [gnu_hash(symbol) for symbol in symbol_names]
+    for symbol_hash in hashes:
+        bloom |= 1 << (symbol_hash % 64)
+        bloom |= 1 << ((symbol_hash >> bloom_shift) % 64)
+    struct.pack_into(
+        "<IIIIQ",
+        data,
+        gnu_hash_offset,
+        1,
+        1,
+        1,
+        bloom_shift,
+        bloom,
+    )
+    struct.pack_into("<I", data, gnu_hash_offset + 24, 1)
+    for index, symbol_hash in enumerate(hashes):
+        if index + 1 == len(hashes):
+            symbol_hash |= 1
+        else:
+            symbol_hash &= ~1
+        struct.pack_into(
+            "<I",
+            data,
+            gnu_hash_offset + 28 + index * 4,
+            symbol_hash,
         )
 
     string_section = section_offset + 64
     struct.pack_into("<I", data, string_section + 4, 3)
+    struct.pack_into("<Q", data, string_section + 8, 2)
+    struct.pack_into("<Q", data, string_section + 16, string_offset)
     struct.pack_into("<Q", data, string_section + 24, string_offset)
     struct.pack_into("<Q", data, string_section + 32, len(dynamic_strings))
     struct.pack_into("<Q", data, string_section + 48, 1)
     symbol_section = section_offset + 128
     struct.pack_into("<I", data, symbol_section + 4, 11)
+    struct.pack_into("<Q", data, symbol_section + 8, 2)
+    struct.pack_into("<Q", data, symbol_section + 16, symbol_offset)
     struct.pack_into("<Q", data, symbol_section + 24, symbol_offset)
     struct.pack_into(
         "<Q", data, symbol_section + 32, (len(symbol_names) + 1) * 24
@@ -223,28 +294,88 @@ def elf(machine):
     struct.pack_into("<I", data, symbol_section + 44, 1)
     struct.pack_into("<Q", data, symbol_section + 48, 8)
     struct.pack_into("<Q", data, symbol_section + 56, 24)
+    text_section = section_offset + 192
+    struct.pack_into("<I", data, text_section + 4, 1)
+    struct.pack_into("<Q", data, text_section + 8, 6)
+    struct.pack_into("<Q", data, text_section + 16, text_offset)
+    struct.pack_into("<Q", data, text_section + 24, text_offset)
+    struct.pack_into(
+        "<Q", data, text_section + 32, (len(symbol_names) + 1) * 16
+    )
+    struct.pack_into("<Q", data, text_section + 48, 16)
+    hash_section = section_offset + 256
+    struct.pack_into("<I", data, hash_section + 4, 5)
+    struct.pack_into("<Q", data, hash_section + 8, 2)
+    struct.pack_into("<Q", data, hash_section + 16, hash_offset)
+    struct.pack_into("<Q", data, hash_section + 24, hash_offset)
+    struct.pack_into(
+        "<Q", data, hash_section + 32, 12 + symbol_count * 4
+    )
+    struct.pack_into("<I", data, hash_section + 40, 2)
+    struct.pack_into("<Q", data, hash_section + 48, 4)
+    struct.pack_into("<Q", data, hash_section + 56, 4)
+    version_section = section_offset + 320
+    struct.pack_into("<I", data, version_section + 4, 0x6FFFFFFF)
+    struct.pack_into("<Q", data, version_section + 8, 2)
+    struct.pack_into("<Q", data, version_section + 16, version_offset)
+    struct.pack_into("<Q", data, version_section + 24, version_offset)
+    struct.pack_into("<Q", data, version_section + 32, symbol_count * 2)
+    struct.pack_into("<I", data, version_section + 40, 2)
+    struct.pack_into("<Q", data, version_section + 48, 2)
+    struct.pack_into("<Q", data, version_section + 56, 2)
+    gnu_hash_section = section_offset + 384
+    struct.pack_into("<I", data, gnu_hash_section + 4, 0x6FFFFFF6)
+    struct.pack_into("<Q", data, gnu_hash_section + 8, 2)
+    struct.pack_into("<Q", data, gnu_hash_section + 16, gnu_hash_offset)
+    struct.pack_into("<Q", data, gnu_hash_section + 24, gnu_hash_offset)
+    struct.pack_into(
+        "<Q", data, gnu_hash_section + 32, 28 + len(hashes) * 4
+    )
+    struct.pack_into("<I", data, gnu_hash_section + 40, 2)
+    struct.pack_into("<Q", data, gnu_hash_section + 48, 8)
     return bytes(data)
 
 
 def macho():
+    def uleb128(value):
+        encoded = bytearray()
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                byte |= 0x80
+            encoded.append(byte)
+            if not value:
+                return bytes(encoded)
+
     data = bytearray(64 * 1024)
     data[:4] = b"\xcf\xfa\xed\xfe"
     struct.pack_into("<I", data, 4, 0x0100000C)
     struct.pack_into("<I", data, 12, 6)
-    struct.pack_into("<I", data, 16, 3)
-    struct.pack_into("<I", data, 20, 128)
+    struct.pack_into("<I", data, 16, 4)
+    struct.pack_into("<I", data, 20, 224)
     struct.pack_into("<I", data, 32, 0x19)
-    struct.pack_into("<I", data, 36, 72)
+    struct.pack_into("<I", data, 36, 152)
     data[40:56] = b"__TEXT\x00" + b"\x00" * 9
-    struct.pack_into("<Q", data, 64, len(data))
-    struct.pack_into("<Q", data, 72, 0)
-    struct.pack_into("<Q", data, 80, len(data))
+    struct.pack_into("<Q", data, 56, 0x1000)
+    struct.pack_into("<Q", data, 64, 0x1000)
+    struct.pack_into("<Q", data, 72, 0x3000)
+    struct.pack_into("<Q", data, 80, 0x1000)
     struct.pack_into("<I", data, 88, 7)
     struct.pack_into("<I", data, 92, 5)
-    struct.pack_into("<I", data, 104, 0xD)
-    struct.pack_into("<I", data, 108, 32)
-    struct.pack_into("<I", data, 112, 24)
-    data[128:135] = b"mosaic\x00"
+    struct.pack_into("<I", data, 96, 1)
+    data[104:120] = b"__text\x00" + b"\x00" * 9
+    data[120:136] = b"__TEXT\x00" + b"\x00" * 9
+    struct.pack_into("<Q", data, 136, 0x1000)
+    struct.pack_into(
+        "<Q", data, 144, (len(symbol_names) + 1) * 16
+    )
+    struct.pack_into("<I", data, 152, 0x3000)
+    struct.pack_into("<I", data, 168, 0x80000400)
+    struct.pack_into("<I", data, 184, 0xD)
+    struct.pack_into("<I", data, 188, 32)
+    struct.pack_into("<I", data, 192, 24)
+    data[208:215] = b"mosaic\x00"
 
     dynamic_strings = bytearray(b"\x00")
     string_indexes = []
@@ -253,10 +384,36 @@ def macho():
         dynamic_strings.extend(b"_" + symbol + b"\x00")
     symbol_offset = 0x1000
     string_offset = 0x2000
-    struct.pack_into("<I", data, 136, 0x2)
-    struct.pack_into("<I", data, 140, 24)
-    struct.pack_into("<IIII", data, 144, symbol_offset, len(symbol_names),
+    struct.pack_into("<I", data, 216, 0x2)
+    struct.pack_into("<I", data, 220, 24)
+    struct.pack_into("<IIII", data, 224, symbol_offset, len(symbol_names),
                      string_offset, len(dynamic_strings))
+    trie_offset = 0x5000
+    trie_names = [b"_" + symbol for symbol in symbol_names]
+    leaves = []
+    for index in range(len(trie_names)):
+        payload = uleb128(0) + uleb128(index * 16)
+        leaves.append(uleb128(len(payload)) + payload + b"\x00")
+    child_offsets = [0] * len(leaves)
+    for _ in range(10):
+        root = bytearray(b"\x00" + bytes([len(leaves)]))
+        for trie_name, child_offset in zip(trie_names, child_offsets):
+            root.extend(trie_name + b"\x00")
+            root.extend(uleb128(child_offset))
+        new_offsets = []
+        next_offset = len(root)
+        for leaf in leaves:
+            new_offsets.append(next_offset)
+            next_offset += len(leaf)
+        if new_offsets == child_offsets:
+            break
+        child_offsets = new_offsets
+    else:
+        raise AssertionError("Mach-O export trie offsets did not converge")
+    trie = bytes(root) + b"".join(leaves)
+    data[trie_offset : trie_offset + len(trie)] = trie
+    struct.pack_into("<II", data, 240, 0x80000033, 16)
+    struct.pack_into("<II", data, 248, trie_offset, len(trie))
     data[
         string_offset : string_offset + len(dynamic_strings)
     ] = dynamic_strings
@@ -271,6 +428,9 @@ def macho():
             0,
             0x1000 + index * 16,
         )
+        data[
+            0x3000 + index * 16 : 0x3000 + index * 16 + 16
+        ] = b"\x00\x00\x80\xd2\xc0\x03\x5f\xd6" * 2
     data[0x4000 : 0x4000 + len(symbol_blob)] = symbol_blob
     return bytes(data)
 
@@ -282,7 +442,7 @@ def pe():
     struct.pack_into("<I", data, 0x3C, pe_offset)
     data[pe_offset : pe_offset + 4] = b"PE\x00\x00"
     struct.pack_into("<H", data, pe_offset + 4, 0x8664)
-    struct.pack_into("<H", data, pe_offset + 6, 1)
+    struct.pack_into("<H", data, pe_offset + 6, 2)
     struct.pack_into("<H", data, pe_offset + 20, 240)
     struct.pack_into("<H", data, pe_offset + 22, 0x2022)
     optional = pe_offset + 24
@@ -293,11 +453,18 @@ def pe():
     struct.pack_into("<I", data, optional + 116, 0x2000)
     section = optional + 240
     data[section : section + 8] = b".text\x00\x00\x00"
-    struct.pack_into("<I", data, section + 8, len(data) - 0x200)
+    struct.pack_into("<I", data, section + 8, 0x8000)
     struct.pack_into("<I", data, section + 12, 0x1000)
-    struct.pack_into("<I", data, section + 16, len(data) - 0x200)
+    struct.pack_into("<I", data, section + 16, 0x8000)
     struct.pack_into("<I", data, section + 20, 0x200)
     struct.pack_into("<I", data, section + 36, 0x60000020)
+    alias_section = section + 40
+    data[alias_section : alias_section + 8] = b".alias\x00\x00"
+    struct.pack_into("<I", data, alias_section + 8, 0x2000)
+    struct.pack_into("<I", data, alias_section + 12, 0xA000)
+    struct.pack_into("<I", data, alias_section + 16, 0x2000)
+    struct.pack_into("<I", data, alias_section + 20, 0x9000)
+    struct.pack_into("<I", data, alias_section + 36, 0x40000040)
 
     export_offset = 0x200
     functions_offset = 0x300
@@ -307,6 +474,7 @@ def pe():
     strings_offset = 0x600
     section_rva = 0x1000
     raw_offset = 0x200
+    pe_symbols = sorted(symbol_names)
 
     def to_rva(offset):
         return section_rva + offset - raw_offset
@@ -322,14 +490,14 @@ def pe():
         0,
         to_rva(dll_name_offset),
         1,
-        len(symbol_names),
-        len(symbol_names),
+        len(pe_symbols),
+        len(pe_symbols),
         to_rva(functions_offset),
         to_rva(names_offset),
         to_rva(ordinals_offset),
     )
     next_string = strings_offset
-    for index, symbol in enumerate(symbol_names):
+    for index, symbol in enumerate(pe_symbols):
         struct.pack_into(
             "<I", data, functions_offset + index * 4, 0x3000 + index * 16
         )
@@ -2071,6 +2239,478 @@ PY
   done
 }
 
+mutate_candidate_native_entry() {
+  local native=$1
+  local mutation=$2
+
+  "$PYTHON" - \
+    "$CANDIDATE_DIR/mosaic-0.3.0.jar" \
+    "$native" \
+    "$mutation" <<'PY'
+import os
+import struct
+import sys
+import zipfile
+from pathlib import Path
+
+
+jar_path = Path(sys.argv[1])
+entry_name = sys.argv[2]
+mutation = sys.argv[3]
+temporary = jar_path.with_suffix(".tmp")
+
+
+def elf_metadata(data):
+    program_offset = struct.unpack_from("<Q", data, 32)[0]
+    program_size = struct.unpack_from("<H", data, 54)[0]
+    program_count = struct.unpack_from("<H", data, 56)[0]
+    loads = []
+    dynamic = None
+    for index in range(program_count):
+        program = program_offset + index * program_size
+        kind = struct.unpack_from("<I", data, program)[0]
+        file_offset, virtual_address = struct.unpack_from(
+            "<QQ", data, program + 8
+        )
+        file_size = struct.unpack_from("<Q", data, program + 32)[0]
+        if kind == 1:
+            loads.append((virtual_address, file_offset, file_size))
+        elif kind == 2:
+            dynamic = (file_offset, file_size)
+
+    def virtual_to_file(address):
+        for virtual_address, file_offset, file_size in loads:
+            if virtual_address <= address < virtual_address + file_size:
+                return file_offset + address - virtual_address
+        raise AssertionError("ELF virtual address is not file-backed")
+
+    dynamic_values = {}
+    for offset in range(dynamic[0], sum(dynamic), 16):
+        tag, value = struct.unpack_from("<qQ", data, offset)
+        if tag == 0:
+            break
+        dynamic_values[tag] = value
+
+    section_offset = struct.unpack_from("<Q", data, 40)[0]
+    section_size = struct.unpack_from("<H", data, 58)[0]
+    section_count = struct.unpack_from("<H", data, 60)[0]
+    symbols = None
+    for index in range(section_count):
+        section = section_offset + index * section_size
+        if struct.unpack_from("<I", data, section + 4)[0] == 11:
+            symbols = (
+                struct.unpack_from("<Q", data, section + 24)[0],
+                struct.unpack_from("<Q", data, section + 32)[0],
+                struct.unpack_from("<Q", data, section + 56)[0],
+            )
+            break
+    return dynamic_values, virtual_to_file, symbols
+
+
+with zipfile.ZipFile(jar_path) as source, zipfile.ZipFile(
+    temporary, "w", zipfile.ZIP_DEFLATED
+) as target:
+    for info in source.infolist():
+        contents = source.read(info)
+        if info.filename == entry_name:
+            data = bytearray(contents)
+            if mutation.startswith("elf-"):
+                dynamic_values, virtual_to_file, symbols = elf_metadata(data)
+                symbol_offset, symbol_size, entry_size = symbols
+                symbol_count = symbol_size // entry_size
+                if mutation == "elf-hash-unreachable":
+                    hash_offset = virtual_to_file(dynamic_values[4])
+                    struct.pack_into("<I", data, hash_offset + 8, 0)
+                elif mutation == "elf-gnu-hash-unreachable":
+                    hash_offset = virtual_to_file(
+                        dynamic_values[0x6FFFFEF5]
+                    )
+                    struct.pack_into("<Q", data, hash_offset + 16, 0)
+                elif mutation == "elf-hidden-version":
+                    version_offset = virtual_to_file(
+                        dynamic_values[0x6FFFFFF0]
+                    )
+                    for index in range(1, symbol_count):
+                        version = struct.unpack_from(
+                            "<H", data, version_offset + index * 2
+                        )[0]
+                        struct.pack_into(
+                            "<H",
+                            data,
+                            version_offset + index * 2,
+                            version | 0x8000,
+                        )
+                elif mutation == "elf-notype":
+                    for index in range(1, symbol_count):
+                        offset = symbol_offset + index * entry_size
+                        data[offset + 4] &= 0xF0
+                elif mutation == "elf-nonexec":
+                    for index in range(1, symbol_count):
+                        offset = symbol_offset + index * entry_size
+                        struct.pack_into("<H", data, offset + 6, 1)
+                        struct.pack_into(
+                            "<Q", data, offset + 8, dynamic_values[5]
+                        )
+                else:
+                    raise AssertionError("unknown ELF mutation")
+            elif mutation.startswith("macho-"):
+                command_count = struct.unpack_from("<I", data, 16)[0]
+                offset = 32
+                for _ in range(command_count):
+                    command, size = struct.unpack_from("<II", data, offset)
+                    if mutation == "macho-empty-trie" and command == 0x80000033:
+                        trie_offset = struct.unpack_from(
+                            "<I", data, offset + 8
+                        )[0]
+                        data[trie_offset : trie_offset + 2] = b"\x00\x00"
+                    elif mutation == "macho-nonexec" and command == 0x19:
+                        struct.pack_into("<I", data, offset + 72 + 64, 0)
+                    offset += size
+            elif mutation in ("pe-nonexec-alias", "pe-unsorted-names"):
+                pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                optional_offset = pe_offset + 24
+                section_offset = optional_offset + struct.unpack_from(
+                    "<H", data, pe_offset + 20
+                )[0]
+                text_section = section_offset
+                alias_section = section_offset + 40
+                alias_rva = struct.unpack_from(
+                    "<I", data, alias_section + 12
+                )[0]
+                text_raw_offset = struct.unpack_from(
+                    "<I", data, text_section + 20
+                )[0]
+                struct.pack_into(
+                    "<I", data, alias_section + 20, text_raw_offset + 0x2000
+                )
+                export_rva = struct.unpack_from(
+                    "<I", data, optional_offset + 112
+                )[0]
+                export_offset = (
+                    text_raw_offset
+                    + export_rva
+                    - struct.unpack_from(
+                        "<I", data, text_section + 12
+                    )[0]
+                )
+                function_count = struct.unpack_from(
+                    "<I", data, export_offset + 20
+                )[0]
+                functions_rva = struct.unpack_from(
+                    "<I", data, export_offset + 28
+                )[0]
+                names_rva = struct.unpack_from(
+                    "<I", data, export_offset + 32
+                )[0]
+                functions_offset = (
+                    text_raw_offset
+                    + functions_rva
+                    - struct.unpack_from(
+                        "<I", data, text_section + 12
+                    )[0]
+                )
+                names_offset = (
+                    text_raw_offset
+                    + names_rva
+                    - struct.unpack_from(
+                        "<I", data, text_section + 12
+                    )[0]
+                )
+                if mutation == "pe-nonexec-alias":
+                    for index in range(function_count):
+                        struct.pack_into(
+                            "<I",
+                            data,
+                            functions_offset + index * 4,
+                            alias_rva + index * 16,
+                        )
+                else:
+                    first = struct.unpack_from("<I", data, names_offset)[0]
+                    second = struct.unpack_from(
+                        "<I", data, names_offset + 4
+                    )[0]
+                    struct.pack_into("<I", data, names_offset, second)
+                    struct.pack_into("<I", data, names_offset + 4, first)
+            else:
+                raise AssertionError("unexpected native mutation")
+            contents = bytes(data)
+        output_info = zipfile.ZipInfo(
+            info.filename,
+            date_time=(2026, 1, 1, 0, 0, 0),
+        )
+        output_info.compress_type = zipfile.ZIP_DEFLATED
+        target.writestr(output_info, contents)
+os.replace(temporary, jar_path)
+PY
+  repack_candidate_and_refresh_provenance
+}
+
+test_validator_rejects_loader_unresolvable_elf_exports() {
+  local mutation
+
+  for mutation in \
+    elf-hash-unreachable \
+    elf-gnu-hash-unreachable \
+    elf-hidden-version
+  do
+    new_fixture
+    mutate_candidate_native_entry \
+      native/linux/x86_64/libpaimon_mosaic_jni.so \
+      "$mutation"
+
+    if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      fail "loader-unresolvable ELF JNI exports were accepted: $mutation"
+    fi
+    assert_contains "$OUTPUT_LOG" "missing JNI exports"
+    assert_maven_not_invoked
+  done
+}
+
+test_validator_rejects_macho_names_missing_from_export_trie() {
+  new_fixture
+  mutate_candidate_native_entry \
+    native/macos/aarch64/libpaimon_mosaic_jni.dylib \
+    macho-empty-trie
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "Mach-O JNI names missing from the export trie were accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "missing JNI exports"
+  assert_maven_not_invoked
+}
+
+test_validator_accepts_callable_elf_notype_exports() {
+  new_fixture
+  mutate_candidate_native_entry \
+    native/linux/x86_64/libpaimon_mosaic_jni.so \
+    elf-notype
+
+  run_script --dry-run > "$OUTPUT_LOG" 2>&1
+  assert_contains "$OUTPUT_LOG" \
+    "Java staging dry run finished successfully"
+  assert_maven_not_invoked
+}
+
+test_validator_rejects_exports_outside_executable_mapping() {
+  local native
+  local mutation
+
+  for native in \
+    native/linux/x86_64/libpaimon_mosaic_jni.so \
+    native/macos/aarch64/libpaimon_mosaic_jni.dylib \
+    native/windows/x86_64/paimon_mosaic_jni.dll
+  do
+    case "$native" in
+      native/linux/*) mutation=elf-nonexec ;;
+      native/macos/*) mutation=macho-nonexec ;;
+      native/windows/*) mutation=pe-nonexec-alias ;;
+      *) fail "unexpected native path: $native" ;;
+    esac
+    new_fixture
+    mutate_candidate_native_entry "$native" "$mutation"
+
+    if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      fail "JNI exports outside executable mappings were accepted: $native"
+    fi
+    assert_contains "$OUTPUT_LOG" "missing JNI exports"
+    assert_maven_not_invoked
+  done
+}
+
+test_validator_rejects_unsorted_pe_export_names() {
+  new_fixture
+  mutate_candidate_native_entry \
+    native/windows/x86_64/paimon_mosaic_jni.dll \
+    pe-unsorted-names
+
+  if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "unsorted PE export names were accepted"
+  fi
+  assert_contains "$OUTPUT_LOG" "not strictly sorted"
+  assert_maven_not_invoked
+}
+
+test_validator_rejects_non_callable_jni_exports() {
+  local native
+
+  for native in \
+    native/linux/x86_64/libpaimon_mosaic_jni.so \
+    native/linux/aarch64/libpaimon_mosaic_jni.so \
+    native/macos/aarch64/libpaimon_mosaic_jni.dylib \
+    native/windows/x86_64/paimon_mosaic_jni.dll
+  do
+    new_fixture
+    "$PYTHON" - "$CANDIDATE_DIR/mosaic-0.3.0.jar" "$native" <<'PY'
+import os
+import struct
+import sys
+import zipfile
+from pathlib import Path
+
+
+jar_path = Path(sys.argv[1])
+entry_name = sys.argv[2]
+temporary = jar_path.with_suffix(".tmp")
+with zipfile.ZipFile(jar_path) as source, zipfile.ZipFile(
+    temporary, "w", zipfile.ZIP_DEFLATED
+) as target:
+    for info in source.infolist():
+        contents = source.read(info)
+        if info.filename == entry_name:
+            data = bytearray(contents)
+            if data[:4] == b"\x7fELF":
+                section_offset = struct.unpack_from("<Q", data, 40)[0]
+                section_size = struct.unpack_from("<H", data, 58)[0]
+                section_count = struct.unpack_from("<H", data, 60)[0]
+                for index in range(section_count):
+                    section = section_offset + index * section_size
+                    if struct.unpack_from("<I", data, section + 4)[0] != 11:
+                        continue
+                    symbol_offset = struct.unpack_from(
+                        "<Q", data, section + 24
+                    )[0]
+                    symbol_size = struct.unpack_from(
+                        "<Q", data, section + 32
+                    )[0]
+                    entry_size = struct.unpack_from(
+                        "<Q", data, section + 56
+                    )[0]
+                    for symbol in range(1, symbol_size // entry_size):
+                        offset = symbol_offset + symbol * entry_size
+                        data[offset + 4] = (data[offset + 4] & 0xF0) | 0x01
+            elif data[:4] == b"\xcf\xfa\xed\xfe":
+                command_count = struct.unpack_from("<I", data, 16)[0]
+                offset = 32
+                for _ in range(command_count):
+                    command, size = struct.unpack_from("<II", data, offset)
+                    if command == 0x2:
+                        symbol_offset, symbol_count = struct.unpack_from(
+                            "<II", data, offset + 8
+                        )
+                        for symbol in range(symbol_count):
+                            data[symbol_offset + symbol * 16 + 4] = 0x03
+                    offset += size
+            elif data[:2] == b"MZ":
+                pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                optional_offset = pe_offset + 24
+                section_offset = optional_offset + struct.unpack_from(
+                    "<H", data, pe_offset + 20
+                )[0]
+                export_rva = struct.unpack_from(
+                    "<I", data, optional_offset + 112
+                )[0]
+                virtual_address = struct.unpack_from(
+                    "<I", data, section_offset + 12
+                )[0]
+                raw_offset = struct.unpack_from(
+                    "<I", data, section_offset + 20
+                )[0]
+                export_offset = raw_offset + export_rva - virtual_address
+                function_count = struct.unpack_from(
+                    "<I", data, export_offset + 20
+                )[0]
+                functions_rva = struct.unpack_from(
+                    "<I", data, export_offset + 28
+                )[0]
+                functions_offset = (
+                    raw_offset + functions_rva - virtual_address
+                )
+                for index in range(function_count):
+                    struct.pack_into(
+                        "<I",
+                        data,
+                        functions_offset + index * 4,
+                        export_rva + 40,
+                    )
+            else:
+                raise SystemExit("unexpected native format")
+            contents = bytes(data)
+        output_info = zipfile.ZipInfo(
+            info.filename,
+            date_time=(2026, 1, 1, 0, 0, 0),
+        )
+        output_info.compress_type = zipfile.ZIP_DEFLATED
+        target.writestr(output_info, contents)
+os.replace(temporary, jar_path)
+PY
+    repack_candidate_and_refresh_provenance
+
+    if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      fail "non-callable JNI exports were accepted: $native"
+    fi
+    assert_contains "$OUTPUT_LOG" "missing JNI exports"
+    assert_maven_not_invoked
+  done
+}
+
+test_validator_rejects_detached_elf_dynamic_symbols() {
+  local native
+
+  for native in \
+    native/linux/x86_64/libpaimon_mosaic_jni.so \
+    native/linux/aarch64/libpaimon_mosaic_jni.so
+  do
+    new_fixture
+    "$PYTHON" - "$CANDIDATE_DIR/mosaic-0.3.0.jar" "$native" <<'PY'
+import os
+import struct
+import sys
+import zipfile
+from pathlib import Path
+
+
+jar_path = Path(sys.argv[1])
+entry_name = sys.argv[2]
+temporary = jar_path.with_suffix(".tmp")
+with zipfile.ZipFile(jar_path) as source, zipfile.ZipFile(
+    temporary, "w", zipfile.ZIP_DEFLATED
+) as target:
+    for info in source.infolist():
+        contents = source.read(info)
+        if info.filename == entry_name:
+            data = bytearray(contents)
+            program_offset = struct.unpack_from("<Q", data, 32)[0]
+            program_size = struct.unpack_from("<H", data, 54)[0]
+            program_count = struct.unpack_from("<H", data, 56)[0]
+            for index in range(program_count):
+                program = program_offset + index * program_size
+                if struct.unpack_from("<I", data, program)[0] != 2:
+                    continue
+                dynamic_offset = struct.unpack_from(
+                    "<Q", data, program + 8
+                )[0]
+                dynamic_size = struct.unpack_from(
+                    "<Q", data, program + 32
+                )[0]
+                for offset in range(
+                    dynamic_offset,
+                    dynamic_offset + dynamic_size,
+                    16,
+                ):
+                    tag = struct.unpack_from("<Q", data, offset)[0]
+                    if tag == 0:
+                        break
+                    if tag == 6:
+                        struct.pack_into("<Q", data, offset + 8, 0)
+            contents = bytes(data)
+        output_info = zipfile.ZipInfo(
+            info.filename,
+            date_time=(2026, 1, 1, 0, 0, 0),
+        )
+        output_info.compress_type = zipfile.ZIP_DEFLATED
+        target.writestr(output_info, contents)
+os.replace(temporary, jar_path)
+PY
+    repack_candidate_and_refresh_provenance
+
+    if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      fail "detached ELF dynamic symbols were accepted: $native"
+    fi
+    assert_contains "$OUTPUT_LOG" "loader-visible"
+    assert_maven_not_invoked
+  done
+}
+
 test_validator_rejects_changed_source_and_javadoc_contents() {
   new_fixture
   rewrite_candidate_jar_entry \
@@ -2764,6 +3404,29 @@ PY
   assert_maven_not_invoked
 }
 
+test_git_fsmonitor_hook_is_never_executed() {
+  new_fixture
+  fsmonitor_hook=$(mktemp "$TEST_ROOT/fsmonitor-exec.XXXXXX")
+  fsmonitor_marker=$(mktemp "$TEST_ROOT/fsmonitor-marker.XXXXXX")
+  rm -f -- "$fsmonitor_marker"
+  cat > "$fsmonitor_hook" <<'EOF'
+#!/bin/sh
+printf 'executed\n' >> "$1"
+read token || true
+printf '0\n\n'
+EOF
+  chmod +x "$fsmonitor_hook"
+
+  git -C "$FIXTURE_DIR" config \
+    core.fsmonitor "$fsmonitor_hook $fsmonitor_marker"
+  run_script --dry-run > "$OUTPUT_LOG" 2>&1
+
+  if [[ -e "$fsmonitor_marker" ]]; then
+    fail "repository-local core.fsmonitor hook was executed"
+  fi
+  assert_maven_not_invoked
+}
+
 test_foreign_git_environment_cannot_redirect_checkout_checks() {
   new_fixture
   foreign_repo=$(mktemp -d "$TEST_ROOT/foreign.XXXXXX")
@@ -2859,6 +3522,13 @@ run_test test_validator_rejects_one_byte_classifier_jars
 run_test test_validator_rejects_invalid_java_class_and_maven_metadata
 run_test test_validator_rejects_invalid_legal_and_native_contents
 run_test test_validator_rejects_jni_names_without_dynamic_exports
+run_test test_validator_rejects_loader_unresolvable_elf_exports
+run_test test_validator_rejects_macho_names_missing_from_export_trie
+run_test test_validator_accepts_callable_elf_notype_exports
+run_test test_validator_rejects_exports_outside_executable_mapping
+run_test test_validator_rejects_unsorted_pe_export_names
+run_test test_validator_rejects_non_callable_jni_exports
+run_test test_validator_rejects_detached_elf_dynamic_symbols
 run_test test_validator_rejects_changed_source_and_javadoc_contents
 run_test test_validator_rejects_windows_drive_relative_jar_entries
 run_test test_same_commit_retag_candidate_provenance_mismatch
@@ -2881,6 +3551,7 @@ run_test test_nexus_maven_failure_status_is_preserved
 run_test test_real_deploy_requires_official_repository_run
 run_test test_dirty_release_input_stops_before_download
 run_test test_fsmonitor_cannot_hide_dirty_release_helper
+run_test test_git_fsmonitor_hook_is_never_executed
 run_test test_foreign_git_environment_cannot_redirect_checkout_checks
 run_test test_git_index_flags_are_rejected
 run_test test_git_replacement_refs_are_rejected

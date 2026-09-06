@@ -23,9 +23,15 @@ on:
     paths:
       - ".gitattributes"
       - ".github/workflows/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "core/**"
       - "docs/creating-a-release.html"
       - "docs/verifying-a-release-candidate.html"
       - "java/pom.xml"
+      - "java/src/main/java/**"
+      - "jni/**"
+      - "rust-toolchain.toml"
       - "tools/create_source_release.sh"
       - "tools/deploy_java_staging.sh"
       - "tools/java-staging-maven-plugins.sha256"
@@ -45,9 +51,15 @@ on:
     paths:
       - ".gitattributes"
       - ".github/workflows/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "core/**"
       - "docs/creating-a-release.html"
       - "docs/verifying-a-release-candidate.html"
       - "java/pom.xml"
+      - "java/src/main/java/**"
+      - "jni/**"
+      - "rust-toolchain.toml"
       - "tools/create_source_release.sh"
       - "tools/deploy_java_staging.sh"
       - "tools/java-staging-maven-plugins.sha256"
@@ -95,6 +107,26 @@ jobs:
       - name: Test local Java staging
         shell: bash
         run: bash tools/tests/deploy_java_staging_test.sh
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+          cache: maven
+          cache-dependency-path: java/pom.xml
+
+      - name: Verify Java class contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn --batch-mode --no-transfer-progress \
+            --file java/pom.xml \
+            -DskipTests \
+            clean compile
+          bash tools/validate_java_staging_artifacts.sh \
+            --validate-java-class-set \
+            java/target/classes
 
       - name: Verify current source tree
         shell: bash
