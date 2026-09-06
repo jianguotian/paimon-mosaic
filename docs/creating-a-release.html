@@ -231,6 +231,7 @@ git push origin ${RC_TAG}</code></pre>
                 <li><strong>Python publish</strong> &mdash; publishes to TestPyPI only after the Rust, Java, and Python wheel jobs succeed</li>
             </ul>
             <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated. A reused <code>java-package</code> may therefore record an earlier producer attempt than the final successful run attempt; local staging accepts that ordering while freezing the final run attempt and immutable artifact identity.</p>
+            <p>If Java is rerun, the initial dry-run selects the unexpired <code>java-package</code> with the highest artifact id and validates it before freezing its identity. An invalid newest candidate is rejected rather than falling back to an older one. If the selected artifact or run attempt later changes, staging stops; perform a new dry-run with a new manifest path.</p>
 
             <h3>Deploy Java Artifacts to Nexus Staging</h3>
             <p>First open <a href="https://repository.apache.org/#stagingProfiles">Apache Nexus Staging Profiles</a> and copy the Paimon profile id; it is not a secret. Do not run an ambient Maven plugin with release credentials merely to discover this id.</p>

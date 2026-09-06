@@ -630,19 +630,23 @@ artifacts = [
     if artifact.get("name") == "java-package"
     and not artifact.get("expired", False)
 ]
-if len(artifacts) != 1:
-    fail(
-        "Expected exactly one unexpired java-package artifact, found {}".format(
-            len(artifacts)
-        )
-    )
-artifact = artifacts[0]
+if not artifacts:
+    fail("No unexpired java-package artifact found")
+artifact_ids = [artifact.get("id") for artifact in artifacts]
+if any(
+    not isinstance(artifact_id, int) or artifact_id <= 0
+    for artifact_id in artifact_ids
+):
+    fail("java-package artifact does not have a valid immutable artifact id")
+if len(set(artifact_ids)) != len(artifact_ids):
+    fail("Duplicate java-package artifact id")
+
+# Java reruns can retain same-name artifacts; match GitHub's newest-id selection.
+artifact = max(artifacts, key=lambda artifact: artifact["id"])
 artifact_id = artifact.get("id")
 artifact_digest = artifact.get("digest")
 artifact_size = artifact.get("size_in_bytes")
 artifact_run = artifact.get("workflow_run") or {}
-if not isinstance(artifact_id, int) or artifact_id <= 0:
-    fail("java-package artifact does not have a valid immutable artifact id")
 if not isinstance(artifact_digest, str) or not re.fullmatch(
     r"sha256:[0-9a-fA-F]{64}", artifact_digest
 ):

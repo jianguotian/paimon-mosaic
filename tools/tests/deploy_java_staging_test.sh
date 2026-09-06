@@ -1044,14 +1044,17 @@ JSON
   repos/*/actions/runs/42/artifacts\?*)
     artifact_count=1
     duplicate=
-    if [[ "${FAKE_DUPLICATE_ARTIFACT:-false}" == true ]]; then
+    if [[ "${FAKE_DUPLICATE_ARTIFACT:-false}" == true &&
+          $(cat "$FAKE_GH_RUN_COUNT") -gt \
+            "${FAKE_DUPLICATE_ARTIFACT_AFTER_COUNT:-0}" ]]; then
       artifact_count=2
       duplicate=',
         {
-          "id": 9002,
+          "id": '"${FAKE_DUPLICATE_ARTIFACT_ID:-9002}"',
           "name": "java-package",
           "expired": false,
           "digest": "'"${FAKE_ARTIFACT_DIGEST}"'",
+          "size_in_bytes": '"${FAKE_DUPLICATE_ARTIFACT_SIZE:-$FAKE_ARTIFACT_SIZE}"',
           "workflow_run": {
             "id": 42,
             "head_sha": "'"${FAKE_ARTIFACT_SHA:-$(git rev-parse HEAD)}"'"
@@ -1081,7 +1084,7 @@ JSON
 JSON
     ;;
   repos/*/actions/artifacts/*/zip)
-    expected="repos/${FAKE_EXPECTED_REPOSITORY:-apache/paimon-mosaic}/actions/artifacts/${FAKE_ARTIFACT_ID:-9001}/zip"
+    expected="repos/${FAKE_EXPECTED_REPOSITORY:-apache/paimon-mosaic}/actions/artifacts/${FAKE_DOWNLOAD_ARTIFACT_ID:-${FAKE_ARTIFACT_ID:-9001}}/zip"
     if [[ "$2" != "$expected" ]]; then
       echo "unexpected artifact download endpoint: $2" >&2
       exit 2
@@ -1708,6 +1711,83 @@ test_failed_job_rerun_can_reuse_earlier_java_candidate() {
   assert_maven_not_invoked
 }
 
+test_java_rerun_selects_latest_candidate_in_either_list_order() {
+  local artifact_id
+  local other_artifact_id
+  local keys
+
+  for artifact_id in 9999 10000; do
+    FAKE_CANDIDATE_RUN_ATTEMPT=2 new_fixture
+    FAKE_RUN_ATTEMPT=2
+    FAKE_ARTIFACT_ID=$artifact_id
+    other_artifact_id=$((19999 - artifact_id))
+    FAKE_ARTIFACT_ID=10000 write_expected_provenance
+    rm -f -- "$PROVENANCE_PATH"
+
+    if ! FAKE_DUPLICATE_ARTIFACT=true \
+      FAKE_DUPLICATE_ARTIFACT_ID=$other_artifact_id \
+      FAKE_DOWNLOAD_ARTIFACT_ID=10000 \
+      run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      sed -n '1,240p' "$OUTPUT_LOG" >&2
+      fail "Java rerun with an earlier same-name artifact was rejected"
+    fi
+    cmp "$EXPECTED_PROVENANCE" "$PROVENANCE_PATH"
+    assert_contains "$GH_LOG" "/actions/artifacts/10000/zip"
+    assert_not_contains "$GH_LOG" "/actions/artifacts/9999/zip"
+    assert_contains "$OUTPUT_LOG" "dry run finished successfully"
+    assert_maven_not_invoked
+
+    keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+    printf 'fake KEYS\n' > "$keys"
+    if ! FAKE_DUPLICATE_ARTIFACT=true \
+      FAKE_DUPLICATE_ARTIFACT_ID=$other_artifact_id \
+      FAKE_DOWNLOAD_ARTIFACT_ID=10000 \
+      run_script \
+        --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+        --keys-file "$keys" \
+        > "$OUTPUT_LOG" 2>&1; then
+      sed -n '1,240p' "$OUTPUT_LOG" >&2
+      fail "Java rerun candidate failed the frozen deployment checks"
+    fi
+    cmp "$EXPECTED_PROVENANCE" "$PROVENANCE_PATH"
+    assert_contains "$NEXUS_CALLED_LOG" "called"
+    assert_not_contains "$GH_LOG" "/actions/artifacts/9999/zip"
+  done
+}
+
+test_new_java_artifact_after_dry_run_stops_before_download() {
+  new_fixture
+  rm -f -- "$PROVENANCE_PATH"
+  run_script --dry-run > "$OUTPUT_LOG" 2>&1
+  : > "$GH_LOG"
+
+  if FAKE_DUPLICATE_ARTIFACT=true \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      > "$OUTPUT_LOG" 2>&1; then
+    fail "newer Java candidate replaced the dry-run manifest"
+  fi
+  assert_contains "$OUTPUT_LOG" "Provenance manifest does not match"
+  cmp "$EXPECTED_PROVENANCE" "$PROVENANCE_PATH"
+  assert_not_contains "$GH_LOG" "/zip"
+  assert_maven_not_invoked
+  assert_not_contains "$NEXUS_CALLED_LOG" "called"
+}
+
+test_new_java_artifact_during_validation_stops_before_maven() {
+  new_fixture
+  if FAKE_DUPLICATE_ARTIFACT=true \
+    FAKE_DUPLICATE_ARTIFACT_AFTER_COUNT=1 \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "newer Java candidate was accepted during validation"
+  fi
+  assert_contains "$OUTPUT_LOG" \
+    "GitHub Actions provenance changed while validating java-package"
+  assert_contains "$GH_LOG" "/actions/artifacts/9001/zip"
+  assert_not_contains "$GH_LOG" "/actions/artifacts/9002/zip"
+  assert_maven_not_invoked
+}
+
 test_rerun_during_candidate_validation_stops_before_maven() {
   new_fixture
   if FAKE_SECOND_RUN_ATTEMPT=2 \
@@ -1874,14 +1954,24 @@ test_github_unix_socket_is_rejected_before_api_calls() {
   assert_maven_not_invoked
 }
 
-test_java_package_metadata_must_be_unique_and_complete() {
+test_java_package_metadata_must_be_complete() {
   new_fixture
   if FAKE_DUPLICATE_ARTIFACT=true \
+    FAKE_DUPLICATE_ARTIFACT_ID=9001 \
     run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
-    fail "duplicate java-package artifacts were accepted"
+    fail "duplicate immutable artifact ids were accepted"
   fi
-  assert_contains "$OUTPUT_LOG" \
-    "Expected exactly one unexpired java-package artifact"
+  assert_contains "$OUTPUT_LOG" "Duplicate java-package artifact id"
+  assert_maven_not_invoked
+
+  : > "$GH_RUN_COUNT"
+  if FAKE_DUPLICATE_ARTIFACT=true \
+    FAKE_DUPLICATE_ARTIFACT_SIZE=0 \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "incomplete newest artifact fell back to an older candidate"
+  fi
+  assert_contains "$OUTPUT_LOG" "artifact size must be between 1"
+  assert_not_contains "$GH_LOG" "/zip"
   assert_maven_not_invoked
 
   : > "$GH_RUN_COUNT"
@@ -1889,8 +1979,7 @@ test_java_package_metadata_must_be_unique_and_complete() {
     run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
     fail "expired java-package artifact was accepted"
   fi
-  assert_contains "$OUTPUT_LOG" \
-    "Expected exactly one unexpired java-package artifact"
+  assert_contains "$OUTPUT_LOG" "No unexpired java-package artifact found"
   assert_maven_not_invoked
 
   : > "$GH_RUN_COUNT"
@@ -3222,6 +3311,22 @@ test_final_provenance_boundary_runs_after_signatures() {
   new_fixture
   keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
   printf 'fake KEYS\n' > "$keys"
+  if FAKE_DUPLICATE_ARTIFACT=true \
+    FAKE_DUPLICATE_ARTIFACT_AFTER_COUNT=2 \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      --keys-file "$keys" \
+      > "$OUTPUT_LOG" 2>&1; then
+    fail "newer Java candidate was accepted after local signing"
+  fi
+  assert_contains "$OUTPUT_LOG" "provenance changed after it was frozen"
+  assert_contains "$MAVEN_LOG" "sign-and-deploy-file"
+  assert_not_contains "$GH_LOG" "/actions/artifacts/9002/zip"
+  assert_not_contains "$NEXUS_CALLED_LOG" "called"
+
+  new_fixture
+  keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+  printf 'fake KEYS\n' > "$keys"
   if FAKE_SECOND_RUN_ATTEMPT=2 \
     FAKE_RUN_CHANGE_AFTER_COUNT=2 \
     run_script \
@@ -3502,6 +3607,9 @@ run_test test_real_deploy_requires_manifest_from_dry_run
 run_test test_workflow_run_must_be_successful_release_tag_push
 run_test test_workflow_path_id_and_attempt_are_frozen
 run_test test_failed_job_rerun_can_reuse_earlier_java_candidate
+run_test test_java_rerun_selects_latest_candidate_in_either_list_order
+run_test test_new_java_artifact_after_dry_run_stops_before_download
+run_test test_new_java_artifact_during_validation_stops_before_maven
 run_test test_rerun_during_candidate_validation_stops_before_maven
 run_test test_retag_during_candidate_validation_stops_before_maven
 run_test test_workflow_run_tag_and_sha_must_match_checkout
@@ -3514,7 +3622,7 @@ run_test test_downloads_java_candidate_by_immutable_artifact_id
 run_test test_dry_run_can_validate_a_fork_without_enabling_real_deploy
 run_test test_github_host_is_pinned
 run_test test_github_unix_socket_is_rejected_before_api_calls
-run_test test_java_package_metadata_must_be_unique_and_complete
+run_test test_java_package_metadata_must_be_complete
 run_test test_downloaded_java_package_digest_must_match_metadata
 run_test test_java_package_zip_rejects_unsafe_paths
 run_test test_java_package_requires_exact_four_candidate_files
