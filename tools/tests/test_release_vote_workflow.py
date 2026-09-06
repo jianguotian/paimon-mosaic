@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import copy
+import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -30,11 +32,13 @@ RELEASE_PREFLIGHT_WORKFLOW = ROOT / ".github/workflows/release-preflight.yml"
 GATE_WORKFLOW = ROOT / ".github/workflows/release-vote-gate.yml"
 RUST_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-rust.yml"
 JAVA_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-java.yml"
+JAVA_POM = ROOT / "java/pom.xml"
+JAVA_STAGING_VALIDATOR = ROOT / "tools/validate_java_staging_artifacts.sh"
 PYTHON_PUBLISH_WORKFLOW = ROOT / ".github/workflows/release-python-publish.yml"
 RELEASE_DOCUMENTATION = ROOT / "docs/creating-a-release.html"
-CREDENTIALED_RELEASE_WORKFLOWS = (
+RELEASE_LEAF_WORKFLOWS = (
     (RUST_RELEASE_WORKFLOW, "publish"),
-    (JAVA_RELEASE_WORKFLOW, "deploy-staging"),
+    (JAVA_RELEASE_WORKFLOW, "package-java"),
     (PYTHON_PUBLISH_WORKFLOW, "publish"),
 )
 TAG_CONDITION = "startsWith(github.ref, 'refs/tags/')"
@@ -44,8 +48,7 @@ RUST_PUBLISH_CONDITION = (
     "startsWith(github.ref, 'refs/tags/') && "
     "!contains(github.ref_name, '-')"
 )
-JAVA_DEPLOY_CONDITION = (
-    "github.event_name != 'workflow_dispatch' && "
+JAVA_PACKAGE_CONDITION = (
     "github.repository == 'apache/paimon-mosaic' && "
     "startsWith(github.ref, 'refs/tags/') && "
     "contains(github.ref_name, '-rc')"
@@ -61,12 +64,25 @@ PYTHON_PUBLISH_CONDITION = (
 REQUIRED_GATE_PATHS = {
     ".gitattributes",
     ".github/workflows/**",
+    "Cargo.lock",
+    "Cargo.toml",
+    "core/**",
     "docs/creating-a-release.html",
+    "docs/verifying-a-release-candidate.html",
+    "java/pom.xml",
+    "java/src/main/java/**",
+    "jni/**",
+    "rust-toolchain.toml",
     "tools/create_source_release.sh",
+    "tools/deploy_java_staging.sh",
+    "tools/java-staging-maven-plugins.sha256",
+    "tools/prepare_java_staging_maven_plugins.py",
     "tools/update_branch_version.sh",
+    "tools/validate_java_staging_artifacts.sh",
     "tools/verify_release_versions.py",
     "tools/verify_source_archive.py",
     "tools/tests/test_create_source_release.py",
+    "tools/tests/deploy_java_staging_test.sh",
     "tools/tests/test_release_vote_workflow.py",
     "tools/tests/test_update_branch_version.py",
     "tools/tests/test_verify_release_versions.py",
@@ -89,6 +105,17 @@ VERIFY_RELEASE_COMMAND = (
     'python3 tools/verify_release_versions.py "${TAG_NAME}" '
     "--verify-signature"
 )
+EXPORT_RELEASE_PROVENANCE_COMMAND = """set -euo pipefail
+tag_object="$(git rev-parse -q --verify "refs/tags/${TAG_NAME}^{tag}")"
+commit="$(git rev-parse "${tag_object}^{commit}")"
+if [[ "${commit}" != "${GITHUB_SHA}" ||
+      "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
+  echo "Verified release tag does not match GITHUB_SHA." >&2
+  exit 1
+fi
+printf 'tag_object=%s\\n' "${tag_object}" >> "${GITHUB_OUTPUT}"
+printf 'commit=%s\\n' "${commit}" >> "${GITHUB_OUTPUT}"
+"""
 VERIFY_SOURCE_ARCHIVE_COMMAND = """set -euo pipefail
 release_version="${GITHUB_REF_NAME#v}"
 release_version="${release_version%-rc*}"
@@ -113,6 +140,32 @@ GATE_TEST_COMMAND = """python -m pytest -q \\
   tools/tests/test_verify_release_versions.py \\
   tools/tests/test_verify_source_archive.py
 """
+GATE_JAVA_STAGING_COMMAND = "bash tools/tests/deploy_java_staging_test.sh"
+GATE_JAVA_CLASS_COMMAND = """set -euo pipefail
+mvn --batch-mode --no-transfer-progress \\
+  --file java/pom.xml \\
+  -DskipTests \\
+  clean compile
+bash tools/validate_java_staging_artifacts.sh \\
+  --validate-java-class-set \\
+  java/target/classes
+"""
+EXPECTED_JAVA_CLASS_ENTRIES = {
+    "org/apache/paimon/mosaic/ColumnStatistics.class",
+    "org/apache/paimon/mosaic/InputFile.class",
+    "org/apache/paimon/mosaic/MosaicReader.class",
+    "org/apache/paimon/mosaic/MosaicWriter$1.class",
+    "org/apache/paimon/mosaic/MosaicWriter$RootArrayExporter.class",
+    "org/apache/paimon/mosaic/MosaicWriter$RootArrayPrivateData.class",
+    "org/apache/paimon/mosaic/MosaicWriter.class",
+    "org/apache/paimon/mosaic/NativeLib.class",
+    "org/apache/paimon/mosaic/WriterOptions.class",
+}
+JAVA_CANDIDATE_PATHS = """${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}.jar
+${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-sources.jar
+${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-javadoc.jar
+${{ runner.temp }}/java-package/java-staging-provenance.txt
+"""
 GATE_SOURCE_TREE_COMMAND = """set -euo pipefail
 output_dir="$(mktemp -d "${RUNNER_TEMP}/source-tree.XXXXXX")"
 archive="${output_dir}/source.tgz"
@@ -131,6 +184,7 @@ python3 tools/verify_source_archive.py verify \\
 """
 GATE_STATIC_COMMAND = """set -euo pipefail
 python -m compileall -q \\
+  tools/prepare_java_staging_maven_plugins.py \\
   tools/verify_release_versions.py \\
   tools/verify_source_archive.py \\
   tools/tests/test_create_source_release.py \\
@@ -139,7 +193,10 @@ python -m compileall -q \\
   tools/tests/test_verify_release_versions.py \\
   tools/tests/test_verify_source_archive.py
 bash -n tools/create_source_release.sh
+bash -n tools/deploy_java_staging.sh
 bash -n tools/update_branch_version.sh
+bash -n tools/validate_java_staging_artifacts.sh
+bash -n tools/tests/deploy_java_staging_test.sh
 if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
   comparison_ref="origin/${GITHUB_BASE_REF}"
 else
@@ -176,6 +233,13 @@ def named_step(workflow: dict, name: str) -> dict:
     return matches[0]
 
 
+def java_package_step(workflow: dict, name: str) -> dict:
+    steps = workflow["jobs"]["package-java"]["steps"]
+    matches = [step for step in steps if step.get("name") == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def gate_step(workflow: dict, name: str) -> dict:
     steps = workflow["jobs"]["release-vote-gate"]["steps"]
     matches = [step for step in steps if step.get("name") == name]
@@ -197,14 +261,36 @@ def assert_gate_contract(workflow: dict) -> None:
 
     install_step = gate_step(workflow, "Install test dependencies")
     test_step = gate_step(workflow, "Run release vote tests")
+    staging_step = gate_step(workflow, "Test local Java staging")
+    java_setup_step = gate_step(workflow, "Set up Java")
+    java_class_step = gate_step(workflow, "Verify Java class contract")
     source_tree_step = gate_step(workflow, "Verify current source tree")
     static_step = gate_step(workflow, "Run static checks")
-    for step in (install_step, test_step, source_tree_step, static_step):
+    for step in (
+        install_step,
+        test_step,
+        staging_step,
+        java_setup_step,
+        java_class_step,
+        source_tree_step,
+        static_step,
+    ):
         assert "if" not in step
         assert "continue-on-error" not in step
 
     assert install_step["run"] == "python -m pip install pytest PyYAML"
     assert test_step["run"] == GATE_TEST_COMMAND
+    assert staging_step["shell"] == "bash"
+    assert staging_step["run"] == GATE_JAVA_STAGING_COMMAND
+    assert java_setup_step["uses"] == "actions/setup-java@v4"
+    assert java_setup_step["with"] == {
+        "distribution": "temurin",
+        "java-version": "8",
+        "cache": "maven",
+        "cache-dependency-path": "java/pom.xml",
+    }
+    assert java_class_step["shell"] == "bash"
+    assert java_class_step["run"] == GATE_JAVA_CLASS_COMMAND
     assert source_tree_step["shell"] == "bash"
     assert source_tree_step["run"] == GATE_SOURCE_TREE_COMMAND
     assert static_step["shell"] == "bash"
@@ -220,8 +306,9 @@ def assert_release_contract(workflow: dict) -> None:
     assert "runs-on" not in preflight
     assert "continue-on-error" not in preflight
 
-    for job_name in ("rust", "java", "python-wheels", "python-publish"):
+    for job_name in ("rust", "python-wheels", "python-publish"):
         assert jobs[job_name].get("secrets") == "inherit"
+    assert "secrets" not in jobs["java"]
 
     for job_name in ("rust", "java", "python-wheels"):
         release_job = jobs[job_name]
@@ -242,13 +329,27 @@ def assert_release_contract(workflow: dict) -> None:
 
 
 def assert_release_preflight_contract(workflow: dict) -> None:
-    assert "workflow_call" in workflow["on"]
+    workflow_call = workflow["on"]["workflow_call"]
+    assert workflow_call["outputs"] == {
+        "tag_object": {
+            "description": "Verified annotated release tag object.",
+            "value": "${{ jobs.release-preflight.outputs.tag_object }}",
+        },
+        "commit": {
+            "description": "Commit referenced by the verified release tag.",
+            "value": "${{ jobs.release-preflight.outputs.commit }}",
+        },
+    }
     assert workflow["permissions"]["contents"] == "read"
 
     preflight = workflow["jobs"]["release-preflight"]
     assert "runs-on" in preflight
     assert "uses" not in preflight
     assert "continue-on-error" not in preflight
+    assert preflight["outputs"] == {
+        "tag_object": "${{ steps.release-provenance.outputs.tag_object }}",
+        "commit": "${{ steps.release-provenance.outputs.commit }}",
+    }
     assert "continue-on-error" not in release_version_step(workflow)
 
     checkout = next(
@@ -273,10 +374,23 @@ def assert_release_preflight_contract(workflow: dict) -> None:
     }
     assert version_step["run"] == VERIFY_RELEASE_COMMAND
 
+    provenance_step = named_step(workflow, "Export verified release provenance")
+    assert provenance_step["id"] == "release-provenance"
+    assert provenance_step["if"] == TAG_CONDITION
+    assert provenance_step["env"] == {
+        "TAG_NAME": "${{ github.ref_name }}",
+    }
+    assert "continue-on-error" not in provenance_step
+    assert provenance_step["run"] == EXPORT_RELEASE_PROVENANCE_COMMAND
+
     source_step = named_step(workflow, "Verify source archive")
     assert source_step["if"] == TAG_CONDITION
     assert "continue-on-error" not in source_step
     assert source_step["run"] == VERIFY_SOURCE_ARCHIVE_COMMAND
+
+    steps = preflight["steps"]
+    assert steps.index(version_step) < steps.index(provenance_step)
+    assert steps.index(provenance_step) < steps.index(source_step)
 
 
 def assert_leaf_release_contract(
@@ -346,11 +460,196 @@ def test_manual_rust_dispatch_cannot_publish() -> None:
     assert publish_steps[0]["if"] == RUST_PUBLISH_CONDITION
 
 
-def test_manual_java_dispatch_cannot_deploy_staging() -> None:
-    workflow = load_workflow(JAVA_RELEASE_WORKFLOW)
-    deploy_job = workflow["jobs"]["deploy-staging"]
+def assert_java_release_contract(workflow: dict) -> None:
+    build_native_job = workflow["jobs"]["build-native"]
+    package_job = workflow["jobs"]["package-java"]
 
-    assert deploy_job["if"] == JAVA_DEPLOY_CONDITION
+    assert needs(build_native_job) == {"release-preflight"}
+    build_native_checkout_steps = [
+        step
+        for step in build_native_job["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    ]
+    assert len(build_native_checkout_steps) == 1
+    assert build_native_checkout_steps[0]["with"] == {
+        "ref": "${{ needs.release-preflight.outputs.commit }}",
+    }
+
+    assert package_job["if"] == JAVA_PACKAGE_CONDITION
+    assert needs(package_job) == {"release-preflight", "build-native"}
+    assert "continue-on-error" not in package_job
+
+    checkout_steps = [
+        step
+        for step in package_job["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    ]
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0]["with"] == {
+        "ref": "${{ needs.release-preflight.outputs.commit }}",
+        "fetch-depth": "0",
+    }
+
+    package_step = java_package_step(workflow, "Package Java artifacts")
+    assert package_step["working-directory"] == "java"
+    assert package_step["run"] == (
+        "mvn clean verify -Prelease -Dgpg.skip=true -DskipTests"
+    )
+
+    candidate_step = java_package_step(
+        workflow,
+        "Freeze exact Java candidate",
+    )
+    assert candidate_step["id"] == "java-candidate"
+    assert candidate_step["env"] == {
+        "TAG_NAME": "${{ github.ref_name }}",
+        "VERIFIED_TAG_OBJECT": (
+            "${{ needs.release-preflight.outputs.tag_object }}"
+        ),
+        "VERIFIED_COMMIT": "${{ needs.release-preflight.outputs.commit }}",
+    }
+    candidate_run = candidate_step["run"]
+    for required in (
+        'candidate_dir="${RUNNER_TEMP}/java-package"',
+        '"mosaic-${version}.jar"',
+        '"mosaic-${version}-sources.jar"',
+        '"mosaic-${version}-javadoc.jar"',
+        '"${commit}" != "${GITHUB_SHA}"',
+        '"$(git rev-parse HEAD)" != "${GITHUB_SHA}"',
+        "printf 'repository=%s\\n' \"${GITHUB_REPOSITORY}\"",
+        "printf 'tag=%s\\n' \"${TAG_NAME}\"",
+        "printf 'tag_object=%s\\n' \"${tag_object}\"",
+        "printf 'commit=%s\\n' \"${commit}\"",
+        "printf 'run_id=%s\\n' \"${GITHUB_RUN_ID}\"",
+        "printf 'run_attempt=%s\\n' \"${GITHUB_RUN_ATTEMPT}\"",
+        '} > "${candidate_dir}/java-staging-provenance.txt"',
+        "./tools/validate_java_staging_artifacts.sh \\\n"
+        '  "${candidate_dir}" \\\n'
+        '  "${version}"',
+        "printf 'version=%s\\n' \"${version}\" >> \"${GITHUB_OUTPUT}\"",
+    ):
+        assert required in candidate_run
+    assert 'refs/tags/${TAG_NAME}' not in candidate_run
+
+    upload_step = java_package_step(workflow, "Upload Java artifacts")
+    assert upload_step["uses"] == "actions/upload-artifact@v5"
+    assert upload_step["with"] == {
+        "name": "java-package",
+        "path": JAVA_CANDIDATE_PATHS,
+        "if-no-files-found": "error",
+    }
+    steps = package_job["steps"]
+    assert steps.index(package_step) < steps.index(candidate_step)
+    assert steps.index(candidate_step) < steps.index(upload_step)
+
+
+def test_java_workflow_freezes_exact_unsigned_candidate() -> None:
+    workflow = load_workflow(JAVA_RELEASE_WORKFLOW)
+    assert_java_release_contract(workflow)
+
+
+def test_java_release_never_receives_signing_or_nexus_credentials() -> None:
+    workflow_text = JAVA_RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    assert "secrets." not in workflow_text
+    for forbidden in (
+        "GPG_SECRET_KEY",
+        "GPG_PASSPHRASE",
+        "NEXUS_STAGE_DEPLOYER_USER",
+        "NEXUS_STAGE_DEPLOYER_PW",
+        "mvn clean deploy",
+    ):
+        assert forbidden not in workflow_text
+
+    release = load_workflow(RELEASE_WORKFLOW)
+    assert "secrets" not in release["jobs"]["java"]
+
+
+def test_java_pom_does_not_control_candidate_validation_or_deploy_order() -> None:
+    root = ET.parse(JAVA_POM).getroot()
+    namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+    plugin_ids = [
+        plugin.findtext("m:artifactId", namespaces=namespace)
+        for plugin in root.findall(".//m:plugin", namespace)
+    ]
+    assert "exec-maven-plugin" not in plugin_ids
+
+    source = JAVA_POM.read_text(encoding="utf-8")
+    for forbidden in (
+        "staging-artifact-validation",
+        "validate-staging-artifacts",
+        "stagingValidationScript",
+        "stagingReferenceDirectory",
+    ):
+        assert forbidden not in source
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "native-mutable-checkout",
+        "mutable-checkout",
+        "shallow-checkout",
+        "mutable-tag-object",
+        "mutable-commit",
+        "missing-run-attempt",
+        "missing-validator",
+        "wildcard-upload",
+        "extra-upload",
+        "upload-before-validation",
+    ),
+)
+def test_java_candidate_contract_rejects_mutations(mutation: str) -> None:
+    workflow = copy.deepcopy(load_workflow(JAVA_RELEASE_WORKFLOW))
+    build_native_job = workflow["jobs"]["build-native"]
+    package_job = workflow["jobs"]["package-java"]
+    build_native_checkout = next(
+        step
+        for step in build_native_job["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    )
+    checkout = next(
+        step
+        for step in package_job["steps"]
+        if step.get("uses") == "actions/checkout@v6"
+    )
+    candidate = java_package_step(workflow, "Freeze exact Java candidate")
+    upload = java_package_step(workflow, "Upload Java artifacts")
+
+    if mutation == "native-mutable-checkout":
+        build_native_checkout["with"]["ref"] = "main"
+    elif mutation == "mutable-checkout":
+        checkout["with"]["ref"] = "${{ github.ref }}"
+    elif mutation == "shallow-checkout":
+        checkout["with"]["fetch-depth"] = "1"
+    elif mutation == "mutable-tag-object":
+        candidate["env"]["VERIFIED_TAG_OBJECT"] = "${{ github.sha }}"
+    elif mutation == "mutable-commit":
+        candidate["env"]["VERIFIED_COMMIT"] = "${{ github.sha }}"
+    elif mutation == "missing-run-attempt":
+        candidate["run"] = candidate["run"].replace(
+            "  printf 'run_attempt=%s\\n' \"${GITHUB_RUN_ATTEMPT}\"\n",
+            "",
+        )
+    elif mutation == "missing-validator":
+        candidate["run"] = candidate["run"].replace(
+            "./tools/validate_java_staging_artifacts.sh \\\n"
+            '  "${candidate_dir}" \\\n'
+            '  "${version}"',
+            "true",
+        )
+    elif mutation == "wildcard-upload":
+        upload["with"]["path"] = "${{ runner.temp }}/java-package/*"
+    elif mutation == "extra-upload":
+        upload["with"]["path"] += "java/pom.xml\n"
+    elif mutation == "upload-before-validation":
+        steps = package_job["steps"]
+        steps.remove(upload)
+        steps.insert(steps.index(candidate), upload)
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    with pytest.raises(AssertionError):
+        assert_java_release_contract(workflow)
 
 
 def test_manual_release_dispatch_cannot_publish_python() -> None:
@@ -370,31 +669,16 @@ def test_manual_release_dispatch_cannot_publish_python() -> None:
 
 
 @pytest.mark.parametrize(
-    ("workflow_path", "credentialed_job"),
-    CREDENTIALED_RELEASE_WORKFLOWS,
+    ("workflow_path", "release_job"),
+    RELEASE_LEAF_WORKFLOWS,
 )
-def test_credentialed_release_jobs_require_reusable_preflight(
+def test_release_leaf_jobs_require_reusable_preflight(
     workflow_path: Path,
-    credentialed_job: str,
+    release_job: str,
 ) -> None:
     workflow = load_workflow(workflow_path)
 
-    assert_leaf_release_contract(workflow, credentialed_job)
-
-
-def test_java_release_tag_context_is_not_interpolated_into_shell() -> None:
-    workflow = load_workflow(JAVA_RELEASE_WORKFLOW)
-    deploy_steps = [
-        step
-        for step in workflow["jobs"]["deploy-staging"]["steps"]
-        if step.get("name") == "Deploy to Apache Nexus staging"
-    ]
-
-    assert len(deploy_steps) == 1
-    deploy_step = deploy_steps[0]
-    assert deploy_step["env"]["TAG_NAME"] == "${{ github.ref_name }}"
-    assert 'REF="${TAG_NAME}"' in deploy_step["run"]
-    assert "${{ github.ref_name }}" not in deploy_step["run"]
+    assert_leaf_release_contract(workflow, release_job)
 
 
 @pytest.mark.parametrize("job_name", ("rust", "java", "python-wheels"))
@@ -444,7 +728,10 @@ def test_contract_rejects_wrong_reusable_workflow(job_name: str) -> None:
         assert_release_contract(workflow)
 
 
-@pytest.mark.parametrize("job_name", RELEASE_WORKFLOW_BY_JOB)
+@pytest.mark.parametrize(
+    "job_name",
+    ("rust", "python-wheels", "python-publish"),
+)
 def test_contract_rejects_missing_secret_inheritance(job_name: str) -> None:
     workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
     workflow["jobs"][job_name].pop("secrets")
@@ -453,24 +740,32 @@ def test_contract_rejects_missing_secret_inheritance(job_name: str) -> None:
         assert_release_contract(workflow)
 
 
+def test_contract_rejects_java_secret_inheritance() -> None:
+    workflow = copy.deepcopy(load_workflow(RELEASE_WORKFLOW))
+    workflow["jobs"]["java"]["secrets"] = "inherit"
+
+    with pytest.raises(AssertionError):
+        assert_release_contract(workflow)
+
+
 @pytest.mark.parametrize(
-    ("workflow_path", "credentialed_job"),
-    CREDENTIALED_RELEASE_WORKFLOWS,
+    ("workflow_path", "release_job"),
+    RELEASE_LEAF_WORKFLOWS,
 )
 @pytest.mark.parametrize(
     "mutation",
     ("missing-workflow-call", "missing-dependency", "unguarded-extra-job"),
 )
-def test_credentialed_release_contract_rejects_preflight_bypass(
+def test_release_leaf_contract_rejects_preflight_bypass(
     workflow_path: Path,
-    credentialed_job: str,
+    release_job: str,
     mutation: str,
 ) -> None:
     workflow = copy.deepcopy(load_workflow(workflow_path))
     if mutation == "missing-workflow-call":
         workflow["on"].pop("workflow_call")
     elif mutation == "missing-dependency":
-        job = workflow["jobs"][credentialed_job]
+        job = workflow["jobs"][release_job]
         job["needs"] = [
             dependency
             for dependency in job.get("needs", [])
@@ -485,7 +780,7 @@ def test_credentialed_release_contract_rejects_preflight_bypass(
         raise AssertionError(f"unknown mutation: {mutation}")
 
     with pytest.raises(AssertionError):
-        assert_leaf_release_contract(workflow, credentialed_job)
+        assert_leaf_release_contract(workflow, release_job)
 
 
 def test_contract_rejects_masked_release_verifier_failure() -> None:
@@ -574,6 +869,53 @@ def test_contract_rejects_signed_tag_preflight_mutations(mutation: str) -> None:
 
 @pytest.mark.parametrize(
     "mutation",
+    (
+        "missing-call-output",
+        "wrong-call-output",
+        "missing-job-output",
+        "wrong-job-output",
+        "wrong-step-id",
+        "missing-sha-binding",
+        "export-before-signature-check",
+    ),
+)
+def test_contract_rejects_release_provenance_output_mutations(
+    mutation: str,
+) -> None:
+    workflow = copy.deepcopy(load_workflow(RELEASE_PREFLIGHT_WORKFLOW))
+    workflow_call = workflow["on"]["workflow_call"]
+    preflight = workflow["jobs"]["release-preflight"]
+    provenance = named_step(workflow, "Export verified release provenance")
+
+    if mutation == "missing-call-output":
+        workflow_call["outputs"].pop("tag_object")
+    elif mutation == "wrong-call-output":
+        workflow_call["outputs"]["tag_object"]["value"] = "${{ github.sha }}"
+    elif mutation == "missing-job-output":
+        preflight["outputs"].pop("commit")
+    elif mutation == "wrong-job-output":
+        preflight["outputs"]["commit"] = "${{ github.sha }}"
+    elif mutation == "wrong-step-id":
+        provenance["id"] = "mutable-provenance"
+    elif mutation == "missing-sha-binding":
+        provenance["run"] = provenance["run"].replace(
+            'if [[ "${commit}" != "${GITHUB_SHA}" ||\n'
+            '      "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then\n',
+            "if false; then\n",
+        )
+    elif mutation == "export-before-signature-check":
+        steps = preflight["steps"]
+        steps.remove(provenance)
+        steps.insert(steps.index(release_version_step(workflow)), provenance)
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    with pytest.raises(AssertionError):
+        assert_release_preflight_contract(workflow)
+
+
+@pytest.mark.parametrize(
+    "mutation",
     ("cancel-in-progress", "preflight-continue", "version-step-continue"),
 )
 def test_contract_rejects_non_blocking_preflight_mutations(mutation: str) -> None:
@@ -605,10 +947,43 @@ def test_source_release_documentation_passes_rc_tag_explicitly() -> None:
     assert invocation in source
 
     assert "Cargo path dependency constraints and Cargo.lock" in source
+
+
+def test_release_documentation_keeps_java_credentials_local() -> None:
+    source = RELEASE_DOCUMENTATION.read_text(encoding="utf-8")
+    for forbidden in (
+        "NEXUS_STAGE_DEPLOYER_USER",
+        "NEXUS_STAGE_DEPLOYER_PW",
+        "GPG_SECRET_KEY",
+        "GPG_PASSPHRASE",
+    ):
+        assert forbidden not in source
+
+    staging_command = """./tools/deploy_java_staging.sh \\
+  --release-version ${RELEASE_VERSION} \\
+  --rc ${RC_NUM} \\
+  --run-id ${RELEASE_RUN_ID} \\
+  --provenance-manifest ${JAVA_STAGING_PROVENANCE} \\
+  --staging-profile-id ${STAGING_PROFILE_ID}"""
+    assert f"{staging_command} \\\n  --dry-run" in source
+    assert staging_command in source
     assert (
-        "<tr><td><code>GPG_SECRET_KEY</code></td>"
-        "<td>Java artifact signing</td></tr>"
-    ) in source
+        'JAVA_STAGING_PROVENANCE="../${RC_TAG}-java-staging.provenance"'
+        in source
+    )
+    assert 'STAGING_PROFILE_ID="PAIMON_NEXUS_STAGING_PROFILE_ID"' in source
+    assert "https://repository.apache.org/#stagingProfiles" in source
+    assert "nexus-staging-maven-plugin:1.7.0:rc-list-profiles" not in source
+    assert "maven-gpg-plugin:3.2.8:sign-and-deploy-file" in source
+    assert (
+        "nexus-staging-maven-plugin:1.7.0:deploy-staged-repository"
+        in source
+    )
+    assert "It does not rebuild the JARs or run a Maven lifecycle." in source
+    assert "verifies all four detached signatures" in source
+    assert "earlier producer attempt than the final successful run attempt" in source
+    assert "local GPG keyring" in source
+    assert "apache.releases.https" in source
 
 
 def test_release_documentation_describes_source_archive_preflight() -> None:
@@ -655,6 +1030,73 @@ def test_release_vote_gate_verifies_current_source_tree() -> None:
     assert "continue-on-error" not in step
     assert step["shell"] == "bash"
     assert step["run"] == GATE_SOURCE_TREE_COMMAND
+
+
+def test_java_class_contract_rejects_unreviewed_compiled_class(
+    tmp_path: Path,
+) -> None:
+    classes = tmp_path / "classes"
+    for entry in EXPECTED_JAVA_CLASS_ENTRIES:
+        path = classes / entry
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"class")
+
+    accepted = subprocess.run(
+        [
+            "bash",
+            str(JAVA_STAGING_VALIDATOR),
+            "--validate-java-class-set",
+            str(classes),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+
+    extra = classes / "org/apache/paimon/mosaic/NewApi.class"
+    extra.write_bytes(b"class")
+    rejected = subprocess.run(
+        [
+            "bash",
+            str(JAVA_STAGING_VALIDATOR),
+            "--validate-java-class-set",
+            str(classes),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "Compiled Java class set is invalid" in rejected.stderr
+
+
+@pytest.mark.parametrize("nested", (False, True))
+def test_java_class_contract_rejects_symlinked_classes_directory(
+    tmp_path: Path,
+    nested: bool,
+) -> None:
+    classes = tmp_path / "classes"
+    classes.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    if nested:
+        linked_classes = classes
+        (classes / "linked").symlink_to(external, target_is_directory=True)
+    else:
+        linked_classes = tmp_path / "linked-classes"
+        linked_classes.symlink_to(classes, target_is_directory=True)
+
+    rejected = subprocess.run(
+        [
+            "bash",
+            str(JAVA_STAGING_VALIDATOR),
+            "--validate-java-class-set",
+            str(linked_classes),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "symbolic link" in rejected.stderr
 
 
 @pytest.mark.parametrize("event", ("pull_request", "push"))

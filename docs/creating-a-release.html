@@ -69,19 +69,19 @@
                 <li><a href="#promote-the-release">Promote the release</a></li>
             </ol>
 
-            <h3>Automated Publishing</h3>
-            <p>When a version tag is pushed, the <code>Release</code> workflow orchestrates language-specific release jobs:</p>
+            <h3>Automated and Local Publishing</h3>
+            <p>When a version tag is pushed, the <code>Release</code> workflow orchestrates language-specific release jobs. Java signing and Nexus deployment intentionally remain on the Release Manager's machine:</p>
             <table>
                 <thead>
                     <tr><th>Component</th><th>Tag Pattern</th><th>Published To</th><th>Pre-release (<code>-rc</code>) Behavior</th><th>Ordering</th></tr>
                 </thead>
                 <tbody>
                     <tr><td>Rust crate</td><td><code>v0.1.0</code></td><td>crates.io</td><td>Dry-run only</td><td>Runs in parallel</td></tr>
-                    <tr><td>Java binding</td><td><code>v0.1.0</code></td><td>Apache Nexus staging</td><td>Deploys to staging</td><td>Runs in parallel</td></tr>
+                    <tr><td>Java binding</td><td><code>v0.1.0-rc1</code></td><td>CI artifacts, then Apache Nexus staging</td><td>CI packages without signing; the Release Manager deploys locally</td><td>CI runs in parallel; local deploy follows a successful run</td></tr>
                     <tr><td>Python binding</td><td><code>v0.1.0</code></td><td>PyPI</td><td>Publishes to TestPyPI</td><td>Publishes only after Rust and Java jobs succeed</td></tr>
                 </tbody>
             </table>
-            <p>The Release Manager's primary responsibility is managing the <strong>source release</strong> (tarball + signature) and coordinating the community vote. Language artifact publishing is handled by CI once the tag is pushed.</p>
+            <p>The Release Manager manages the <strong>source release</strong> (tarball + signature), signs and deploys the Java staging artifacts locally, and coordinates the community vote. Rust and Python publishing remain handled by CI.</p>
 
             <!-- ============================================================ -->
             <h2 id="decide-to-release">Decide to Release</h2>
@@ -112,8 +112,8 @@ sudo apt install gnupg2</code></pre>
 <pre><code>gpg --full-gen-key</code></pre>
                 </li>
                 <li>
-                    <p>Find your key ID:</p>
-<pre><code>gpg --list-keys --keyid-format short</code></pre>
+                    <p>Find the full fingerprint of the signing-capable secret key or subkey:</p>
+<pre><code>gpg --list-secret-keys --keyid-format long --with-subkey-fingerprint</code></pre>
                 </li>
                 <li>
                     <p>Upload to key server:</p>
@@ -140,14 +140,20 @@ svn ci -m "Add &lt;YOUR_NAME&gt;'s public key"</code></pre>
                 </thead>
                 <tbody>
                     <tr><td><code>CARGO_REGISTRY_TOKEN</code></td><td>crates.io publishing</td></tr>
-                    <tr><td><code>NEXUS_STAGE_DEPLOYER_USER</code></td><td>Apache Nexus staging</td></tr>
-                    <tr><td><code>NEXUS_STAGE_DEPLOYER_PW</code></td><td>Apache Nexus staging</td></tr>
-                    <tr><td><code>GPG_SECRET_KEY</code></td><td>Java artifact signing</td></tr>
-                    <tr><td><code>GPG_PASSPHRASE</code></td><td>Java artifact signing</td></tr>
                     <tr><td><code>PYPI_API_TOKEN</code></td><td>PyPI publishing</td></tr>
                     <tr><td><code>TEST_PYPI_API_TOKEN</code></td><td>TestPyPI publishing</td></tr>
                 </tbody>
             </table>
+            <p>Do not store Java signing material or Nexus credentials in GitHub Actions. Keep the signing key in the Release Manager's local GPG keyring and configure the Nexus account under server id <code>apache.releases.https</code> in local Maven settings:</p>
+<pre><code>&lt;settings&gt;
+  &lt;servers&gt;
+    &lt;server&gt;
+      &lt;id&gt;apache.releases.https&lt;/id&gt;
+      &lt;username&gt;YOUR_APACHE_ID&lt;/username&gt;
+      &lt;password&gt;YOUR_NEXUS_PASSWORD&lt;/password&gt;
+    &lt;/server&gt;
+  &lt;/servers&gt;
+&lt;/settings&gt;</code></pre>
 
             <h3>Clone into a Fresh Workspace</h3>
 <pre><code>git clone https://github.com/apache/paimon-mosaic.git
@@ -220,11 +226,40 @@ git push origin ${RC_TAG}</code></pre>
             <p>The release preflight validates the signed tag and component versions, then creates and verifies a temporary source archive before any language release job starts.</p>
             <ul>
                 <li><strong>Rust release</strong> &mdash; dry-run check (does not publish for RC tags)</li>
-                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, deploys JAR to Apache Nexus staging</li>
+                <li><strong>Java release</strong> &mdash; builds native JNI libraries for 4 platforms, packages without signing, and uploads exactly the main, sources, and javadoc JARs plus their signed-tag/run provenance as the <code>java-package</code> workflow artifact</li>
                 <li><strong>Python wheels</strong> &mdash; builds wheels for 4 platforms</li>
                 <li><strong>Python publish</strong> &mdash; publishes to TestPyPI only after the Rust, Java, and Python wheel jobs succeed</li>
             </ul>
-            <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated.</p>
+            <p>If only the Python publish job fails due to a transient PyPI or TestPyPI issue, use <strong>Re-run failed jobs</strong> on the <code>Release</code> workflow. The successful Rust, Java, and Python wheel jobs do not need to be repeated. A reused <code>java-package</code> may therefore record an earlier producer attempt than the final successful run attempt; local staging accepts that ordering while freezing the final run attempt and immutable artifact identity.</p>
+            <p>If Java is rerun, the initial dry-run selects the unexpired <code>java-package</code> with the highest artifact id and validates it before freezing its identity. An invalid newest candidate is rejected rather than falling back to an older one. If the selected artifact or run attempt later changes, staging stops; perform a new dry-run with a new manifest path.</p>
+
+            <h3>Deploy Java Artifacts to Nexus Staging</h3>
+            <p>First open <a href="https://repository.apache.org/#stagingProfiles">Apache Nexus Staging Profiles</a> and copy the Paimon profile id; it is not a secret. Do not run an ambient Maven plugin with release credentials merely to discover this id.</p>
+            <p>Then copy the numeric run id from the successful RC-tag <code>Release</code> workflow, check out the exact RC tag, and run the local dry-run before the signed deployment:</p>
+<pre><code>RELEASE_RUN_ID="12345678901"
+STAGING_PROFILE_ID="PAIMON_NEXUS_STAGING_PROFILE_ID"
+GPG_FINGERPRINT="YOUR_FULL_OPENPGP_FINGERPRINT"
+JAVA_STAGING_PROVENANCE="../${RC_TAG}-java-staging.provenance"
+
+git checkout ${RC_TAG}
+
+./tools/deploy_java_staging.sh \
+  --release-version ${RELEASE_VERSION} \
+  --rc ${RC_NUM} \
+  --run-id ${RELEASE_RUN_ID} \
+  --provenance-manifest ${JAVA_STAGING_PROVENANCE} \
+  --staging-profile-id ${STAGING_PROFILE_ID} \
+  --dry-run
+
+./tools/deploy_java_staging.sh \
+  --release-version ${RELEASE_VERSION} \
+  --rc ${RC_NUM} \
+  --run-id ${RELEASE_RUN_ID} \
+  --provenance-manifest ${JAVA_STAGING_PROVENANCE} \
+  --staging-profile-id ${STAGING_PROFILE_ID} \
+  --gpg-keyname ${GPG_FINGERPRINT}</code></pre>
+            <p>The dry-run downloads the immutable <code>java-package</code> artifact by id, checks its ZIP size and SHA-256 digest, safely extracts exactly three JARs plus <code>java-staging-provenance.txt</code>, validates the candidate contents, and writes a non-overwriting manifest outside the clean checkout. The manifest freezes the annotated tag object and commit, canonical workflow path and id, run id and attempt, artifact id/digest/size, and Nexus staging profile id. It does not invoke Maven, GPG, or Nexus.</p>
+            <p>The real deployment requires that unchanged manifest and revalidates the live tag, run, and artifact metadata. It does not rebuild the JARs or run a Maven lifecycle. Before Maven executes, the script downloads the complete runtime closure of <code>maven-gpg-plugin:3.2.8</code> and <code>nexus-staging-maven-plugin:1.7.0</code> directly from Maven Central, verifies every POM and JAR against the signed-tag SHA-256 lock, and exposes only that verified repository through a script-owned local <code>file://</code> mirror and separate empty runtime repositories. User <code>localRepository</code>, plugin groups, and mirrors are not retained. The signing plugin receives no Nexus server credentials; only the verified Nexus plugin receives the selected server and proxy settings. The verified <code>maven-gpg-plugin:3.2.8:sign-and-deploy-file</code> goal writes the exact frozen main, sources, and javadoc JARs plus the exact signed-source <code>java/pom.xml</code> into a private <code>file://</code> Maven repository. The script checks all four payloads against their pre-signing digests, rejects unexpected payloads or symlinks, verifies all four detached signatures with the requested full GPG fingerprint, and repeats the payload, plugin-lock, live-provenance, and checkout checks immediately before the Nexus write. It then uses the verified <code>nexus-staging-maven-plugin:1.7.0:deploy-staged-repository</code> goal to upload and close the repository with the explicit profile id and without auto-release. Record the resulting <code>orgapachepaimon-XXXX</code> repository id and leave it staged for the vote.</p>
 
             <h3>Create Source Release Artifacts</h3>
             <p>Create source release artifacts from the same commit as the RC tag:</p>
