@@ -145,12 +145,13 @@ native_methods = re.findall(
     r"([A-Za-z_$][A-Za-z0-9_$]*)\s*\(",
     native_source,
 )
-symbol_blob = b"\x00".join(
+symbol_names = [
     (
         "Java_org_apache_paimon_mosaic_NativeLib_" + method
     ).encode("ascii")
     for method in native_methods
-)
+]
+symbol_blob = b"\x00".join(symbol_names)
 
 
 def elf(machine):
@@ -166,6 +167,10 @@ def elf(machine):
     struct.pack_into("<H", data, 52, 64)
     struct.pack_into("<H", data, 54, 56)
     struct.pack_into("<H", data, 56, 2)
+    section_offset = 0x5000
+    struct.pack_into("<Q", data, 40, section_offset)
+    struct.pack_into("<H", data, 58, 64)
+    struct.pack_into("<H", data, 60, 3)
     struct.pack_into("<I", data, 64, 1)
     struct.pack_into("<I", data, 68, 5)
     struct.pack_into("<Q", data, 72, 0)
@@ -179,6 +184,45 @@ def elf(machine):
     struct.pack_into("<Q", data, 160, 512)
     struct.pack_into("<Q", data, 168, 8)
     data[8192 : 8192 + len(symbol_blob)] = symbol_blob
+
+    dynamic_strings = bytearray(b"\x00")
+    string_indexes = []
+    for symbol in symbol_names:
+        string_indexes.append(len(dynamic_strings))
+        dynamic_strings.extend(symbol + b"\x00")
+    string_offset = 0x3000
+    symbol_offset = 0x4000
+    data[
+        string_offset : string_offset + len(dynamic_strings)
+    ] = dynamic_strings
+    for index, string_index in enumerate(string_indexes, 1):
+        struct.pack_into(
+            "<IBBHQQ",
+            data,
+            symbol_offset + index * 24,
+            string_index,
+            0x12,
+            0,
+            1,
+            0x1000 + index * 16,
+            16,
+        )
+
+    string_section = section_offset + 64
+    struct.pack_into("<I", data, string_section + 4, 3)
+    struct.pack_into("<Q", data, string_section + 24, string_offset)
+    struct.pack_into("<Q", data, string_section + 32, len(dynamic_strings))
+    struct.pack_into("<Q", data, string_section + 48, 1)
+    symbol_section = section_offset + 128
+    struct.pack_into("<I", data, symbol_section + 4, 11)
+    struct.pack_into("<Q", data, symbol_section + 24, symbol_offset)
+    struct.pack_into(
+        "<Q", data, symbol_section + 32, (len(symbol_names) + 1) * 24
+    )
+    struct.pack_into("<I", data, symbol_section + 40, 1)
+    struct.pack_into("<I", data, symbol_section + 44, 1)
+    struct.pack_into("<Q", data, symbol_section + 48, 8)
+    struct.pack_into("<Q", data, symbol_section + 56, 24)
     return bytes(data)
 
 
@@ -187,8 +231,8 @@ def macho():
     data[:4] = b"\xcf\xfa\xed\xfe"
     struct.pack_into("<I", data, 4, 0x0100000C)
     struct.pack_into("<I", data, 12, 6)
-    struct.pack_into("<I", data, 16, 2)
-    struct.pack_into("<I", data, 20, 104)
+    struct.pack_into("<I", data, 16, 3)
+    struct.pack_into("<I", data, 20, 128)
     struct.pack_into("<I", data, 32, 0x19)
     struct.pack_into("<I", data, 36, 72)
     data[40:56] = b"__TEXT\x00" + b"\x00" * 9
@@ -201,7 +245,33 @@ def macho():
     struct.pack_into("<I", data, 108, 32)
     struct.pack_into("<I", data, 112, 24)
     data[128:135] = b"mosaic\x00"
-    data[4096 : 4096 + len(symbol_blob)] = symbol_blob
+
+    dynamic_strings = bytearray(b"\x00")
+    string_indexes = []
+    for symbol in symbol_names:
+        string_indexes.append(len(dynamic_strings))
+        dynamic_strings.extend(b"_" + symbol + b"\x00")
+    symbol_offset = 0x1000
+    string_offset = 0x2000
+    struct.pack_into("<I", data, 136, 0x2)
+    struct.pack_into("<I", data, 140, 24)
+    struct.pack_into("<IIII", data, 144, symbol_offset, len(symbol_names),
+                     string_offset, len(dynamic_strings))
+    data[
+        string_offset : string_offset + len(dynamic_strings)
+    ] = dynamic_strings
+    for index, string_index in enumerate(string_indexes):
+        struct.pack_into(
+            "<IBBHQ",
+            data,
+            symbol_offset + index * 16,
+            string_index,
+            0x0F,
+            1,
+            0,
+            0x1000 + index * 16,
+        )
+    data[0x4000 : 0x4000 + len(symbol_blob)] = symbol_blob
     return bytes(data)
 
 
@@ -220,7 +290,7 @@ def pe():
     struct.pack_into("<I", data, optional + 60, 0x200)
     struct.pack_into("<I", data, optional + 108, 16)
     struct.pack_into("<I", data, optional + 112, 0x1000)
-    struct.pack_into("<I", data, optional + 116, 0x400)
+    struct.pack_into("<I", data, optional + 116, 0x2000)
     section = optional + 240
     data[section : section + 8] = b".text\x00\x00\x00"
     struct.pack_into("<I", data, section + 8, len(data) - 0x200)
@@ -228,7 +298,48 @@ def pe():
     struct.pack_into("<I", data, section + 16, len(data) - 0x200)
     struct.pack_into("<I", data, section + 20, 0x200)
     struct.pack_into("<I", data, section + 36, 0x60000020)
-    data[4096 : 4096 + len(symbol_blob)] = symbol_blob
+
+    export_offset = 0x200
+    functions_offset = 0x300
+    names_offset = 0x400
+    ordinals_offset = 0x500
+    dll_name_offset = 0x580
+    strings_offset = 0x600
+    section_rva = 0x1000
+    raw_offset = 0x200
+
+    def to_rva(offset):
+        return section_rva + offset - raw_offset
+
+    data[dll_name_offset : dll_name_offset + 11] = b"mosaic.dll\x00"
+    struct.pack_into(
+        "<IIHHIIIIIII",
+        data,
+        export_offset,
+        0,
+        0,
+        0,
+        0,
+        to_rva(dll_name_offset),
+        1,
+        len(symbol_names),
+        len(symbol_names),
+        to_rva(functions_offset),
+        to_rva(names_offset),
+        to_rva(ordinals_offset),
+    )
+    next_string = strings_offset
+    for index, symbol in enumerate(symbol_names):
+        struct.pack_into(
+            "<I", data, functions_offset + index * 4, 0x3000 + index * 16
+        )
+        struct.pack_into(
+            "<I", data, names_offset + index * 4, to_rva(next_string)
+        )
+        struct.pack_into("<H", data, ordinals_offset + index * 2, index)
+        data[next_string : next_string + len(symbol) + 1] = symbol + b"\x00"
+        next_string += len(symbol) + 1
+    data[0x3000 : 0x3000 + len(symbol_blob)] = symbol_blob
     return bytes(data)
 
 
@@ -683,6 +794,13 @@ set -o pipefail
 
 printf 'args=%s\n' "$*" >> "$FAKE_GH_LOG"
 printf 'host=%s\n' "${GH_HOST:-}" >> "$FAKE_GH_LOG"
+
+if [[ "${1-}" == config &&
+      "${2-}" == get &&
+      "${3-}" == http_unix_socket ]]; then
+  printf '%s\n' "${FAKE_GH_HTTP_UNIX_SOCKET:-}"
+  exit 0
+fi
 
 if [[ "${1-}" != api ]]; then
   exit 2
@@ -1576,6 +1694,18 @@ test_github_host_is_pinned() {
   assert_contains "$GH_LOG" "host=github.com"
 }
 
+test_github_unix_socket_is_rejected_before_api_calls() {
+  new_fixture
+  if FAKE_GH_HTTP_UNIX_SOCKET=/tmp/attacker.sock \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "GitHub CLI Unix socket transport was accepted"
+  fi
+
+  assert_contains "$OUTPUT_LOG" "GitHub CLI Unix socket"
+  assert_not_contains "$GH_LOG" "args=api"
+  assert_maven_not_invoked
+}
+
 test_java_package_metadata_must_be_unique_and_complete() {
   new_fixture
   if FAKE_DUPLICATE_ARTIFACT=true \
@@ -1826,6 +1956,119 @@ test_validator_rejects_invalid_legal_and_native_contents() {
   assert_contains "$OUTPUT_LOG" \
     "Packaged META-INF/LICENSE does not match the signed source tree"
   assert_maven_not_invoked
+}
+
+test_validator_rejects_jni_names_without_dynamic_exports() {
+  local native
+
+  for native in \
+    native/linux/x86_64/libpaimon_mosaic_jni.so \
+    native/linux/aarch64/libpaimon_mosaic_jni.so \
+    native/macos/aarch64/libpaimon_mosaic_jni.dylib \
+    native/windows/x86_64/paimon_mosaic_jni.dll
+  do
+    new_fixture
+    "$PYTHON" - "$CANDIDATE_DIR/mosaic-0.3.0.jar" "$native" <<'PY'
+import os
+import struct
+import sys
+import zipfile
+from pathlib import Path
+
+
+jar_path = Path(sys.argv[1])
+entry_name = sys.argv[2]
+temporary = jar_path.with_suffix(".tmp")
+with zipfile.ZipFile(jar_path) as source, zipfile.ZipFile(
+    temporary, "w", zipfile.ZIP_DEFLATED
+) as target:
+    for info in source.infolist():
+        contents = source.read(info)
+        if info.filename == entry_name:
+            data = bytearray(contents)
+            if data[:4] == b"\x7fELF":
+                section_offset = struct.unpack_from("<Q", data, 40)[0]
+                section_size = struct.unpack_from("<H", data, 58)[0]
+                section_count = struct.unpack_from("<H", data, 60)[0]
+                for index in range(section_count):
+                    section = section_offset + index * section_size
+                    if struct.unpack_from("<I", data, section + 4)[0] != 11:
+                        continue
+                    symbol_offset = struct.unpack_from(
+                        "<Q", data, section + 24
+                    )[0]
+                    symbol_size = struct.unpack_from(
+                        "<Q", data, section + 32
+                    )[0]
+                    entry_size = struct.unpack_from(
+                        "<Q", data, section + 56
+                    )[0]
+                    for symbol in range(1, symbol_size // entry_size):
+                        offset = symbol_offset + symbol * entry_size
+                        struct.pack_into("<H", data, offset + 6, 0)
+            elif data[:4] == b"\xcf\xfa\xed\xfe":
+                command_count = struct.unpack_from("<I", data, 16)[0]
+                offset = 32
+                for _ in range(command_count):
+                    command, size = struct.unpack_from("<II", data, offset)
+                    if command == 0x2:
+                        symbol_offset, symbol_count = struct.unpack_from(
+                            "<II", data, offset + 8
+                        )
+                        for symbol in range(symbol_count):
+                            data[symbol_offset + symbol * 16 + 4] &= 0xFE
+                    offset += size
+            elif data[:2] == b"MZ":
+                pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                optional_offset = pe_offset + 24
+                section_offset = optional_offset + struct.unpack_from(
+                    "<H", data, pe_offset + 20
+                )[0]
+                export_rva = struct.unpack_from(
+                    "<I", data, optional_offset + 112
+                )[0]
+
+                def rva_to_offset(rva):
+                    virtual_address = struct.unpack_from(
+                        "<I", data, section_offset + 12
+                    )[0]
+                    raw_offset = struct.unpack_from(
+                        "<I", data, section_offset + 20
+                    )[0]
+                    return raw_offset + rva - virtual_address
+
+                export_offset = rva_to_offset(export_rva)
+                name_count = struct.unpack_from(
+                    "<I", data, export_offset + 24
+                )[0]
+                names_rva = struct.unpack_from(
+                    "<I", data, export_offset + 32
+                )[0]
+                names_offset = rva_to_offset(names_rva)
+                for index in range(name_count):
+                    name_rva = struct.unpack_from(
+                        "<I", data, names_offset + index * 4
+                    )[0]
+                    data[rva_to_offset(name_rva)] = ord("X")
+            else:
+                raise SystemExit("unexpected native format")
+            contents = bytes(data)
+        output_info = zipfile.ZipInfo(
+            info.filename,
+            date_time=(2026, 1, 1, 0, 0, 0),
+        )
+        output_info.compress_type = zipfile.ZIP_DEFLATED
+        target.writestr(output_info, contents)
+os.replace(temporary, jar_path)
+PY
+    repack_candidate_and_refresh_provenance
+
+    if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      fail "JNI names without dynamic exports were accepted: $native"
+    fi
+    assert_contains "$OUTPUT_LOG" "missing JNI exports"
+    assert_maven_not_invoked
+  done
 }
 
 test_validator_rejects_changed_source_and_javadoc_contents() {
@@ -2473,6 +2716,54 @@ test_dirty_release_input_stops_before_download() {
   assert_maven_not_invoked
 }
 
+test_fsmonitor_cannot_hide_dirty_release_helper() {
+  new_fixture
+  fsmonitor_hook=$(mktemp "$TEST_ROOT/fsmonitor.XXXXXX")
+  helper_marker=$(mktemp "$TEST_ROOT/helper-marker.XXXXXX")
+  keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
+  rm -f -- "$helper_marker"
+  cat > "$fsmonitor_hook" <<'EOF'
+#!/bin/sh
+printf 'token\0'
+EOF
+  chmod +x "$fsmonitor_hook"
+  printf 'fake KEYS\n' > "$keys"
+
+  git -C "$FIXTURE_DIR" config core.fsmonitor "$fsmonitor_hook"
+  git -C "$FIXTURE_DIR" status --porcelain=v1 >/dev/null
+  "$PYTHON" - \
+    "$FIXTURE_DIR/tools/prepare_java_staging_maven_plugins.py" \
+    "$helper_marker" <<'PY'
+import sys
+from pathlib import Path
+
+
+path = Path(sys.argv[1])
+marker = sys.argv[2]
+path.write_text(
+    "from pathlib import Path as _InjectedPath\n"
+    "_InjectedPath({!r}).write_text('executed', encoding='utf-8')\n".format(
+        marker
+    )
+    + path.read_text(encoding="utf-8"),
+    encoding="utf-8",
+)
+PY
+
+  if run_script \
+    --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+    --keys-file "$keys" \
+    > "$OUTPUT_LOG" 2>&1; then
+    fail "fsmonitor hid a dirty release helper"
+  fi
+  assert_contains "$OUTPUT_LOG" "must be clean"
+  if [[ -e "$helper_marker" ]]; then
+    fail "dirty release helper was executed"
+  fi
+  assert_not_contains "$GH_LOG" "args=api"
+  assert_maven_not_invoked
+}
+
 test_foreign_git_environment_cannot_redirect_checkout_checks() {
   new_fixture
   foreign_repo=$(mktemp -d "$TEST_ROOT/foreign.XXXXXX")
@@ -2559,6 +2850,7 @@ run_test test_current_remote_tag_object_must_match_local_tag
 run_test test_downloads_java_candidate_by_immutable_artifact_id
 run_test test_dry_run_can_validate_a_fork_without_enabling_real_deploy
 run_test test_github_host_is_pinned
+run_test test_github_unix_socket_is_rejected_before_api_calls
 run_test test_java_package_metadata_must_be_unique_and_complete
 run_test test_downloaded_java_package_digest_must_match_metadata
 run_test test_java_package_zip_rejects_unsafe_paths
@@ -2566,6 +2858,7 @@ run_test test_java_package_requires_exact_four_candidate_files
 run_test test_validator_rejects_one_byte_classifier_jars
 run_test test_validator_rejects_invalid_java_class_and_maven_metadata
 run_test test_validator_rejects_invalid_legal_and_native_contents
+run_test test_validator_rejects_jni_names_without_dynamic_exports
 run_test test_validator_rejects_changed_source_and_javadoc_contents
 run_test test_validator_rejects_windows_drive_relative_jar_entries
 run_test test_same_commit_retag_candidate_provenance_mismatch
@@ -2587,6 +2880,7 @@ run_test test_maven_failure_status_is_preserved
 run_test test_nexus_maven_failure_status_is_preserved
 run_test test_real_deploy_requires_official_repository_run
 run_test test_dirty_release_input_stops_before_download
+run_test test_fsmonitor_cannot_hide_dirty_release_helper
 run_test test_foreign_git_environment_cannot_redirect_checkout_checks
 run_test test_git_index_flags_are_rejected
 run_test test_git_replacement_refs_are_rejected

@@ -63,6 +63,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 MAX_ENTRY_SIZE = 256 * 1024 * 1024
 MAX_TOTAL_SIZE = 1024 * 1024 * 1024
 MIN_NATIVE_SIZE = 64 * 1024
+MAX_NATIVE_SYMBOLS = 64 * 1024
+MAX_NATIVE_SYMBOL_LENGTH = 4096
 READ_CHUNK_SIZE = 1024 * 1024
 JAVA_CLASS = "org/apache/paimon/mosaic/MosaicReader.class"
 JAVA_CLASS_NAME = "org.apache.paimon.mosaic.MosaicReader"
@@ -281,6 +283,16 @@ def validate_java_classes(main_jar, archive, entries):
         )
 
 
+def bounded_c_string(data, offset, limit, description, name):
+    if offset < 0 or offset >= limit or limit > len(data):
+        fail("{} is out of bounds: {}".format(description, name))
+    search_limit = min(limit, offset + MAX_NATIVE_SYMBOL_LENGTH + 1)
+    end = data.find(b"\x00", offset, search_limit)
+    if end < 0:
+        fail("{} is invalid or too long: {}".format(description, name))
+    return data[offset:end]
+
+
 def validate_elf(data, expected_machine, name):
     if (
         len(data) < MIN_NATIVE_SIZE
@@ -336,6 +348,88 @@ def validate_elf(data, expected_machine, name):
     if not (has_load and has_executable_load and has_dynamic):
         fail("Packaged ELF is missing load or dynamic segments: {}".format(name))
 
+    section_offset = struct.unpack_from("<Q", data, 40)[0]
+    section_entry_size = struct.unpack_from("<H", data, 58)[0]
+    section_count = struct.unpack_from("<H", data, 60)[0]
+    if (
+        section_offset == 0
+        or section_entry_size != 64
+        or section_count == 0
+        or section_count > 4096
+        or section_offset > len(data)
+        or section_entry_size * section_count > len(data) - section_offset
+    ):
+        fail("Packaged ELF section headers are invalid: {}".format(name))
+
+    sections = []
+    for index in range(section_count):
+        offset = section_offset + index * section_entry_size
+        section_type = struct.unpack_from("<I", data, offset + 4)[0]
+        file_offset = struct.unpack_from("<Q", data, offset + 24)[0]
+        file_size = struct.unpack_from("<Q", data, offset + 32)[0]
+        link = struct.unpack_from("<I", data, offset + 40)[0]
+        entry_size = struct.unpack_from("<Q", data, offset + 56)[0]
+        if (
+            section_type != 8
+            and (
+                file_offset > len(data)
+                or file_size > len(data) - file_offset
+            )
+        ):
+            fail("Packaged ELF section is out of bounds: {}".format(name))
+        sections.append(
+            (section_type, file_offset, file_size, link, entry_size)
+        )
+
+    exports = set()
+    dynamic_symbol_tables = 0
+    for section_type, file_offset, file_size, link, entry_size in sections:
+        if section_type != 11:
+            continue
+        dynamic_symbol_tables += 1
+        if (
+            entry_size != 24
+            or file_size % entry_size != 0
+            or link >= len(sections)
+        ):
+            fail("Packaged ELF dynamic symbol table is invalid: {}".format(name))
+        string_type, string_offset, string_size, _, _ = sections[link]
+        symbol_count = file_size // entry_size
+        if (
+            string_type != 3
+            or string_size == 0
+            or symbol_count > MAX_NATIVE_SYMBOLS
+        ):
+            fail("Packaged ELF dynamic string table is invalid: {}".format(name))
+        string_limit = string_offset + string_size
+        for index in range(symbol_count):
+            offset = file_offset + index * entry_size
+            string_index = struct.unpack_from("<I", data, offset)[0]
+            symbol_info = data[offset + 4]
+            symbol_visibility = data[offset + 5] & 0x3
+            section_index = struct.unpack_from("<H", data, offset + 6)[0]
+            symbol_binding = symbol_info >> 4
+            if (
+                string_index == 0
+                or string_index >= string_size
+                or section_index == 0
+                or symbol_binding not in (1, 2)
+                or symbol_visibility not in (0, 3)
+            ):
+                continue
+            exports.add(
+                bounded_c_string(
+                    data,
+                    string_offset + string_index,
+                    string_limit,
+                    "Packaged ELF dynamic symbol",
+                    name,
+                )
+            )
+    if dynamic_symbol_tables == 0:
+        fail("Packaged ELF has no dynamic symbol table: {}".format(name))
+    return exports
+
 
 def validate_macho(data, expected_cpu, name):
     if (
@@ -363,6 +457,7 @@ def validate_macho(data, expected_cpu, name):
 
     has_executable_segment = False
     has_dylib_id = False
+    symbol_table = None
     offset = command_start
     for _ in range(command_count):
         if offset + 8 > command_end:
@@ -397,12 +492,57 @@ def validate_macho(data, expected_cpu, name):
             ):
                 fail("Packaged Mach-O dylib id is invalid: {}".format(name))
             has_dylib_id = True
+        elif command == 0x2:
+            if size != 24 or symbol_table is not None:
+                fail("Packaged Mach-O symbol table is invalid: {}".format(name))
+            symbol_table = struct.unpack_from("<IIII", data, offset + 8)
         offset += size
     if offset != command_end or not (has_executable_segment and has_dylib_id):
         fail(
             "Packaged Mach-O is missing an executable segment or dylib id: {}"
             .format(name)
         )
+
+    if symbol_table is None:
+        fail("Packaged Mach-O has no dynamic symbol table: {}".format(name))
+    symbol_offset, symbol_count, string_offset, string_size = symbol_table
+    if (
+        symbol_count > MAX_NATIVE_SYMBOLS
+        or symbol_offset > len(data)
+        or symbol_count * 16 > len(data) - symbol_offset
+        or string_offset > len(data)
+        or string_size == 0
+        or string_size > len(data) - string_offset
+    ):
+        fail("Packaged Mach-O symbol table is out of bounds: {}".format(name))
+
+    exports = set()
+    string_limit = string_offset + string_size
+    for index in range(symbol_count):
+        offset = symbol_offset + index * 16
+        string_index, symbol_type, section_index = struct.unpack_from(
+            "<IBB", data, offset
+        )
+        if (
+            string_index == 0
+            or string_index >= string_size
+            or symbol_type & 0xE0
+            or not symbol_type & 0x01
+            or symbol_type & 0x0E == 0
+            or section_index == 0
+        ):
+            continue
+        symbol = bounded_c_string(
+            data,
+            string_offset + string_index,
+            string_limit,
+            "Packaged Mach-O dynamic symbol",
+            name,
+        )
+        if symbol.startswith(b"_"):
+            symbol = symbol[1:]
+        exports.add(symbol)
+    return exports
 
 
 def validate_pe(data, expected_machine, name):
@@ -444,7 +584,7 @@ def validate_pe(data, expected_machine, name):
         fail("Packaged PE DLL has no export directory: {}".format(name))
 
     has_executable_section = False
-    export_in_bounds = False
+    sections = []
     for index in range(section_count):
         offset = section_offset + index * 40
         virtual_size = struct.unpack_from("<I", data, offset + 8)[0]
@@ -457,35 +597,118 @@ def validate_pe(data, expected_machine, name):
         if raw_size > 0 and characteristics & 0x20000000:
             has_executable_section = True
         mapped_size = max(virtual_size, raw_size)
-        if (
-            virtual_address <= export_rva
-            and export_rva - virtual_address <= mapped_size
-            and export_size <= mapped_size - (export_rva - virtual_address)
-        ):
-            export_offset = raw_offset + (export_rva - virtual_address)
-            if export_offset <= len(data) and export_size <= len(data) - export_offset:
-                export_in_bounds = True
-    if not (has_executable_section and export_in_bounds):
+        sections.append(
+            (virtual_address, mapped_size, raw_offset, raw_size)
+        )
+
+    def rva_to_offset(rva, size, description):
+        for virtual_address, mapped_size, raw_offset, raw_size in sections:
+            if virtual_address <= rva:
+                delta = rva - virtual_address
+                if (
+                    delta <= mapped_size
+                    and size <= mapped_size - delta
+                    and delta <= raw_size
+                    and size <= raw_size - delta
+                ):
+                    return raw_offset + delta
+        fail("{} is out of bounds: {}".format(description, name))
+
+    export_offset = rva_to_offset(
+        export_rva, export_size, "Packaged PE export directory"
+    )
+    if not has_executable_section or export_size < 40:
         fail(
             "Packaged PE DLL is missing executable code or valid exports: {}"
             .format(name)
         )
+    (
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        function_count,
+        name_count,
+        functions_rva,
+        names_rva,
+        ordinals_rva,
+    ) = struct.unpack_from("<IIHHIIIIIII", data, export_offset)
+    if (
+        function_count == 0
+        or name_count == 0
+        or function_count > MAX_NATIVE_SYMBOLS
+        or name_count > MAX_NATIVE_SYMBOLS
+        or name_count > function_count
+    ):
+        fail("Packaged PE export table is invalid: {}".format(name))
+
+    functions_offset = rva_to_offset(
+        functions_rva,
+        function_count * 4,
+        "Packaged PE export address table",
+    )
+    names_offset = rva_to_offset(
+        names_rva,
+        name_count * 4,
+        "Packaged PE export name table",
+    )
+    ordinals_offset = rva_to_offset(
+        ordinals_rva,
+        name_count * 2,
+        "Packaged PE export ordinal table",
+    )
+
+    exports = set()
+    for index in range(name_count):
+        symbol_rva = struct.unpack_from("<I", data, names_offset + index * 4)[0]
+        ordinal = struct.unpack_from(
+            "<H", data, ordinals_offset + index * 2
+        )[0]
+        if ordinal >= function_count:
+            fail("Packaged PE export ordinal is invalid: {}".format(name))
+        function_rva = struct.unpack_from(
+            "<I", data, functions_offset + ordinal * 4
+        )[0]
+        if function_rva == 0:
+            fail("Packaged PE export address is invalid: {}".format(name))
+        symbol_offset = rva_to_offset(
+            symbol_rva, 1, "Packaged PE export name"
+        )
+        section_limit = None
+        for _, _, raw_offset, raw_size in sections:
+            if raw_offset <= symbol_offset < raw_offset + raw_size:
+                section_limit = raw_offset + raw_size
+                break
+        if section_limit is None:
+            fail("Packaged PE export name is out of bounds: {}".format(name))
+        exports.add(
+            bounded_c_string(
+                data,
+                symbol_offset,
+                section_limit,
+                "Packaged PE export name",
+                name,
+            )
+        )
+    return exports
 
 
 def validate_native(data, expected, name, jni_symbols):
     kind, architecture = expected
     if kind == "ELF":
-        validate_elf(data, architecture, name)
+        exports = validate_elf(data, architecture, name)
     elif kind == "Mach-O":
-        validate_macho(data, architecture, name)
+        exports = validate_macho(data, architecture, name)
     elif kind == "PE":
-        validate_pe(data, architecture, name)
+        exports = validate_pe(data, architecture, name)
     else:
         fail("Unknown native validation target: {}".format(kind))
     missing_symbols = [
         symbol.decode("ascii")
         for symbol in jni_symbols
-        if symbol not in data
+        if symbol not in exports
     ]
     if missing_symbols:
         fail(

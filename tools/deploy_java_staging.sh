@@ -65,7 +65,6 @@ NEXUS_SERVER_ID=apache.releases.https
 GPG_PLUGIN_GOAL=org.apache.maven.plugins:maven-gpg-plugin:3.2.8:sign-and-deploy-file
 NEXUS_PLUGIN_GOAL=org.sonatype.plugins:nexus-staging-maven-plugin:1.7.0:deploy-staged-repository
 MAVEN_CENTRAL_URL=https://repo.maven.apache.org/maven2
-MAVEN_PLUGIN_LOCK="$SCRIPT_DIR/java-staging-maven-plugins.sha256"
 PINNED_MAVEN_MIRROR_ID=paimon-mosaic-pinned-plugins
 
 usage() {
@@ -394,7 +393,11 @@ check_checkout_clean() {
   local status
   local ignored
 
-  status=$(git -C "$REPO_DIR" status --porcelain=v1 --untracked-files=all)
+  status=$(
+    git -C "$REPO_DIR" \
+      -c core.fsmonitor=false \
+      status --porcelain=v1 --untracked-files=all
+  )
   if [[ -n "$status" ]]; then
     echo "The RC checkout must be clean before Java staging." >&2
     printf '%s\n' "$status" >&2
@@ -420,6 +423,22 @@ check_checkout_clean
 gh_exact() {
   GH_HOST="$GITHUB_HOST" gh "$@"
 }
+
+validate_gh_transport() {
+  local unix_socket
+
+  if ! unix_socket=$(gh_exact config get http_unix_socket); then
+    echo "Unable to inspect the GitHub CLI HTTP transport configuration." >&2
+    exit 1
+  fi
+  if [[ -n "$unix_socket" ]]; then
+    echo "GitHub CLI Unix socket transport is not allowed during Java staging." >&2
+    echo "$unix_socket" >&2
+    exit 1
+  fi
+}
+
+validate_gh_transport
 
 validate_remote_tag_object() {
   local remote_tag_output
@@ -747,10 +766,22 @@ tar -xf "$ARCHIVE_PATH" -C "$STAGING_ROOT"
 SIGNED_REPO_DIR="$STAGING_ROOT/$ARCHIVE_PREFIX"
 
 ARTIFACT_VALIDATOR="$SIGNED_REPO_DIR/tools/validate_java_staging_artifacts.sh"
+MAVEN_PLUGIN_PREPARER="$SIGNED_REPO_DIR/tools/prepare_java_staging_maven_plugins.py"
+MAVEN_PLUGIN_LOCK="$SIGNED_REPO_DIR/tools/java-staging-maven-plugins.sha256"
 SIGNED_POM="$SIGNED_REPO_DIR/java/pom.xml"
 if [[ -L "$ARTIFACT_VALIDATOR" || ! -f "$ARTIFACT_VALIDATOR" ||
       ! -x "$ARTIFACT_VALIDATOR" ]]; then
   echo "Java staging artifact validator is not an executable regular file." >&2
+  exit 1
+fi
+if [[ -L "$MAVEN_PLUGIN_PREPARER" || ! -f "$MAVEN_PLUGIN_PREPARER" ||
+      ! -s "$MAVEN_PLUGIN_PREPARER" ]]; then
+  echo "Signed Maven plugin preparer is missing or unsafe." >&2
+  exit 1
+fi
+if [[ -L "$MAVEN_PLUGIN_LOCK" || ! -f "$MAVEN_PLUGIN_LOCK" ||
+      ! -s "$MAVEN_PLUGIN_LOCK" ]]; then
+  echo "Signed Maven plugin lock is missing or unsafe." >&2
   exit 1
 fi
 if [[ -L "$SIGNED_POM" || ! -f "$SIGNED_POM" || ! -s "$SIGNED_POM" ]]; then
@@ -1125,16 +1156,11 @@ validate_asf_keys_membership() {
 validate_local_signing_key
 validate_asf_keys_membership
 
-if [[ -L "$MAVEN_PLUGIN_LOCK" || ! -f "$MAVEN_PLUGIN_LOCK" ]]; then
-  echo "Pinned Maven plugin lock is missing or unsafe: $MAVEN_PLUGIN_LOCK" >&2
-  exit 1
-fi
-
 PINNED_MAVEN_REPOSITORY="$STAGING_ROOT/pinned-maven-plugins"
 install -d -m 700 "$PINNED_MAVEN_REPOSITORY"
 PINNED_MAVEN_REPOSITORY_URI=$(
   "$PYTHON" \
-    "$SCRIPT_DIR/prepare_java_staging_maven_plugins.py" \
+    "$MAVEN_PLUGIN_PREPARER" \
     prepare \
     "$MAVEN_PLUGIN_LOCK" \
     "$PINNED_MAVEN_REPOSITORY" \
@@ -1631,7 +1657,7 @@ validate_frozen_provenance
 check_checkout_clean
 verify_frozen_java_payloads
 "$PYTHON" \
-  "$SCRIPT_DIR/prepare_java_staging_maven_plugins.py" \
+  "$MAVEN_PLUGIN_PREPARER" \
   verify \
   "$MAVEN_PLUGIN_LOCK" \
   "$PINNED_MAVEN_REPOSITORY"
