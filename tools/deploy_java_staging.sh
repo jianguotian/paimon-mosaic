@@ -38,6 +38,12 @@ export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_NO_REPLACE_OBJECTS=1
 
+# Python validation only uses the standard library. Do not inherit module search
+# paths that can execute code before release provenance is established.
+unset PYTHONHOME PYTHONPATH
+# Curl configuration can add transfers before the explicit release URLs.
+unset CURL_HOME
+
 MVN=${MVN:-mvn}
 GPG=${GPG:-gpg}
 CURL=${CURL:-curl}
@@ -313,6 +319,7 @@ if [[ "$DRY_RUN" != true ]] &&
   echo "Required command not found: $CURL" >&2
   exit 1
 fi
+PYTHON_TRUSTED=("$PYTHON" -I)
 
 GIT_TRUSTED=(git -c core.fsmonitor=false)
 
@@ -521,7 +528,7 @@ capture_github_provenance() {
     exit 1
   fi
 
-  "$PYTHON" - \
+  "${PYTHON_TRUSTED[@]}" - \
     "$RUN_JSON" \
     "$WORKFLOW_JSON" \
     "$ARTIFACTS_JSON" \
@@ -773,7 +780,7 @@ ARCHIVE_PATH="$STAGING_ROOT/source.tar"
   --format=tar \
   "--prefix=${ARCHIVE_PREFIX}/" \
   "$TAG_COMMIT" > "$ARCHIVE_PATH"
-tar -xf "$ARCHIVE_PATH" -C "$STAGING_ROOT"
+env -u TAR_OPTIONS tar -xf "$ARCHIVE_PATH" -C "$STAGING_ROOT"
 SIGNED_REPO_DIR="$STAGING_ROOT/$ARCHIVE_PREFIX"
 
 ARTIFACT_VALIDATOR="$SIGNED_REPO_DIR/tools/validate_java_staging_artifacts.sh"
@@ -825,7 +832,7 @@ if ! gh_exact api \
   exit 1
 fi
 
-"$PYTHON" - \
+"${PYTHON_TRUSTED[@]}" - \
   "$JAVA_PACKAGE_ZIP" \
   "$JAVA_PACKAGE_ARTIFACT_DIGEST" \
   "$JAVA_PACKAGE_ARTIFACT_SIZE" \
@@ -962,7 +969,7 @@ finally:
     archive.close()
 PY
 
-"$PYTHON" - \
+"${PYTHON_TRUSTED[@]}" - \
   "$JAVA_PACKAGE_DIR/java-staging-provenance.txt" \
   "$REPOSITORY" \
   "$TAG" \
@@ -1069,7 +1076,7 @@ fi
 check_checkout_clean
 
 write_provenance_manifest() {
-  "$PYTHON" - "$FROZEN_PROVENANCE" "$PROVENANCE_MANIFEST" <<'PY'
+  "${PYTHON_TRUSTED[@]}" - "$FROZEN_PROVENANCE" "$PROVENANCE_MANIFEST" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -1127,7 +1134,7 @@ validate_asf_keys_membership() {
 
   if [[ -z "$KEYS_FILE" ]]; then
     KEYS_FILE="$STAGING_ROOT/PAIMON_KEYS"
-    if "$CURL" \
+    if "$CURL" -q \
       --proto '=https' \
       --tlsv1.2 \
       --location \
@@ -1170,7 +1177,7 @@ validate_asf_keys_membership
 PINNED_MAVEN_REPOSITORY="$STAGING_ROOT/pinned-maven-plugins"
 install -d -m 700 "$PINNED_MAVEN_REPOSITORY"
 PINNED_MAVEN_REPOSITORY_URI=$(
-  "$PYTHON" \
+  "${PYTHON_TRUSTED[@]}" \
     "$MAVEN_PLUGIN_PREPARER" \
     prepare \
     "$MAVEN_PLUGIN_LOCK" \
@@ -1181,7 +1188,7 @@ PINNED_MAVEN_REPOSITORY_URI=$(
 SIGNING_MAVEN_SETTINGS="$STAGING_ROOT/maven-signing-settings.xml"
 NEXUS_MAVEN_SETTINGS="$STAGING_ROOT/maven-nexus-settings.xml"
 EMPTY_GLOBAL_MAVEN_SETTINGS="$STAGING_ROOT/maven-global-settings.xml"
-"$PYTHON" - \
+"${PYTHON_TRUSTED[@]}" - \
   "$SOURCE_MAVEN_SETTINGS" \
   "$SIGNING_MAVEN_SETTINGS" \
   "$NEXUS_MAVEN_SETTINGS" \
@@ -1340,7 +1347,7 @@ MAIN_JAR="$JAVA_PACKAGE_DIR/mosaic-${RELEASE_VERSION}.jar"
 SOURCES_JAR="$JAVA_PACKAGE_DIR/mosaic-${RELEASE_VERSION}-sources.jar"
 JAVADOC_JAR="$JAVA_PACKAGE_DIR/mosaic-${RELEASE_VERSION}-javadoc.jar"
 FROZEN_JAVA_PAYLOADS=$(
-  "$PYTHON" - \
+  "${PYTHON_TRUSTED[@]}" - \
     "$MAIN_JAR" \
     "$SOURCES_JAR" \
     "$JAVADOC_JAR" \
@@ -1439,7 +1446,7 @@ run_maven \
 LOCAL_VERSION_DIR="$LOCAL_MAVEN_REPO/org/apache/paimon/mosaic/$RELEASE_VERSION"
 
 verify_frozen_java_payloads() {
-  "$PYTHON" - \
+  "${PYTHON_TRUSTED[@]}" - \
     "$FROZEN_JAVA_PAYLOADS" \
     "$LOCAL_MAVEN_REPO" \
     "$RELEASE_VERSION" \
@@ -1667,7 +1674,7 @@ verify_local_signature "$LOCAL_VERSION_DIR/mosaic-${RELEASE_VERSION}.pom"
 validate_frozen_provenance
 check_checkout_clean
 verify_frozen_java_payloads
-"$PYTHON" \
+"${PYTHON_TRUSTED[@]}" \
   "$MAVEN_PLUGIN_PREPARER" \
   verify \
   "$MAVEN_PLUGIN_LOCK" \

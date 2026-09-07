@@ -243,6 +243,7 @@ def prepare(lock, root, curl):
     write_download_config(config, root, entries)
     command = [
         curl,
+        "-q",
         "--proto",
         "=https",
         "--tlsv1.2",

