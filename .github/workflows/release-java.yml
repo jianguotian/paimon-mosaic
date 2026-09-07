@@ -62,6 +62,8 @@ jobs:
             lib_name: paimon_mosaic_jni.dll
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
 
       - name: Setup Rust toolchain
         run: |
@@ -123,9 +125,8 @@ jobs:
           name: native-${{ matrix.os_name }}-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
 
-  deploy-staging:
+  package-java:
     if: >-
-      github.event_name != 'workflow_dispatch' &&
       github.repository == 'apache/paimon-mosaic' &&
       startsWith(github.ref, 'refs/tags/') &&
       contains(github.ref_name, '-rc')
@@ -133,6 +134,9 @@ jobs:
     needs: [release-preflight, build-native]
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.commit }}
+          fetch-depth: 0
 
       - name: Download linux x86_64 native library
         uses: actions/download-artifact@v5
@@ -166,31 +170,83 @@ jobs:
         with:
           java-version: ${{ env.JDK_VERSION }}
           distribution: 'temurin'
-          server-id: apache.releases.https
-          server-username: MAVEN_USERNAME
-          server-password: MAVEN_PASSWORD
-          gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          cache: maven
 
       - name: Show Maven version
         run: mvn --version
 
-      - name: Deploy to Apache Nexus staging
+      - name: Package Java artifacts
         working-directory: java
-        run: |
-          REF="${TAG_NAME}"
-          VERSION="${REF#v}"
-          if [[ "$VERSION" == *-rc* ]]; then
-            DESC="Apache Paimon Mosaic, version ${VERSION%-rc*}, release candidate ${VERSION#*-rc}"
-          else
-            DESC="Apache Paimon Mosaic, version ${VERSION}"
-          fi
-          mvn clean deploy \
-            -Prelease \
-            -DskipTests \
-            -DstagingDescription="$DESC"
+        run: mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
+
+      - name: Freeze exact Java candidate
+        id: java-candidate
         env:
           TAG_NAME: ${{ github.ref_name }}
-          MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
-          MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          VERIFIED_TAG_OBJECT: ${{ needs.release-preflight.outputs.tag_object }}
+          VERIFIED_COMMIT: ${{ needs.release-preflight.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${TAG_NAME}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-rc[1-9][0-9]*$ ]]; then
+            echo "Invalid Java RC tag: ${TAG_NAME}" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          tag_object="${VERIFIED_TAG_OBJECT}"
+          commit="${VERIFIED_COMMIT}"
+          if [[ ! "${tag_object}" =~ ^[0-9a-f]{40}$ ||
+                ! "${commit}" =~ ^[0-9a-f]{40}$ ||
+                "${commit}" != "${GITHUB_SHA}" ||
+                "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]]; then
+            echo "Verified RC provenance does not match GITHUB_SHA." >&2
+            exit 1
+          fi
+
+          candidate_dir="${RUNNER_TEMP}/java-package"
+          if [[ -e "${candidate_dir}" ]]; then
+            echo "Java candidate directory already exists: ${candidate_dir}" >&2
+            exit 1
+          fi
+          install -d -m 700 "${candidate_dir}"
+
+          for artifact in \
+            "mosaic-${version}.jar" \
+            "mosaic-${version}-sources.jar" \
+            "mosaic-${version}-javadoc.jar"
+          do
+            source="java/target/${artifact}"
+            if [[ -L "${source}" || ! -f "${source}" || ! -s "${source}" ]]; then
+              echo "Expected Java artifact is missing or unsafe: ${source}" >&2
+              exit 1
+            fi
+            install -m 600 "${source}" "${candidate_dir}/${artifact}"
+          done
+
+          umask 077
+          {
+            printf 'schema=1\n'
+            printf 'repository=%s\n' "${GITHUB_REPOSITORY}"
+            printf 'tag=%s\n' "${TAG_NAME}"
+            printf 'tag_object=%s\n' "${tag_object}"
+            printf 'commit=%s\n' "${commit}"
+            printf 'run_id=%s\n' "${GITHUB_RUN_ID}"
+            printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+          } > "${candidate_dir}/java-staging-provenance.txt"
+
+          ./tools/validate_java_staging_artifacts.sh \
+            "${candidate_dir}" \
+            "${version}"
+
+          printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload Java artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: java-package
+          path: |
+            ${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}.jar
+            ${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-sources.jar
+            ${{ runner.temp }}/java-package/mosaic-${{ steps.java-candidate.outputs.version }}-javadoc.jar
+            ${{ runner.temp }}/java-package/java-staging-provenance.txt
+          if-no-files-found: error

@@ -50,7 +50,6 @@ jobs:
     name: Java release
     needs: [release-preflight]
     uses: ./.github/workflows/release-java.yml
-    secrets: inherit
 
   python-wheels:
     name: Python wheels
