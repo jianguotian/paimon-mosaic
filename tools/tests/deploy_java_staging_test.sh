@@ -75,17 +75,22 @@ create_candidate_artifacts() {
   local tag_object
   local commit
   local candidate_run_attempt
+  local omitted_native=${1-}
+  local omitted_position=${2-}
 
   tag_object=$(git -C "$FIXTURE_DIR" rev-parse "v0.3.0-rc1^{tag}")
   commit=$(git -C "$FIXTURE_DIR" rev-parse "v0.3.0-rc1^{commit}")
   candidate_run_attempt=${FAKE_CANDIDATE_RUN_ATTEMPT:-$FAKE_RUN_ATTEMPT}
-  "$PYTHON" - \
+  REMOVED_JNI_SYMBOL=$(
+    "$PYTHON" - \
     "$FIXTURE_DIR" \
     "$CANDIDATE_DIR" \
     "$ARTIFACT_ZIP" \
     "$tag_object" \
     "$commit" \
-    "$candidate_run_attempt" <<'PY'
+    "$candidate_run_attempt" \
+    "$omitted_native" \
+    "$omitted_position" <<'PY'
 import re
 import struct
 import sys
@@ -99,6 +104,8 @@ artifact_zip = Path(sys.argv[3])
 tag_object = sys.argv[4]
 commit = sys.argv[5]
 run_attempt = sys.argv[6]
+omitted_native = sys.argv[7]
+omitted_position = sys.argv[8]
 candidate.mkdir(parents=True, exist_ok=True)
 
 version = "0.3.0"
@@ -151,10 +158,43 @@ symbol_names = [
     ).encode("ascii")
     for method in native_methods
 ]
+sorted_symbol_names = [
+    (
+        "Java_org_apache_paimon_mosaic_NativeLib_" + method
+    ).encode("ascii")
+    for method in sorted(native_methods)
+]
 symbol_blob = b"\x00".join(symbol_names)
+symbol_indexes = {
+    symbol: index for index, symbol in enumerate(symbol_names, 1)
+}
+native_entries = (
+    "native/linux/x86_64/libpaimon_mosaic_jni.so",
+    "native/linux/aarch64/libpaimon_mosaic_jni.so",
+    "native/macos/aarch64/libpaimon_mosaic_jni.dylib",
+    "native/windows/x86_64/paimon_mosaic_jni.dll",
+)
+omitted_symbol = None
+if omitted_native or omitted_position:
+    if omitted_native not in native_entries:
+        raise AssertionError("unknown native omission target")
+    indexes = {
+        "first": 0,
+        "middle": len(sorted_symbol_names) // 2,
+        "last": len(sorted_symbol_names) - 1,
+    }
+    if omitted_position not in indexes:
+        raise AssertionError("unknown JNI symbol omission position")
+    omitted_symbol = sorted_symbol_names[indexes[omitted_position]]
 
 
-def elf(machine):
+def exports_for(native):
+    if native != omitted_native:
+        return symbol_names
+    return [symbol for symbol in symbol_names if symbol != omitted_symbol]
+
+
+def elf(machine, exported_symbols):
     def gnu_hash(symbol):
         value = 5381
         for byte in symbol:
@@ -194,7 +234,7 @@ def elf(machine):
 
     dynamic_strings = bytearray(b"\x00")
     string_indexes = []
-    for symbol in symbol_names:
+    for symbol in exported_symbols:
         string_indexes.append(len(dynamic_strings))
         dynamic_strings.extend(symbol + b"\x00")
     string_offset = 0x3000
@@ -218,7 +258,9 @@ def elf(machine):
     data[
         string_offset : string_offset + len(dynamic_strings)
     ] = dynamic_strings
-    for index, string_index in enumerate(string_indexes, 1):
+    for index, (symbol, string_index) in enumerate(
+        zip(exported_symbols, string_indexes), 1
+    ):
         struct.pack_into(
             "<IBBHQQ",
             data,
@@ -227,13 +269,14 @@ def elf(machine):
             0x12,
             0,
             3,
-            text_offset + index * 16,
+            text_offset + symbol_indexes[symbol] * 16,
             16,
         )
+    for index in range(1, len(symbol_names) + 1):
         data[
             text_offset + index * 16 : text_offset + index * 16 + 16
         ] = b"\x90" * 16
-    symbol_count = len(symbol_names) + 1
+    symbol_count = len(exported_symbols) + 1
     struct.pack_into("<II", data, hash_offset, 1, symbol_count)
     struct.pack_into("<I", data, hash_offset + 8, 1)
     for index in range(1, symbol_count):
@@ -248,7 +291,7 @@ def elf(machine):
         struct.pack_into("<H", data, version_offset + index * 2, 1)
     bloom_shift = 5
     bloom = 0
-    hashes = [gnu_hash(symbol) for symbol in symbol_names]
+    hashes = [gnu_hash(symbol) for symbol in exported_symbols]
     for symbol_hash in hashes:
         bloom |= 1 << (symbol_hash % 64)
         bloom |= 1 << ((symbol_hash >> bloom_shift) % 64)
@@ -288,7 +331,10 @@ def elf(machine):
     struct.pack_into("<Q", data, symbol_section + 16, symbol_offset)
     struct.pack_into("<Q", data, symbol_section + 24, symbol_offset)
     struct.pack_into(
-        "<Q", data, symbol_section + 32, (len(symbol_names) + 1) * 24
+        "<Q",
+        data,
+        symbol_section + 32,
+        (len(exported_symbols) + 1) * 24,
     )
     struct.pack_into("<I", data, symbol_section + 40, 1)
     struct.pack_into("<I", data, symbol_section + 44, 1)
@@ -336,7 +382,7 @@ def elf(machine):
     return bytes(data)
 
 
-def macho():
+def macho(exported_symbols):
     def uleb128(value):
         encoded = bytearray()
         while True:
@@ -379,20 +425,30 @@ def macho():
 
     dynamic_strings = bytearray(b"\x00")
     string_indexes = []
-    for symbol in symbol_names:
+    for symbol in exported_symbols:
         string_indexes.append(len(dynamic_strings))
         dynamic_strings.extend(b"_" + symbol + b"\x00")
     symbol_offset = 0x1000
     string_offset = 0x2000
     struct.pack_into("<I", data, 216, 0x2)
     struct.pack_into("<I", data, 220, 24)
-    struct.pack_into("<IIII", data, 224, symbol_offset, len(symbol_names),
-                     string_offset, len(dynamic_strings))
+    struct.pack_into(
+        "<IIII",
+        data,
+        224,
+        symbol_offset,
+        len(exported_symbols),
+        string_offset,
+        len(dynamic_strings),
+    )
     trie_offset = 0x5000
-    trie_names = [b"_" + symbol for symbol in symbol_names]
+    trie_names = [b"_" + symbol for symbol in exported_symbols]
     leaves = []
-    for index in range(len(trie_names)):
-        payload = uleb128(0) + uleb128(index * 16)
+    for symbol in exported_symbols:
+        payload = (
+            uleb128(0)
+            + uleb128((symbol_indexes[symbol] - 1) * 16)
+        )
         leaves.append(uleb128(len(payload)) + payload + b"\x00")
     child_offsets = [0] * len(leaves)
     for _ in range(10):
@@ -417,7 +473,9 @@ def macho():
     data[
         string_offset : string_offset + len(dynamic_strings)
     ] = dynamic_strings
-    for index, string_index in enumerate(string_indexes):
+    for index, (symbol, string_index) in enumerate(
+        zip(exported_symbols, string_indexes)
+    ):
         struct.pack_into(
             "<IBBHQ",
             data,
@@ -426,8 +484,9 @@ def macho():
             0x0F,
             1,
             0,
-            0x1000 + index * 16,
+            0x1000 + (symbol_indexes[symbol] - 1) * 16,
         )
+    for index in range(len(symbol_names)):
         data[
             0x3000 + index * 16 : 0x3000 + index * 16 + 16
         ] = b"\x00\x00\x80\xd2\xc0\x03\x5f\xd6" * 2
@@ -435,7 +494,7 @@ def macho():
     return bytes(data)
 
 
-def pe():
+def pe(exported_symbols):
     data = bytearray(64 * 1024)
     data[:2] = b"MZ"
     pe_offset = 0x80
@@ -474,7 +533,10 @@ def pe():
     strings_offset = 0x600
     section_rva = 0x1000
     raw_offset = 0x200
-    pe_symbols = sorted(symbol_names)
+    pe_symbols = sorted(exported_symbols)
+    pe_symbol_indexes = {
+        symbol: index for index, symbol in enumerate(sorted(symbol_names))
+    }
 
     def to_rva(offset):
         return section_rva + offset - raw_offset
@@ -499,7 +561,10 @@ def pe():
     next_string = strings_offset
     for index, symbol in enumerate(pe_symbols):
         struct.pack_into(
-            "<I", data, functions_offset + index * 4, 0x3000 + index * 16
+            "<I",
+            data,
+            functions_offset + index * 4,
+            0x3000 + pe_symbol_indexes[symbol] * 16,
         )
         struct.pack_into(
             "<I", data, names_offset + index * 4, to_rva(next_string)
@@ -541,19 +606,37 @@ write_jar(
         ),
         (
             "native/linux/x86_64/libpaimon_mosaic_jni.so",
-            elf(62),
+            elf(
+                62,
+                exports_for(
+                    "native/linux/x86_64/libpaimon_mosaic_jni.so"
+                ),
+            ),
         ),
         (
             "native/linux/aarch64/libpaimon_mosaic_jni.so",
-            elf(183),
+            elf(
+                183,
+                exports_for(
+                    "native/linux/aarch64/libpaimon_mosaic_jni.so"
+                ),
+            ),
         ),
         (
             "native/macos/aarch64/libpaimon_mosaic_jni.dylib",
-            macho(),
+            macho(
+                exports_for(
+                    "native/macos/aarch64/libpaimon_mosaic_jni.dylib"
+                )
+            ),
         ),
         (
             "native/windows/x86_64/paimon_mosaic_jni.dll",
-            pe(),
+            pe(
+                exports_for(
+                    "native/windows/x86_64/paimon_mosaic_jni.dll"
+                )
+            ),
         ),
     ],
 )
@@ -638,7 +721,10 @@ with zipfile.ZipFile(artifact_zip, "w", zipfile.ZIP_DEFLATED) as archive:
         info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
         info.compress_type = zipfile.ZIP_DEFLATED
         archive.writestr(info, (candidate / name).read_bytes())
+if omitted_symbol is not None:
+    print(omitted_symbol.decode("ascii"))
 PY
+  )
 }
 
 write_expected_provenance() {
@@ -1500,7 +1586,7 @@ EOF
   git -C "$FIXTURE_DIR" tag -a v0.3.0-rc1 -m v0.3.0-rc1
 
   export PYTHON
-  create_candidate_artifacts
+  create_candidate_artifacts "${1-}" "${2-}"
   FAKE_ARTIFACT_ZIP=$ARTIFACT_ZIP
   FAKE_CANDIDATE_DIR=$CANDIDATE_DIR
   FAKE_ARTIFACT_DIGEST="sha256:$(sha256sum "$ARTIFACT_ZIP" | awk '{print $1}')"
@@ -2346,175 +2432,6 @@ PY
   done
 }
 
-remove_single_candidate_jni_export() {
-  local native=$1
-  local position=$2
-
-  REMOVED_JNI_SYMBOL=$(
-    "$PYTHON" - \
-    "$CANDIDATE_DIR/mosaic-0.3.0.jar" \
-    "$native" \
-    "$FIXTURE_DIR/java/src/main/java/org/apache/paimon/mosaic/NativeLib.java" \
-    "$position" <<'PY'
-import os
-import re
-import struct
-import sys
-import zipfile
-from pathlib import Path
-
-
-jar_path = Path(sys.argv[1])
-entry_name = sys.argv[2]
-source_path = Path(sys.argv[3])
-position = sys.argv[4]
-methods = sorted(re.findall(
-    r"\bnative\s+[A-Za-z0-9_.$<>\[\]?]+\s+"
-    r"([A-Za-z_$][A-Za-z0-9_$]*)\s*\(",
-    source_path.read_text(encoding="utf-8"),
-))
-indexes = {"first": 0, "middle": len(methods) // 2, "last": len(methods) - 1}
-target = (
-    "Java_org_apache_paimon_mosaic_NativeLib_" + methods[indexes[position]]
-).encode("ascii")
-temporary = jar_path.with_suffix(".tmp")
-
-
-def c_string(data, offset, limit):
-    end = data.index(0, offset, limit)
-    return bytes(data[offset:end])
-
-
-def remove_elf_export(data):
-    section_offset = struct.unpack_from("<Q", data, 40)[0]
-    section_size = struct.unpack_from("<H", data, 58)[0]
-    section_count = struct.unpack_from("<H", data, 60)[0]
-    for index in range(section_count):
-        section = section_offset + index * section_size
-        if struct.unpack_from("<I", data, section + 4)[0] != 11:
-            continue
-        symbol_offset = struct.unpack_from("<Q", data, section + 24)[0]
-        symbol_size = struct.unpack_from("<Q", data, section + 32)[0]
-        string_section_index = struct.unpack_from("<I", data, section + 40)[0]
-        entry_size = struct.unpack_from("<Q", data, section + 56)[0]
-        string_section = section_offset + string_section_index * section_size
-        string_offset = struct.unpack_from("<Q", data, string_section + 24)[0]
-        string_size = struct.unpack_from("<Q", data, string_section + 32)[0]
-        for symbol in range(1, symbol_size // entry_size):
-            offset = symbol_offset + symbol * entry_size
-            name_index = struct.unpack_from("<I", data, offset)[0]
-            if c_string(
-                data, string_offset + name_index, string_offset + string_size
-            ) == target:
-                struct.pack_into("<H", data, offset + 6, 0)
-                return
-    raise AssertionError("target ELF export not found")
-
-
-def remove_macho_export(data):
-    command_count = struct.unpack_from("<I", data, 16)[0]
-    offset = 32
-    for _ in range(command_count):
-        command, size = struct.unpack_from("<II", data, offset)
-        if command == 0x2:
-            symbol_offset, symbol_count, string_offset, string_size = (
-                struct.unpack_from("<IIII", data, offset + 8)
-            )
-            expected = b"_" + target
-            for symbol in range(symbol_count):
-                symbol_entry = symbol_offset + symbol * 16
-                name_index = struct.unpack_from("<I", data, symbol_entry)[0]
-                if c_string(
-                    data,
-                    string_offset + name_index,
-                    string_offset + string_size,
-                ) == expected:
-                    data[symbol_entry + 4] = 0x01
-                    return
-        offset += size
-    raise AssertionError("target Mach-O export not found")
-
-
-def remove_pe_export(data):
-    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
-    section_count = struct.unpack_from("<H", data, pe_offset + 6)[0]
-    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
-    optional_offset = pe_offset + 24
-    section_offset = optional_offset + optional_size
-    export_rva = struct.unpack_from("<I", data, optional_offset + 112)[0]
-    export_size = struct.unpack_from("<I", data, optional_offset + 116)[0]
-
-    def rva_to_offset(rva):
-        for index in range(section_count):
-            section = section_offset + index * 40
-            virtual_size = struct.unpack_from("<I", data, section + 8)[0]
-            virtual_address = struct.unpack_from("<I", data, section + 12)[0]
-            raw_size = struct.unpack_from("<I", data, section + 16)[0]
-            raw_offset = struct.unpack_from("<I", data, section + 20)[0]
-            extent = max(virtual_size, raw_size)
-            if virtual_address <= rva < virtual_address + extent:
-                return raw_offset + rva - virtual_address
-        raise AssertionError("PE RVA is not file-backed")
-
-    export_offset = rva_to_offset(export_rva)
-    function_count = struct.unpack_from("<I", data, export_offset + 20)[0]
-    name_count = struct.unpack_from("<I", data, export_offset + 24)[0]
-    functions_offset = rva_to_offset(
-        struct.unpack_from("<I", data, export_offset + 28)[0]
-    )
-    names_offset = rva_to_offset(
-        struct.unpack_from("<I", data, export_offset + 32)[0]
-    )
-    ordinals_offset = rva_to_offset(
-        struct.unpack_from("<I", data, export_offset + 36)[0]
-    )
-    for index in range(name_count):
-        name_offset = rva_to_offset(
-            struct.unpack_from("<I", data, names_offset + index * 4)[0]
-        )
-        if c_string(data, name_offset, len(data)) != target:
-            continue
-        ordinal = struct.unpack_from(
-            "<H", data, ordinals_offset + index * 2
-        )[0]
-        if ordinal >= function_count:
-            raise AssertionError("PE export ordinal is invalid")
-        struct.pack_into(
-            "<I", data, functions_offset + ordinal * 4, export_rva
-        )
-        return
-    raise AssertionError("target PE export not found")
-
-
-with zipfile.ZipFile(jar_path) as source, zipfile.ZipFile(
-    temporary, "w", zipfile.ZIP_DEFLATED
-) as output:
-    for info in source.infolist():
-        contents = source.read(info)
-        if info.filename == entry_name:
-            data = bytearray(contents)
-            if data[:4] == b"\x7fELF":
-                remove_elf_export(data)
-            elif data[:4] == b"\xcf\xfa\xed\xfe":
-                remove_macho_export(data)
-            elif data[:2] == b"MZ":
-                remove_pe_export(data)
-            else:
-                raise AssertionError("unexpected native format")
-            contents = bytes(data)
-        output_info = zipfile.ZipInfo(
-            info.filename,
-            date_time=(2026, 1, 1, 0, 0, 0),
-        )
-        output_info.compress_type = zipfile.ZIP_DEFLATED
-        output.writestr(output_info, contents)
-os.replace(temporary, jar_path)
-print(target.decode("ascii"))
-PY
-  )
-  repack_candidate_and_refresh_provenance
-}
-
 test_validator_rejects_single_missing_jni_exports() {
   local case_spec
   local native
@@ -2529,8 +2446,7 @@ test_validator_rejects_single_missing_jni_exports() {
   do
     native=${case_spec% *}
     position=${case_spec##* }
-    new_fixture
-    remove_single_candidate_jni_export "$native" "$position"
+    new_fixture "$native" "$position"
     symbol=$REMOVED_JNI_SYMBOL
 
     if run_script --dry-run > "$OUTPUT_LOG" 2>&1; then
