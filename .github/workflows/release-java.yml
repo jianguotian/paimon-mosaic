@@ -123,7 +123,7 @@ jobs:
           name: native-${{ matrix.os_name }}-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
 
-  deploy-staging:
+  package-java:
     if: >-
       github.event_name != 'workflow_dispatch' &&
       github.repository == 'apache/paimon-mosaic' &&
@@ -166,31 +166,109 @@ jobs:
         with:
           java-version: ${{ env.JDK_VERSION }}
           distribution: 'temurin'
-          server-id: apache.releases.https
-          server-username: MAVEN_USERNAME
-          server-password: MAVEN_PASSWORD
-          gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          cache: maven
 
       - name: Show Maven version
         run: mvn --version
 
-      - name: Deploy to Apache Nexus staging
+      - name: Package Java artifacts
         working-directory: java
+        run: mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
+
+      - name: Verify multi-platform Java package
+        shell: bash
         run: |
-          REF="${TAG_NAME}"
-          VERSION="${REF#v}"
-          if [[ "$VERSION" == *-rc* ]]; then
-            DESC="Apache Paimon Mosaic, version ${VERSION%-rc*}, release candidate ${VERSION#*-rc}"
-          else
-            DESC="Apache Paimon Mosaic, version ${VERSION}"
+          set -euo pipefail
+          version="$(sed -n 's#.*<version>\([^<]*\)</version>.*#\1#p' java/pom.xml | sed -n '2p')"
+          jar_file="java/target/mosaic-${version}.jar"
+          sources_jar="java/target/mosaic-${version}-sources.jar"
+          javadoc_jar="java/target/mosaic-${version}-javadoc.jar"
+
+          for artifact in "$jar_file" "$sources_jar" "$javadoc_jar"; do
+            test -s "$artifact"
+          done
+
+          if jar tf "$sources_jar" | grep -Eq '^native/'; then
+            echo "Sources JAR contains native resources" >&2
+            exit 1
           fi
-          mvn clean deploy \
-            -Prelease \
-            -DskipTests \
-            -DstagingDescription="$DESC"
-        env:
-          TAG_NAME: ${{ github.ref_name }}
-          MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
-          MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+          for entry in \
+            org/apache/paimon/mosaic/NativeLib.class \
+            native/linux/x86_64/libpaimon_mosaic_jni.so \
+            native/linux/aarch64/libpaimon_mosaic_jni.so \
+            native/macos/aarch64/libpaimon_mosaic_jni.dylib \
+            native/windows/x86_64/paimon_mosaic_jni.dll \
+            META-INF/LICENSE \
+            META-INF/NOTICE \
+            META-INF/DEPENDENCIES
+          do
+            jar tf "$jar_file" | grep -qx "$entry"
+          done
+
+          java -cp "$jar_file:java/target/test-classes" \
+            org.apache.paimon.mosaic.MosaicNativeLoaderSmokeTest
+
+      - name: Upload Java package
+        uses: actions/upload-artifact@v5
+        with:
+          name: java-package
+          path: java/target/*.jar
+          if-no-files-found: error
+
+  smoke-java-package:
+    if: >-
+      github.event_name != 'workflow_dispatch' &&
+      github.repository == 'apache/paimon-mosaic' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      contains(github.ref_name, '-rc')
+    needs: [release-preflight, package-java]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            classpath_separator: ':'
+            java_version: 8
+          - os: ubuntu-24.04-arm
+            classpath_separator: ':'
+            java_version: 8
+          # Temurin does not provide JDK 8 for GitHub's macOS arm64 runners.
+          - os: macos-latest
+            classpath_separator: ':'
+            java_version: 17
+          - os: windows-latest
+            classpath_separator: ';'
+            java_version: 8
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK ${{ matrix.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java_version }}
+          distribution: 'temurin'
+
+      - name: Download final Java package
+        uses: actions/download-artifact@v5
+        with:
+          name: java-package
+          path: java-package
+
+      - name: Load the bundled JNI library from the final JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar_file="$(
+            find java-package -type f -name '*.jar' \
+              ! -name '*-sources.jar' \
+              ! -name '*-javadoc.jar' \
+              -print -quit
+          )"
+          test -n "$jar_file"
+          mkdir -p smoke-classes
+          javac -cp "$jar_file" -d smoke-classes \
+            java/src/test/java/org/apache/paimon/mosaic/MosaicNativeLoaderSmokeTest.java
+          java -cp "$jar_file${{ matrix.classpath_separator }}smoke-classes" \
+            org.apache.paimon.mosaic.MosaicNativeLoaderSmokeTest
