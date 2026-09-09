@@ -75,6 +75,11 @@ pub fn safe(s: &str) -> String {
         .collect()
 }
 
+/// Render a path for terminal output without allowing control-sequence injection.
+pub fn safe_path(path: &std::path::Path) -> String {
+    safe(&path.to_string_lossy())
+}
+
 /// Human-readable encoding name.
 pub fn encoding_name(e: paimon_mosaic_core::reader::Encoding) -> String {
     use paimon_mosaic_core::reader::Encoding::*;
@@ -311,6 +316,12 @@ mod tests {
     fn render_value_strips_control_chars() {
         let s = render_value(&Value::String(b"\x1b[31mred".to_vec()));
         assert!(!s.contains('\x1b'), "ANSI escape must not survive: {s:?}");
+    }
+
+    #[test]
+    fn safe_path_strips_control_chars() {
+        let path = std::path::Path::new("input-\x1b]2;owned\x07.csv");
+        assert_eq!(safe_path(path), "input-\u{fffd}]2;owned\u{fffd}.csv");
     }
 
     #[test]

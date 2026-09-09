@@ -885,6 +885,8 @@ version = "0.3.0"
 dependencies = [
  "arrow",
  "clap",
+ "csv",
+ "libc",
  "paimon-mosaic-core",
  "serde",
  "serde_json",

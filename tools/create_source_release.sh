@@ -22,69 +22,193 @@
 #   apache-paimon-mosaic-{version}-src.tgz.asc
 #   apache-paimon-mosaic-{version}-src.tgz.sha512
 #
-# Usage: cd tools && RELEASE_VERSION=0.1.0 ./create_source_release.sh
-
-##
-## Variables with defaults (if not overwritten by environment)
-##
-MVN=${MVN:-mvn}
+# Usage:
+#   cd tools
+#   RELEASE_VERSION=0.3.0 RC_TAG=v0.3.0-rc1 ./create_source_release.sh
 
 # fail immediately
 set -o errexit
 set -o nounset
 set -o pipefail
-# print command before executing
-set -o xtrace
 
-CURR_DIR=`pwd`
-if [[ `basename $CURR_DIR` != "tools" ]] ; then
+# Do not let inherited Git variables redirect checks or replace signature
+# verification.
+unset \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES \
+  GIT_COMMON_DIR \
+  GIT_CONFIG_COUNT \
+  GIT_CONFIG_GLOBAL \
+  GIT_CONFIG_PARAMETERS \
+  GIT_CONFIG_SYSTEM \
+  GIT_DIR \
+  GIT_INDEX_FILE \
+  GIT_NAMESPACE \
+  GIT_OBJECT_DIRECTORY \
+  GIT_WORK_TREE
+export GIT_ATTR_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_NO_REPLACE_OBJECTS=1
+
+CURR_DIR=$(pwd -P)
+if [[ $(basename "${CURR_DIR}") != "tools" ]] ; then
   echo "You have to call the script from the tools/ dir"
   exit 1
 fi
 
-if [ "$(uname)" == "Darwin" ]; then
-    SHASUM="shasum -a 512"
-else
-    SHASUM="sha512sum"
+RELEASE_VERSION=${RELEASE_VERSION:-}
+RC_TAG=${RC_TAG:-}
+if [[ -z "${RELEASE_VERSION}" ]]; then
+  echo "RELEASE_VERSION is unset" >&2
+  exit 1
+fi
+if [[ -z "${RC_TAG}" ]]; then
+  echo "RC_TAG is unset" >&2
+  exit 1
+fi
+if [[ ! "${RC_TAG}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-rc[0-9]+$ ]]; then
+  echo "RC_TAG must have the form vX.Y.Z-rcN: ${RC_TAG}" >&2
+  exit 1
+fi
+if [[ "${BASH_REMATCH[1]}" != "${RELEASE_VERSION}" ]]; then
+  echo \
+    "RC_TAG ${RC_TAG} does not match RELEASE_VERSION ${RELEASE_VERSION}" \
+    >&2
+  exit 1
 fi
 
-###########################
-
-RELEASE_VERSION=${RELEASE_VERSION}
-
-if [ -z "${RELEASE_VERSION}" ]; then
-	echo "RELEASE_VERSION is unset"
-	exit 1
-fi
-
-rm -rf release
-mkdir release
 cd ..
+REPOSITORY=$(pwd -P)
 
-echo "Creating source package"
+if [[ -n $(git status --porcelain --untracked-files=all) ]]; then
+  echo "The source release must be created from a clean Git worktree" >&2
+  git status --short >&2
+  exit 1
+fi
+
+HEAD_COMMIT=$(git rev-parse --verify 'HEAD^{commit}')
+TAG_OBJECT_ID=$(git rev-parse --verify "${RC_TAG}^{tag}")
+TAG_OBJECT=$(git cat-file tag "${TAG_OBJECT_ID}")
+TAG_OBJECT_NAMES=$(
+  awk '
+    BEGIN { separator = "" }
+    /^$/ { exit }
+    /^tag / {
+      printf "%s%s", separator, substr($0, 5)
+      separator = ", "
+    }
+    END {
+      if (separator == "") {
+        printf "<missing>"
+      }
+    }
+  ' <<< "${TAG_OBJECT}"
+)
+if [[ "${TAG_OBJECT_NAMES}" != "${RC_TAG}" ]]; then
+  echo \
+    "signed tag object names ${TAG_OBJECT_NAMES}, not ${RC_TAG}" \
+    >&2
+  exit 1
+fi
+TAG_COMMIT=$(git rev-parse --verify "${TAG_OBJECT_ID}^{commit}")
+if [[ "${TAG_COMMIT}" != "${HEAD_COMMIT}" ]]; then
+  echo \
+    "RC_TAG ${RC_TAG} does not resolve to current HEAD ${HEAD_COMMIT}" \
+    >&2
+  exit 1
+fi
+if ! grep -q '^-----BEGIN PGP SIGNATURE-----$' <<< "${TAG_OBJECT}" ||
+  ! git -c gpg.program=gpg verify-tag "${TAG_OBJECT_ID}"
+then
+  echo \
+    "RC_TAG ${RC_TAG} is not a locally verifiable GPG-signed tag" \
+    >&2
+  exit 1
+fi
 
 ARCHIVE="apache-paimon-mosaic-${RELEASE_VERSION}-src.tgz"
-# Archive from Git objects so filesystem metadata such as macOS xattrs is not included.
-git archive --format=tar --prefix="paimon-mosaic-${RELEASE_VERSION}/" 'HEAD^{tree}' . \
-  ':(exclude).gitignore' ':(exclude).gitattributes' \
-  ':(exclude).asf.yaml' ':(exclude).github' \
-  ':(exclude)deploysettings.xml' ':(exclude)target' \
-  ':(exclude).idea' ':(exclude)*.iml' ':(exclude).DS_Store' \
-  | gzip -n > "tools/release/${ARCHIVE}"
+SIGNATURE="${ARCHIVE}.asc"
+CHECKSUM="${ARCHIVE}.sha512"
+ARCHIVE_ROOT="paimon-mosaic-${RELEASE_VERSION}"
+RELEASE_DIR="${CURR_DIR}/release"
 
-cd tools/release
+if [[ -e "${RELEASE_DIR}" || -L "${RELEASE_DIR}" ]]; then
+  echo "Release output already exists and will not be overwritten: ${RELEASE_DIR}" >&2
+  exit 1
+fi
 
-gpg --armor --detach-sig "${ARCHIVE}"
-$SHASUM "${ARCHIVE}" > "${ARCHIVE}.sha512"
+STAGING_DIR=$(mktemp -d "${CURR_DIR}/.source-release.XXXXXX")
+ARTIFACT_DIR="${STAGING_DIR}/release"
+mkdir "${ARTIFACT_DIR}"
+cleanup() {
+  status=$?
+  rm -rf "${STAGING_DIR}"
+  exit "${status}"
+}
+trap cleanup EXIT
 
-echo "Verifying GPG signature"
-gpg --verify "${ARCHIVE}.asc" "${ARCHIVE}"
+echo "Creating source package from signed tag ${RC_TAG}"
+python3 tools/verify_source_archive.py create \
+  --repository "${REPOSITORY}" \
+  --commit "${TAG_COMMIT}" \
+  --prefix "${ARCHIVE_ROOT}/" \
+  --output "${ARTIFACT_DIR}/${ARCHIVE}"
 
-echo "Verifying tarball integrity"
-tar tzf "${ARCHIVE}" > /dev/null
+mkdir "${STAGING_DIR}/extracted"
+tar xzf "${ARTIFACT_DIR}/${ARCHIVE}" -C "${STAGING_DIR}/extracted"
+# Bash 3.2 does not reliably propagate errexit through subshells, so preserve
+# the explicit status checks in both verification blocks.
+if (
+  cd "${STAGING_DIR}/extracted/${ARCHIVE_ROOT}" &&
+    python3 tools/verify_release_versions.py "${RC_TAG}"
+); then
+  :
+else
+  status=$?
+  exit "${status}"
+fi
+
+gpg \
+  --armor \
+  --detach-sign \
+  --output "${ARTIFACT_DIR}/${SIGNATURE}" \
+  "${ARTIFACT_DIR}/${ARCHIVE}"
+
+if (
+  cd "${ARTIFACT_DIR}" &&
+  if [[ $(uname) == "Darwin" ]]; then
+    shasum -a 512 "${ARCHIVE}" > "${CHECKSUM}" &&
+    shasum -a 512 -c "${CHECKSUM}"
+  else
+    sha512sum "${ARCHIVE}" > "${CHECKSUM}" &&
+    sha512sum -c "${CHECKSUM}"
+  fi &&
+    gpg --verify "${SIGNATURE}" "${ARCHIVE}"
+); then
+  :
+else
+  status=$?
+  exit "${status}"
+fi
+
+python3 tools/verify_source_archive.py verify \
+  --repository "${REPOSITORY}" \
+  --commit "${TAG_COMMIT}" \
+  --prefix "${ARCHIVE_ROOT}/" \
+  --archive "${ARTIFACT_DIR}/${ARCHIVE}"
+
+# The staging and release directories share a filesystem, so this publishes
+# the fully verified artifact set with one atomic directory rename.
+python3 -c \
+  'import os, sys; os.rename(sys.argv[1], sys.argv[2])' \
+  "${ARTIFACT_DIR}" \
+  "${RELEASE_DIR}"
+
+trap - EXIT
+rm -rf "${STAGING_DIR}"
 
 echo ""
 echo "Source release created successfully. Artifacts in tools/release/:"
-ls -la ${CURR_DIR}/release/apache-paimon-mosaic-*
+ls -la "${RELEASE_DIR}"/apache-paimon-mosaic-*
 echo ""
 echo "Next: upload contents to SVN (see docs/creating-a-release.html)."

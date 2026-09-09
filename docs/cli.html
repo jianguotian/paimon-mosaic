@@ -79,10 +79,11 @@ mosaic schema data.mosaic</code></pre>
                     <tr><td><code>column-size</code></td><td>on-disk bytes per column</td><td>footer + index + paged directories</td></tr>
                     <tr><td><code>cat</code> / <code>head</code></td><td>cat: all rows by default (<code>-n</code> to limit); head: first 10; <code>-c</code>, <code>--where</code></td><td>column data</td></tr>
                     <tr><td><code>count</code></td><td>total row count</td><td>footer + index</td></tr>
-                    <tr><td><code>convert</code></td><td>import CSV or JSON lines into a new Mosaic file</td><td>writes file</td></tr>
+                    <tr><td><code>convert</code></td><td>import JSON; legacy single-file CSV calls remain compatible</td><td>writes file</td></tr>
+                    <tr><td><code>convert-csv</code></td><td>import CSV into a new Mosaic file</td><td>writes file</td></tr>
                 </tbody>
             </table>
-            <p>Inspection and query commands accept <code>--json</code> (<code>convert</code> writes a file). <code>cat</code> scans all rows by default (<code>-n</code> to limit); <code>head</code> prints 10 rows by default. <code>cat</code>/<code>head</code>/<code>pages</code>/<code>column-size</code> take <code>-c a,b</code>; <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
+            <p>Inspection and query commands accept <code>--json</code> (<code>convert</code> and <code>convert-csv</code> write files). <code>cat</code> scans all rows by default (<code>-n</code> to limit); <code>head</code> prints 10 rows by default. <code>cat</code>/<code>head</code>/<code>pages</code>/<code>column-size</code> take <code>-c a,b</code>; <code>dictionary</code> takes <code>-c &lt;col&gt;</code>.</p>
 
             <h2>schema</h2>
             <p>Columns, Arrow types, nullability and bucket assignment, in original input order. Footer only.</p>
@@ -173,10 +174,15 @@ row group 0: 3 entries
 200</code></pre>
 
             <h2>convert</h2>
-            <p>Import a CSV (with header) or JSON lines (one object per line) into a new Mosaic file; the schema is inferred. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
-<pre><code><span class="cmt">$ mosaic convert data.csv -o data.mosaic --stats id</span>
+            <p>Import a regular JSON data file (<code>.json</code>/<code>.ndjson</code>/<code>.jsonl</code>, one object per line) into a new Mosaic file with a schema inferred from the complete input. Existing <code>mosaic convert data.csv -o data.mosaic</code> calls remain supported with the default CSV dialect; use <code>convert-csv</code> for multiple inputs or CSV options. FIFOs and devices are rejected because inference and conversion read the input separately. <code>-c</code>/<code>--column</code> projects top-level fields before inference; each occurrence accepts a comma-separated list. <code>--stats id,score</code> builds min/max stats for those columns, which <code>cat --where</code> then uses to skip non-matching row groups. Refuses to replace an existing output unless <code>--overwrite</code> is given.</p>
+<pre><code><span class="cmt">$ mosaic convert data.ndjson -o data.mosaic --stats id</span>
 wrote data.mosaic (200 rows, 5 columns)
-<span class="cmt">$ mosaic convert data.ndjson -o data.mosaic</span>
+<span class="cmt">$ mosaic convert data.json -o projected.mosaic -c id,kind</span>
+wrote projected.mosaic (200 rows, 2 columns)</code></pre>
+
+            <h2>convert-csv</h2>
+            <p>Import one or more regular CSV files with an inferred schema. Header fields are matched by name across inputs; fields missing from a shard are nullable and written as null, and compatible integer/float and timestamp precisions are promoted, while lossy bare-integer-to-<code>Float64</code> promotion and explicit timezones in inferred local timestamps are rejected. Empty files are skipped, all-empty columns fall back to nullable <code>Utf8</code>, and <code>--require col</code> marks a field as not null. Backslash escaping is disabled by default. <code>--delimiter</code>/<code>--quote</code>/<code>--escape</code>/<code>--no-header</code>/<code>--header</code>/<code>--skip-lines</code> control parsing; FIFOs and other non-regular inferred inputs are rejected, and input files must remain unchanged while conversion runs. <code>--stats</code> and <code>--overwrite</code> work as for <code>convert</code>.</p>
+<pre><code><span class="cmt">$ mosaic convert-csv data.csv -o data.mosaic --stats id</span>
 wrote data.mosaic (200 rows, 5 columns)</code></pre>
 
             <div class="tip">
