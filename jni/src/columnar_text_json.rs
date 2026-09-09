@@ -40,18 +40,6 @@ impl EncodedJsonPreflight {
     }
 
     pub(crate) fn complete(self, values: Vec<Vec<u8>>) -> io::Result<EncodedJsonPlan> {
-        self.complete_with_utf8_validation(values, false)
-    }
-
-    pub(crate) fn complete_trusted(self, values: Vec<Vec<u8>>) -> io::Result<EncodedJsonPlan> {
-        self.complete_with_utf8_validation(values, true)
-    }
-
-    fn complete_with_utf8_validation(
-        self,
-        values: Vec<Vec<u8>>,
-        validate_utf8_during_write: bool,
-    ) -> io::Result<EncodedJsonPlan> {
         if values.len() != self.java_double_bits.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -90,7 +78,6 @@ impl EncodedJsonPreflight {
         }
         Ok(EncodedJsonPlan {
             java_double_values: self.java_double_bits.into_iter().zip(values).collect(),
-            validate_utf8_during_write,
         })
     }
 }
@@ -98,7 +85,6 @@ impl EncodedJsonPreflight {
 #[derive(Default)]
 pub(crate) struct EncodedJsonPlan {
     java_double_values: Vec<(u64, Vec<u8>)>,
-    validate_utf8_during_write: bool,
 }
 
 impl EncodedJsonPlan {
@@ -111,7 +97,7 @@ impl EncodedJsonPlan {
     }
 }
 
-fn columnar_json_size_overflow() -> io::Error {
+fn text_size_overflow() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         "columnar JSON size calculation overflowed",
@@ -134,119 +120,9 @@ fn has_supported_structure(data_type: &DataType, encoding: Encoding) -> bool {
     ) && matches!(encoding, Encoding::Const | Encoding::Dict | Encoding::Plain)
 }
 
-struct StructurePreflight {
-    supported_columns: Vec<bool>,
-    fallback_required: bool,
-}
-
-fn prepare_structure(row_group: &RowGroupReader) -> io::Result<StructurePreflight> {
-    let mut preflight = StructurePreflight {
-        supported_columns: Vec::new(),
-        fallback_required: false,
-    };
-    row_group.visit_encoded_columns(|_name, data_type, _, column| {
-        if column.num_rows() != row_group.num_rows() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "column row count {} does not match row group row count {}",
-                    column.num_rows(),
-                    row_group.num_rows()
-                ),
-            ));
-        }
-
-        let supported = has_supported_structure(data_type, column.encoding());
-        preflight.supported_columns.push(supported);
-        if !supported {
-            preflight.fallback_required = true;
-        }
-        Ok(())
-    })?;
-    Ok(preflight)
-}
-
-/// Prepares an encoded row group to be emitted byte-for-byte like the Java fast path.
-///
-/// No output object is created until this preflight succeeds. In addition to type and floating
-/// point compatibility, it validates dictionary indexes and UTF-8 payloads which Arrow
-/// materialization previously checked before touching output.
+/// Checks format support and prepares JVM-compatible DOUBLE text before emitting any bytes.
+/// Other values are validated as they are written, without a second full decoding pass.
 pub(crate) fn prepare_encoded(
-    row_group: &RowGroupReader,
-) -> io::Result<Option<EncodedJsonPreflight>> {
-    let StructurePreflight {
-        supported_columns,
-        mut fallback_required,
-    } = match prepare_structure(row_group) {
-        Ok(preflight) => preflight,
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let columns = supported_columns.len();
-    if columns == 0 {
-        return Ok(None);
-    }
-
-    let mut validated_columns = 0usize;
-    let mut java_double_bits = BTreeSet::new();
-    let result = row_group.visit_encoded_columns(|_name, data_type, _, column| {
-        let column_index = validated_columns;
-        validated_columns += 1;
-        let structurally_supported = supported_columns.get(column_index).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "column count changed during columnar JSON preflight",
-            )
-        })?;
-        if !structurally_supported {
-            return Ok(());
-        }
-
-        let validation: io::Result<bool> = (|| {
-            if column.encoding() == Encoding::AllNull {
-                return Ok(true);
-            }
-            match data_type {
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    validate_integer_column(column)
-                }
-                DataType::Float64 => validate_float64_column(column, &mut java_double_bits),
-                DataType::Decimal128(_, _) => validate_decimal_column(column),
-                DataType::Utf8 => validate_utf8_column(column),
-                _ => Ok(false),
-            }
-        })();
-
-        match validation {
-            Ok(true) => {}
-            Ok(false) => fallback_required = true,
-            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                fallback_required = true;
-            }
-            Err(error) => return Err(error),
-        }
-        Ok(())
-    });
-    match result {
-        Ok(()) if validated_columns == columns && fallback_required => Ok(None),
-        Ok(()) if validated_columns == columns => Ok(Some(EncodedJsonPreflight {
-            java_double_bits: java_double_bits.into_iter().collect(),
-        })),
-        Ok(()) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "column count changed during columnar JSON preflight",
-        )),
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// Prepares the trusted-writer path after the caller has matched the complete physical schema.
-///
-/// This path verifies supported column structure and only scans DOUBLE values before output starts.
-/// Integer, decimal, and UTF-8 values are decoded once while generating JSON, so callers must
-/// discard partial output if decoding fails.
-pub(crate) fn prepare_encoded_trusted(
     row_group: &RowGroupReader,
 ) -> io::Result<Option<EncodedJsonPreflight>> {
     let mut columns = 0usize;
@@ -281,13 +157,41 @@ pub(crate) fn prepare_encoded_trusted(
         Ok(())
     });
     match result {
-        Ok(()) if columns == 0 || fallback_required => Ok(None),
+        Ok(()) if columns == 0 || fallback_required => {
+            // Preserve errors in supported columns rather than hide them behind another column's
+            // fallback decision. This extra pass is not needed on the supported streaming path.
+            validate_fallback_columns(row_group)?;
+            Ok(None)
+        }
         Ok(()) => Ok(Some(EncodedJsonPreflight {
             java_double_bits: java_double_bits.into_iter().collect(),
         })),
         Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn validate_fallback_columns(row_group: &RowGroupReader) -> io::Result<()> {
+    row_group.visit_encoded_columns(|_, data_type, _, column| {
+        if column.encoding() == Encoding::AllNull
+            || !has_supported_structure(data_type, column.encoding())
+        {
+            return Ok(());
+        }
+        match data_type {
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                validate_integer_column(column)?;
+            }
+            DataType::Decimal128(_, _) => {
+                validate_decimal_column(column)?;
+            }
+            DataType::Utf8 => {
+                validate_utf8_column(column)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn write_encoded_supported<W: Write>(
@@ -574,13 +478,17 @@ impl<W: Write> EncodedJsonWriter<'_, W> {
         self.output.write_all(b"\"")?;
         write_escaped_utf8_chunked(self.output, name.as_bytes())?;
         self.output.write_all(b"\":\"")?;
-        self.write_array(data_type, column)?;
+        self.write_column_values(data_type, column)?;
         self.output.write_all(b"\"")
     }
 
-    fn write_array(&mut self, data_type: &DataType, column: EncodedColumn<'_>) -> io::Result<()> {
+    fn write_column_values(
+        &mut self,
+        data_type: &DataType,
+        column: EncodedColumn<'_>,
+    ) -> io::Result<()> {
         match column.encoding() {
-            Encoding::AllNull => write_empty_array(self.output, column.num_rows()),
+            Encoding::AllNull => write_null_entries(self.output, column.num_rows()),
             Encoding::Const => self.write_constant(data_type, column),
             Encoding::Dict | Encoding::Plain => {
                 for (row, value) in column.values().enumerate() {
@@ -601,7 +509,7 @@ impl<W: Write> EncodedJsonWriter<'_, W> {
         column: EncodedColumn<'_>,
     ) -> io::Result<()> {
         if !has_non_null(&column) {
-            return write_empty_array(self.output, column.num_rows());
+            return write_null_entries(self.output, column.num_rows());
         }
         let value = column
             .constant()?
@@ -618,7 +526,6 @@ impl<W: Write> EncodedJsonWriter<'_, W> {
                 value,
                 column.num_rows(),
                 column.null_bitmap(),
-                self.plan.validate_utf8_during_write,
                 &mut self.value_buffer,
                 &mut self.repeated_buffer,
                 &mut self.nullable_block_cache,
@@ -652,15 +559,12 @@ fn write_utf8_constant<W: Write>(
     value: &[u8],
     row_count: usize,
     null_bitmap: Option<&[u8]>,
-    validate_utf8: bool,
     value_buffer: &mut Vec<u8>,
     repeated_buffer: &mut Vec<u8>,
     block_cache: &mut [Option<Vec<u8>>],
     cache_bytes: &mut usize,
 ) -> io::Result<()> {
-    if validate_utf8 {
-        std::str::from_utf8(value).map_err(invalid_utf8)?;
-    }
+    std::str::from_utf8(value).map_err(invalid_utf8)?;
     if let Some(null_bitmap) = null_bitmap {
         validate_null_bitmap(row_count, null_bitmap)?;
     }
@@ -753,9 +657,7 @@ fn write_encoded_value<W: Write>(
             separator,
         ),
         (DataType::Utf8, EncodedValueRef::Utf8(value)) => {
-            if plan.validate_utf8_during_write {
-                std::str::from_utf8(value).map_err(invalid_utf8)?;
-            }
+            std::str::from_utf8(value).map_err(invalid_utf8)?;
             if separator {
                 output.write_all(b",")?;
             }
@@ -931,7 +833,7 @@ fn write_nullable_rows_bounded<W: Write>(
         let is_null = null_bitmap[row / 8] & (1 << (row % 8)) != 0;
         let row_size = usize::from(row > 0)
             .checked_add(if is_null { 0 } else { value.len() })
-            .ok_or_else(columnar_json_size_overflow)?;
+            .ok_or_else(text_size_overflow)?;
         if !scratch.is_empty()
             && scratch.len().saturating_add(row_size) > REPEATED_VALUE_BUFFER_BYTES
         {
@@ -984,7 +886,7 @@ fn encoded_type_mismatch(data_type: &DataType) -> io::Error {
     )
 }
 
-fn write_empty_array<W: Write>(output: &mut W, row_count: usize) -> io::Result<()> {
+fn write_null_entries<W: Write>(output: &mut W, row_count: usize) -> io::Result<()> {
     let mut remaining = row_count.saturating_sub(1);
     while remaining > 0 {
         let written = remaining.min(COMMA_BLOCK.len());
@@ -1325,9 +1227,7 @@ fn escaped_utf8_len(value: &[u8]) -> io::Result<usize> {
             0x00..=0x1f => 6,
             _ => 1,
         };
-        length = length
-            .checked_add(bytes)
-            .ok_or_else(columnar_json_size_overflow)?;
+        length = length.checked_add(bytes).ok_or_else(text_size_overflow)?;
     }
     Ok(length)
 }
@@ -1350,7 +1250,7 @@ mod tests {
     use super::{
         append_nullable_const_block, can_format_double_in_rust, decode_signed_i128,
         escaped_utf8_len, has_supported_structure, integer_value_matches,
-        is_oversized_escaped_utf8, prepare_double_value, prepare_encoded, prepare_encoded_trusted,
+        is_oversized_escaped_utf8, prepare_double_value, prepare_encoded,
         validate_utf8_column_with, write_decimal, write_double, write_encoded_supported,
         write_encoded_value, write_escaped_utf8, write_exact_double, write_nullable_repeated_rows,
         write_repeated_value, write_utf8_constant, EncodedJsonPlan, EncodedJsonPreflight,
@@ -1576,17 +1476,19 @@ mod tests {
         let file_len = data.len() as u64;
         let reader = MosaicReader::new(MemoryInput { data }, file_len).unwrap();
         let row_group = reader.row_group_reader(0).unwrap();
-        let error = match prepare_encoded(&row_group) {
-            Ok(_) => panic!("invalid UTF-8 dictionary entry was accepted"),
-            Err(error) => error,
-        };
+        let plan = prepare_encoded(&row_group)
+            .unwrap()
+            .unwrap()
+            .complete(Vec::new())
+            .unwrap();
+        let error = write_encoded_supported(&row_group, &plan, &mut Vec::new()).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("invalid UTF-8 column value"));
     }
 
     #[test]
-    fn trusted_writer_defers_utf8_decode_until_json_write() {
+    fn writer_validates_utf8_during_streaming_write() {
         let schema = Schema::new(vec![Field::new("text", DataType::Utf8, false)]);
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
@@ -1615,10 +1517,10 @@ mod tests {
         let file_len = data.len() as u64;
         let reader = MosaicReader::new(MemoryInput { data }, file_len).unwrap();
         let row_group = reader.row_group_reader(0).unwrap();
-        let preflight = prepare_encoded_trusted(&row_group)
+        let preflight = prepare_encoded(&row_group)
             .unwrap()
             .expect("supported structure");
-        let plan = preflight.complete_trusted(Vec::new()).unwrap();
+        let plan = preflight.complete(Vec::new()).unwrap();
         let mut output = Vec::new();
         let error = write_encoded_supported(&row_group, &plan, &mut output).unwrap_err();
 
@@ -1869,7 +1771,6 @@ mod tests {
             &value,
             3,
             Some(&null_bitmap),
-            false,
             &mut value_buffer,
             &mut repeated_buffer,
             &mut block_cache,

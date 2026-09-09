@@ -48,12 +48,10 @@ public final class MosaicRowGroupReader implements AutoCloseable {
     }
 
     private long handle;
-    private final boolean columnarJsonAllowed;
     private State state = State.IDLE;
 
-    MosaicRowGroupReader(long handle, boolean columnarJsonAllowed) {
+    MosaicRowGroupReader(long handle) {
         this.handle = handle;
-        this.columnarJsonAllowed = columnarJsonAllowed;
     }
 
     /**
@@ -81,26 +79,10 @@ public final class MosaicRowGroupReader implements AutoCloseable {
         }
     }
 
-    boolean writeGeelyColumnarJson(OutputStream output) throws IOException {
-        return writeGeelyColumnarJson(output, false);
-    }
-
-    boolean writeTrustedGeelyColumnarJson(OutputStream output) throws IOException {
-        return writeGeelyColumnarJson(output, true);
-    }
-
-    private boolean writeGeelyColumnarJson(OutputStream output, boolean trusted)
-            throws IOException {
+    boolean writeColumnarTextJson(OutputStream output) throws IOException {
         long currentHandle = beginUse();
         try {
-            if (!columnarJsonAllowed) {
-                throw new IllegalStateException(
-                        "Geely columnar JSON requires an unprojected Mosaic row group");
-            }
-            return trusted
-                    ? NativeLib.nativeRowGroupReaderWriteGeelyColumnarJsonTrusted(
-                            currentHandle, output)
-                    : NativeLib.nativeRowGroupReaderWriteGeelyColumnarJson(currentHandle, output);
+            return NativeLib.nativeRowGroupReaderWriteColumnarTextJson(currentHandle, output);
         } finally {
             endUse();
         }

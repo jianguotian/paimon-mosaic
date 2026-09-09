@@ -29,9 +29,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -186,7 +184,7 @@ public class MosaicRoundtripTest {
             if (!attempted) {
                 attempted = true;
                 try {
-                    GeelyColumnarJson.write(rowGroup, new ByteArrayOutputStream());
+                    ColumnarTextJsonWriter.write(rowGroup, new ByteArrayOutputStream());
                 } catch (Throwable failure) {
                     reentrantFailure = failure;
                 }
@@ -343,6 +341,30 @@ public class MosaicRoundtripTest {
             assertSame(expected, error);
         }
         return Arrays.asList(inputReference, exceptionReference);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <E extends Throwable> void throwUnchecked(Throwable failure) throws E {
+        throw (E) failure;
+    }
+
+    private WeakReference<InputFile> openReaderWithCheckedAllocatorFailure(byte[] data)
+            throws Exception {
+        IOException expected = new IOException("schema allocation callback failed");
+        InputFile input = (position, buffer, offset, length) ->
+                System.arraycopy(data, (int) position, buffer, offset, length);
+        WeakReference<InputFile> reference = new WeakReference<>(input);
+        try (BufferAllocator failingAllocator = new RootAllocator() {
+            @Override
+            public ArrowBuf buffer(long size) {
+                MosaicRoundtripTest.<RuntimeException>throwUnchecked(expected);
+                throw new AssertionError("unreachable");
+            }
+        }) {
+            assertSame(expected, assertThrows(IOException.class,
+                    () -> MosaicReader.open(input, data.length, failingAllocator)));
+        }
+        return reference;
     }
 
     private List<WeakReference<?>> readRowGroupWithFailingInput(byte[] data) throws IOException {
@@ -1590,6 +1612,14 @@ public class MosaicRoundtripTest {
     }
 
     @Test
+    public void testReaderOpenReleasesNativeHandleOnCheckedAllocatorFailure() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("value", new ArrowType.Int(32, true))));
+        byte[] data = writeToBytes(schema, writer -> {});
+        awaitGarbageCollection(openReaderWithCheckedAllocatorFailure(data));
+    }
+
+    @Test
     public void testReaderRestoresBackgroundInputExceptionAndReleasesGlobalRef()
             throws Exception {
         Schema schema = new Schema(Arrays.asList(
@@ -1608,7 +1638,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonWritesExactPrimitiveProtocol() throws Exception {
+    public void testColumnarTextJsonWriterWritesExactPrimitiveProtocol() throws Exception {
         Schema schema = new Schema(Arrays.asList(
                 Field.nullable("i\"8", new ArrowType.Int(8, true)),
                 Field.nullable("i16", new ArrowType.Int(16, true)),
@@ -1662,13 +1692,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
-            ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
-            assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
-            assertArrayEquals(output.toByteArray(), trustedOutput.toByteArray());
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"i\\\"8\":\"-1,,9\",\"i16\":\"0,-7,12\","
                             + "\"i32\":\"-2147483648,0,2147483647\","
@@ -1682,7 +1707,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonMatchesJavaDoubleFormatting() throws Exception {
+    public void testColumnarTextJsonWriterMatchesJavaDoubleFormatting() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -1752,13 +1777,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
-            ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
-            assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
-            assertArrayEquals(output.toByteArray(), trustedOutput.toByteArray());
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             String actual =
                     new String(
                             output.toByteArray(),
@@ -1779,7 +1799,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonNestedColumnFallsBackWithoutTouchingOutput()
+    public void testColumnarTextJsonWriterNestedColumnFallsBackWithoutTouchingOutput()
             throws Exception {
         Field element =
                 new Field(
@@ -1817,8 +1837,8 @@ public class MosaicRoundtripTest {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             output.write(9);
             assertEquals(
-                    GeelyColumnarJson.Status.UNSUPPORTED,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.UNSUPPORTED,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertArrayEquals(new byte[] {9}, output.toByteArray());
 
             try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
@@ -1833,7 +1853,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonRejectsProjectedRowGroup() throws Exception {
+    public void testColumnarTextJsonWriterWritesProjectedRowGroup() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -1856,11 +1876,10 @@ public class MosaicRoundtripTest {
             reader.project(new String[] {"id"});
             try (MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
                 ByteArrayOutputStream output = new ByteArrayOutputStream();
-                output.write(9);
-                assertThrows(
-                        IllegalStateException.class,
-                        () -> GeelyColumnarJson.write(rowGroup, output));
-                assertArrayEquals(new byte[] {9}, output.toByteArray());
+                assertEquals(
+                        ColumnarTextJsonWriter.Status.WRITTEN,
+                        ColumnarTextJsonWriter.write(rowGroup, output));
+                assertEquals("{\"id\":\"7\"}", output.toString("UTF-8"));
 
                 try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
                     assertEquals(1, fallback.getFieldVectors().size());
@@ -1871,7 +1890,81 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonUnsupportedBooleanDoesNotTouchOutput() throws Exception {
+    public void testColumnarTextJsonValidatesUtf8DuringStreamingWrite() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.notNullable("padding", ArrowType.Utf8.INSTANCE),
+                Field.notNullable("text", ArrowType.Utf8.INSTANCE)));
+        byte[] padding = new byte[1024 * 1024 + 1];
+        Arrays.fill(padding, (byte) 'x');
+        byte[] marker = "invalid_utf8_marker".getBytes("UTF-8");
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            VarCharVector first = (VarCharVector) root.getVector("padding");
+            VarCharVector second = (VarCharVector) root.getVector("text");
+            first.allocateNew();
+            second.allocateNew();
+            first.setSafe(0, padding);
+            second.setSafe(0, marker);
+            root.setRowCount(1);
+            data = writeToBytes(schema, new WriterOptions().compression(0).numBuckets(1),
+                    writer -> writer.write(root));
+        }
+        int markerOffset = -1;
+        for (int i = 0; i <= data.length - marker.length; i++) {
+            if (data[i] == marker[0]
+                    && Arrays.equals(marker, Arrays.copyOfRange(data, i, i + marker.length))) {
+                markerOffset = i;
+                break;
+            }
+        }
+        assertTrue("test marker must be in the uncompressed data", markerOffset >= 0);
+        data[markerOffset] = (byte) 0xff;
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            RuntimeException failure = assertThrows(RuntimeException.class,
+                    () -> ColumnarTextJsonWriter.write(rowGroup, output));
+            assertTrue(failure.getMessage().contains("invalid UTF-8"));
+            assertTrue("the public writer must stream instead of pre-reading all text",
+                    output.size() > 0);
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterPreservesTextAggregationSemantics() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("text", ArrowType.Utf8.INSTANCE),
+                Field.notNullable("index", new ArrowType.Int(32, true))));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            VarCharVector text = (VarCharVector) root.getVector("text");
+            IntVector indexes = (IntVector) root.getVector("index");
+            text.allocateNew();
+            indexes.allocateNew(4);
+            text.setNull(0);
+            text.setSafe(1, new byte[0]);
+            text.setSafe(2, "a,b".getBytes("UTF-8"));
+            text.setSafe(3, "x\"\n".getBytes("UTF-8"));
+            for (int i = 0; i < 4; i++) {
+                indexes.set(i, i);
+            }
+            root.setRowCount(4);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+        try (MosaicReader reader = readerFromBytes(data)) {
+            reader.project(new String[] {"index", "text"});
+            try (MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                assertEquals(ColumnarTextJsonWriter.Status.WRITTEN,
+                        ColumnarTextJsonWriter.write(rowGroup, output));
+                assertEquals("{\"index\":\"0,1,2,3\",\"text\":\",,a,b,x\\\"\\n\"}",
+                        output.toString("UTF-8"));
+            }
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterUnsupportedBooleanDoesNotTouchOutput() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -1896,21 +1989,15 @@ public class MosaicRoundtripTest {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             output.write(9);
             assertEquals(
-                    GeelyColumnarJson.Status.UNSUPPORTED,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.UNSUPPORTED,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertArrayEquals(new byte[] {9}, output.toByteArray());
 
-            ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
-            trustedOutput.write(9);
-            assertEquals(
-                    GeelyColumnarJson.Status.UNSUPPORTED,
-                    GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
-            assertArrayEquals(new byte[] {9}, trustedOutput.toByteArray());
         }
     }
 
     @Test
-    public void testGeelyColumnarJsonWritesAllNullUnsupportedScalarType() throws Exception {
+    public void testColumnarTextJsonWriterWritesAllNullUnsupportedScalarType() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(Field.nullable("value", ArrowType.Bool.INSTANCE)));
@@ -1927,8 +2014,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"value\":\",,\"}",
                     new String(
@@ -1938,7 +2025,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonWritesDecimal128AsPlainString() throws Exception {
+    public void testColumnarTextJsonWriterWritesDecimal128AsPlainString() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -1961,8 +2048,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"value\":\"18446744073709551615,,-9223372036854775809\"}",
                     new String(
@@ -1972,7 +2059,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonPreservesDecimal128Scale() throws Exception {
+    public void testColumnarTextJsonWriterPreservesDecimal128Scale() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -2000,8 +2087,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"value\":\"12.340,-0.005,0.000\"}",
                     new String(
@@ -2011,7 +2098,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonPreservesNegativeDecimalScale() throws Exception {
+    public void testColumnarTextJsonWriterPreservesNegativeDecimalScale() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -2038,8 +2125,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"value\":\"0,12300\"}",
                     new String(
@@ -2049,7 +2136,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonPreserves128BitDecimalValuesAcrossScales() throws Exception {
+    public void testColumnarTextJsonWriterPreserves128BitDecimalValuesAcrossScales() throws Exception {
         assertLargeDecimalJson(
                 new ArrowType.Decimal(20, 3, 128),
                 new BigDecimal[] {
@@ -2069,7 +2156,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonMatchesArrowDecimalPlainStringOracle() throws Exception {
+    public void testColumnarTextJsonWriterMatchesArrowDecimalPlainStringOracle() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -2142,13 +2229,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
-            ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
-            assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
-            assertArrayEquals(output.toByteArray(), trustedOutput.toByteArray());
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             try (VectorSchemaRoot arrow = rowGroup.readColumns(allocator)) {
                 assertEquals(
                         renderDecimalColumnarJson(arrow),
@@ -2160,7 +2242,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonWritesReadableDecimalBeyondDeclaredPrecision()
+    public void testColumnarTextJsonWriterWritesReadableDecimalBeyondDeclaredPrecision()
             throws Exception {
         Schema schema =
                 new Schema(
@@ -2186,8 +2268,8 @@ public class MosaicRoundtripTest {
 
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"value\":\"123\"}",
                     new String(
@@ -2218,8 +2300,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     expected,
                     new String(
@@ -2229,7 +2311,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonFormatsDoublesOutsideNativeRangeWithJava() throws Exception {
+    public void testColumnarTextJsonWriterFormatsDoublesOutsideNativeRangeWithJava() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -2258,8 +2340,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"value\":\"4.9E-324,2.8421709430404007E-14,"
                             + "5.7722107746645115E18\"}",
@@ -2270,7 +2352,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonNonFiniteDoubleDoesNotTouchOutput() throws Exception {
+    public void testColumnarTextJsonWriterNonFiniteDoubleDoesNotTouchOutput() throws Exception {
         for (double value :
                 new double[] {
                     Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY
@@ -2297,16 +2379,10 @@ public class MosaicRoundtripTest {
                 ByteArrayOutputStream output = new ByteArrayOutputStream();
                 output.write(9);
                 assertEquals(
-                        GeelyColumnarJson.Status.UNSUPPORTED,
-                        GeelyColumnarJson.write(rowGroup, output));
+                        ColumnarTextJsonWriter.Status.UNSUPPORTED,
+                        ColumnarTextJsonWriter.write(rowGroup, output));
                 assertArrayEquals(new byte[] {9}, output.toByteArray());
 
-                ByteArrayOutputStream trustedOutput = new ByteArrayOutputStream();
-                trustedOutput.write(9);
-                assertEquals(
-                        GeelyColumnarJson.Status.UNSUPPORTED,
-                        GeelyColumnarJson.writeTrusted(rowGroup, trustedOutput));
-                assertArrayEquals(new byte[] {9}, trustedOutput.toByteArray());
             }
         }
     }
@@ -2333,7 +2409,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonStreamsRowGroupAboveFormerRowBudget()
+    public void testColumnarTextJsonWriterStreamsRowGroupAboveFormerRowBudget()
             throws Exception {
         Schema schema =
                 new Schema(
@@ -2358,8 +2434,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             byte[] bytes = output.toByteArray();
             assertEquals(rowCount + 11, bytes.length);
             assertEquals('{', bytes[0]);
@@ -2368,7 +2444,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonStreamsWhenWorstCaseEstimateExceedsFormerBudget()
+    public void testColumnarTextJsonWriterStreamsWhenWorstCaseEstimateExceedsFormerBudget()
             throws Exception {
         int rowCount = 1_000_000;
         List<Field> fields = new ArrayList<>();
@@ -2402,14 +2478,14 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(8_000_049, output.size());
         }
     }
 
     @Test
-    public void testGeelyColumnarJsonWritesDictionaryAndAllNullColumns() throws Exception {
+    public void testColumnarTextJsonWriterWritesDictionaryAndAllNullColumns() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -2451,8 +2527,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"all_null\":\""
                             + allNull
@@ -2466,7 +2542,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonBatchesNullableConstantsAcrossSupportedTypes()
+    public void testColumnarTextJsonWriterBatchesNullableConstantsAcrossSupportedTypes()
             throws Exception {
         Schema schema = new Schema(Arrays.asList(
                 Field.nullable("i16", new ArrowType.Int(16, true)),
@@ -2519,8 +2595,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals(
                     "{\"i16\":\""
                             + zero
@@ -2536,7 +2612,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonPreservesOutputException() throws Exception {
+    public void testColumnarTextJsonWriterPreservesOutputException() throws Exception {
         Schema schema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true))
         ));
@@ -2554,13 +2630,13 @@ public class MosaicRoundtripTest {
             FailOnceOutputStream output =
                     new FailOnceOutputStream(
                             FailurePoint.WRITE,
-                            "sentinel-geely-columnar-json");
+                            "sentinel-columnar-text-json");
             IOException error =
                     assertThrows(
                             IOException.class,
-                            () -> GeelyColumnarJson.write(rowGroup, output));
+                            () -> ColumnarTextJsonWriter.write(rowGroup, output));
             assertSame(output.failure, error);
-            assertEquals("sentinel-geely-columnar-json", error.getMessage());
+            assertEquals("sentinel-columnar-text-json", error.getMessage());
             assertEquals(1, output.writeCalls);
             assertEquals(0, output.flushCalls);
 
@@ -2571,7 +2647,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonPreservesMidStreamOutputException() throws Exception {
+    public void testColumnarTextJsonWriterPreservesMidStreamOutputException() throws Exception {
         Schema schema =
                 new Schema(
                         Arrays.asList(
@@ -2595,13 +2671,13 @@ public class MosaicRoundtripTest {
                     new FailOnceOutputStream(
                             FailurePoint.WRITE,
                             2,
-                            "sentinel-geely-columnar-json-mid-stream");
+                            "sentinel-columnar-text-json-mid-stream");
             IOException error =
                     assertThrows(
                             IOException.class,
-                            () -> GeelyColumnarJson.write(rowGroup, output));
+                            () -> ColumnarTextJsonWriter.write(rowGroup, output));
             assertSame(output.failure, error);
-            assertEquals("sentinel-geely-columnar-json-mid-stream", error.getMessage());
+            assertEquals("sentinel-columnar-text-json-mid-stream", error.getMessage());
             assertEquals(2, output.writeCalls);
             assertTrue(output.size() > 0);
             assertEquals(0, output.flushCalls);
@@ -2617,7 +2693,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testGeelyColumnarJsonNeverFlushesOrClosesCallerOutput()
+    public void testColumnarTextJsonWriterNeverFlushesOrClosesCallerOutput()
             throws Exception {
         Schema supportedSchema =
                 new Schema(
@@ -2636,8 +2712,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             OwnershipTrackingOutputStream output = new OwnershipTrackingOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertEquals("{\"value\":\"7\"}", output.toString("UTF-8"));
             assertEquals(0, output.flushCalls);
             assertEquals(0, output.closeCalls);
@@ -2661,8 +2737,8 @@ public class MosaicRoundtripTest {
             OwnershipTrackingOutputStream output = new OwnershipTrackingOutputStream();
             output.write(9);
             assertEquals(
-                    GeelyColumnarJson.Status.UNSUPPORTED,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.UNSUPPORTED,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertArrayEquals(new byte[] {9}, output.toByteArray());
             assertEquals(0, output.flushCalls);
             assertEquals(0, output.closeCalls);
@@ -2690,8 +2766,8 @@ public class MosaicRoundtripTest {
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
             ReentrantWriteOutputStream output = new ReentrantWriteOutputStream(rowGroup);
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertTrue(output.reentrantFailure instanceof IllegalStateException);
             assertEquals(
                     "row group reader is already in use",
@@ -2724,8 +2800,8 @@ public class MosaicRoundtripTest {
             CloseOnFirstWriteOutputStream output =
                     new CloseOnFirstWriteOutputStream(rowGroup);
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(rowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
             assertTrue(output.closeRequested);
             assertTrue(output.size() > 256 * 1024);
             assertThrows(
@@ -2765,8 +2841,8 @@ public class MosaicRoundtripTest {
                             () -> {
                                 try {
                                     assertEquals(
-                                            GeelyColumnarJson.Status.WRITTEN,
-                                            GeelyColumnarJson.write(rowGroup, output));
+                                            ColumnarTextJsonWriter.Status.WRITTEN,
+                                            ColumnarTextJsonWriter.write(rowGroup, output));
                                 } catch (Throwable failure) {
                                     writeFailure.set(failure);
                                 }
@@ -2851,7 +2927,7 @@ public class MosaicRoundtripTest {
         output.write(9);
         assertThrows(
                 IllegalStateException.class,
-                () -> GeelyColumnarJson.write(rowGroup, output));
+                () -> ColumnarTextJsonWriter.write(rowGroup, output));
         assertArrayEquals(new byte[] {9}, output.toByteArray());
 
         reader.close();
@@ -2888,8 +2964,8 @@ public class MosaicRoundtripTest {
         try (MosaicRowGroupReader ownedRowGroup = rowGroup) {
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             assertEquals(
-                    GeelyColumnarJson.Status.WRITTEN,
-                    GeelyColumnarJson.write(ownedRowGroup, output));
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(ownedRowGroup, output));
             assertEquals(
                     "{\"id\":\"7\",\"value\":\"11\"}",
                     new String(
@@ -3073,66 +3149,6 @@ public class MosaicRoundtripTest {
             assertFalse(readSchema.getFields().get(1).isNullable());
             assertTrue(readSchema.getFields().get(0).isNullable());
         }
-    }
-
-    @Test
-    public void testSchemaCacheHitSkipsArrowSchemaExport() throws IOException {
-        Schema arrowSchema =
-                new Schema(
-                        Arrays.asList(
-                                Field.nullable("value", new ArrowType.Int(32, true)),
-                                Field.nullable("name", ArrowType.Utf8.INSTANCE)));
-        byte[] data = writeToBytes(arrowSchema, writer -> {});
-        Map<MosaicReader.SchemaFingerprint, Schema> schemas = new HashMap<>();
-        MosaicReader.SchemaCache cache =
-                new MosaicReader.SchemaCache() {
-                    @Override
-                    public Schema get(MosaicReader.SchemaFingerprint fingerprint) {
-                        return schemas.get(fingerprint);
-                    }
-
-                    @Override
-                    public void put(MosaicReader.SchemaFingerprint fingerprint, Schema schema) {
-                        schemas.put(fingerprint, schema);
-                    }
-                };
-        InputFile firstInput =
-                (position, buffer, offset, length) ->
-                        System.arraycopy(data, (int) position, buffer, offset, length);
-
-        Schema cached;
-        try (MosaicReader reader =
-                MosaicReader.open(firstInput, data.length, allocator, cache)) {
-            cached = reader.getSchema();
-        }
-        assertEquals(1, schemas.size());
-
-        BufferAllocator closedAllocator = new RootAllocator();
-        closedAllocator.close();
-        InputFile repeatedInput =
-                (position, buffer, offset, length) ->
-                        System.arraycopy(data, (int) position, buffer, offset, length);
-        try (MosaicReader reader =
-                MosaicReader.open(repeatedInput, data.length, closedAllocator, cache)) {
-            assertSame(cached, reader.getSchema());
-        }
-    }
-
-    @Test
-    public void testSchemaFingerprintDefensivelyCopiesBytes() {
-        byte[] bytes = new byte[32];
-        bytes[0] = 7;
-        MosaicReader.SchemaFingerprint fingerprint =
-                MosaicReader.SchemaFingerprint.fromBytes(bytes);
-
-        bytes[0] = 9;
-        byte[] exposed = fingerprint.bytes();
-        exposed[0] = 11;
-
-        assertEquals(7, fingerprint.bytes()[0]);
-        assertEquals(
-                fingerprint,
-                MosaicReader.SchemaFingerprint.fromBytes(fingerprint.bytes()));
     }
 
     @Test

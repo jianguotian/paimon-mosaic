@@ -20,7 +20,6 @@
 package org.apache.paimon.mosaic;
 
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -36,25 +35,9 @@ public class MosaicReader implements AutoCloseable {
 
     private long handle;
     private final Schema schema;
-    private boolean projected;
 
-    private MosaicReader(long handle, BufferAllocator allocator, SchemaCache schemaCache) {
+    private MosaicReader(long handle, BufferAllocator allocator) {
         this.handle = handle;
-        if (schemaCache != null) {
-            byte[] bytes = NativeLib.nativeReaderSchemaFingerprint(handle);
-            if (bytes == null) {
-                throw new RuntimeException("failed to read schema fingerprint");
-            }
-            SchemaFingerprint fingerprint = new SchemaFingerprint(bytes);
-            Schema cached = schemaCache.get(fingerprint);
-            if (cached != null) {
-                this.schema = cached;
-                return;
-            }
-            this.schema = exportSchema(handle, allocator);
-            schemaCache.put(fingerprint, this.schema);
-            return;
-        }
         this.schema = exportSchema(handle, allocator);
     }
 
@@ -80,90 +63,15 @@ public class MosaicReader implements AutoCloseable {
         if (handle == 0) {
             throw new RuntimeException("failed to open reader");
         }
+        boolean opened = false;
         try {
-            return new MosaicReader(handle, allocator, null);
-        } catch (RuntimeException | Error e) {
-            NativeLib.nativeReaderFree(handle);
-            throw e;
-        }
-    }
-
-    /**
-     * Opens a Mosaic reader and resolves its Arrow schema through the supplied cache.
-     *
-     * <p>The native reader returns a compact SHA-256 fingerprint first. On a cache hit, Arrow C
-     * Data schema export and Java field construction are skipped.
-     */
-    public static MosaicReader open(
-            InputFile inputFile,
-            long fileLength,
-            BufferAllocator allocator,
-            SchemaCache schemaCache)
-            throws IOException {
-        if (schemaCache == null) {
-            throw new NullPointerException("schemaCache");
-        }
-        long handle = NativeLib.nativeReaderOpen(inputFile, fileLength);
-        if (handle == 0) {
-            throw new RuntimeException("failed to open reader");
-        }
-        try {
-            return new MosaicReader(handle, allocator, schemaCache);
-        } catch (RuntimeException | Error e) {
-            NativeLib.nativeReaderFree(handle);
-            throw e;
-        }
-    }
-
-    /** Caller-owned cache used by the schema-first reader-open path. */
-    public interface SchemaCache {
-        Schema get(SchemaFingerprint fingerprint);
-
-        void put(SchemaFingerprint fingerprint, Schema schema);
-    }
-
-    /** Immutable SHA-256 identity of one serialized Mosaic schema block. */
-    public static final class SchemaFingerprint {
-        private static final int LENGTH = 32;
-
-        private final byte[] bytes;
-        private final int hashCode;
-
-        private SchemaFingerprint(byte[] bytes) {
-            if (bytes.length != LENGTH) {
-                throw new IllegalArgumentException(
-                        "schema fingerprint must be " + LENGTH + " bytes");
+            MosaicReader reader = new MosaicReader(handle, allocator);
+            opened = true;
+            return reader;
+        } finally {
+            if (!opened) {
+                NativeLib.nativeReaderFree(handle);
             }
-            this.bytes = bytes.clone();
-            this.hashCode = Arrays.hashCode(this.bytes);
-        }
-
-        public static SchemaFingerprint fromBytes(byte[] bytes) {
-            if (bytes == null) {
-                throw new NullPointerException("bytes");
-            }
-            return new SchemaFingerprint(bytes);
-        }
-
-        public byte[] bytes() {
-            return bytes.clone();
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            if (this == other) {
-                return true;
-            }
-            if (!(other instanceof SchemaFingerprint)) {
-                return false;
-            }
-            SchemaFingerprint that = (SchemaFingerprint) other;
-            return Arrays.equals(bytes, that.bytes);
-        }
-
-        @Override
-        public int hashCode() {
-            return hashCode;
         }
     }
 
@@ -177,7 +85,6 @@ public class MosaicReader implements AutoCloseable {
 
     public void project(String[] columns) {
         NativeLib.nativeReaderSetProjection(handle, columns);
-        projected = true;
     }
 
     /**
@@ -197,7 +104,7 @@ public class MosaicReader implements AutoCloseable {
             throw new RuntimeException("failed to open row group " + rgIndex);
         }
         try {
-            return new MosaicRowGroupReader(rgHandle, !projected);
+            return new MosaicRowGroupReader(rgHandle);
         } catch (RuntimeException | Error e) {
             NativeLib.nativeRowGroupReaderFree(rgHandle);
             throw e;

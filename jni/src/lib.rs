@@ -26,7 +26,7 @@ use jni::errors::Error as JniError;
 use jni::objects::{
     GlobalRef, JByteArray, JClass, JMethodID, JObject, JObjectArray, JString, JThrowable, JValue,
 };
-use jni::sys::{jboolean, jbyteArray, jint, jlong, jlongArray};
+use jni::sys::{jboolean, jint, jlong, jlongArray};
 use jni::JNIEnv;
 use jni::JavaVM;
 
@@ -38,7 +38,7 @@ use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess, RowGroupReader}
 use mosaic_core::spec::*;
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
 
-mod columnar_json;
+mod columnar_text_json;
 
 fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<String>() {
@@ -901,22 +901,6 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderFree(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderSchemaFingerprint(
-    env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-) -> jbyteArray {
-    if handle == 0 {
-        return ptr::null_mut();
-    }
-    let rh = unsafe { &*(handle as *const ReaderHandle) };
-    match env.byte_array_from_slice(rh.reader.schema_fingerprint()) {
-        Ok(fingerprint) => fingerprint.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderExportSchema(
     _env: JNIEnv,
     _class: JClass,
@@ -1275,7 +1259,7 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
     }
 }
 
-// ======================== Geely Columnar JSON ========================
+// ======================== Columnar Text JSON ========================
 
 fn format_columnar_json_doubles(
     env: &mut JNIEnv<'_>,
@@ -1295,7 +1279,7 @@ fn format_columnar_json_doubles(
     let result = env
         .call_static_method(
             class,
-            "formatColumnarJsonDoubles",
+            "formatColumnarTextJsonDoubles",
             "([J)[Ljava/lang/String;",
             &[JValue::Object(bits_array.as_ref())],
         )
@@ -1329,7 +1313,7 @@ fn format_columnar_json_doubles(
             ));
         }
         let string = JString::from(object);
-        // SAFETY: formatColumnarJsonDoubles has the JNI return type String[], and the element was
+        // SAFETY: formatColumnarTextJsonDoubles has the JNI return type String[], and the element was
         // checked for null above. Avoid get_string's per-element class local references.
         let value: String = unsafe { env.get_string_unchecked(&string) }
             .map_err(|error| format!("failed to copy Java DOUBLE string: {}", error))?
@@ -1342,31 +1326,11 @@ fn format_columnar_json_doubles(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteGeelyColumnarJson(
-    env: JNIEnv,
-    class: JClass,
-    handle: jlong,
-    output: JObject,
-) -> jboolean {
-    write_geely_columnar_json(env, class, handle, output, false)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteGeelyColumnarJsonTrusted(
-    env: JNIEnv,
-    class: JClass,
-    handle: jlong,
-    output: JObject,
-) -> jboolean {
-    write_geely_columnar_json(env, class, handle, output, true)
-}
-
-fn write_geely_columnar_json(
+pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderWriteColumnarTextJson(
     mut env: JNIEnv,
     class: JClass,
     handle: jlong,
     output: JObject,
-    trusted: bool,
 ) -> jboolean {
     const JSON_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -1378,11 +1342,7 @@ fn write_geely_columnar_json(
         }
 
         let row_group = unsafe { &*(handle as *const RowGroupReaderHandle) };
-        let preflight_result = if trusted {
-            columnar_json::prepare_encoded_trusted(&row_group.inner)
-        } else {
-            columnar_json::prepare_encoded(&row_group.inner)
-        };
+        let preflight_result = columnar_text_json::prepare_encoded(&row_group.inner);
         let preflight = match preflight_result {
             Ok(None) => return 0,
             Ok(Some(preflight)) => preflight,
@@ -1390,7 +1350,7 @@ fn write_geely_columnar_json(
                 throw_io_error(
                     &mut env,
                     &error,
-                    &format!("Geely columnar JSON compatibility check failed: {}", error),
+                    &format!("columnar text JSON compatibility check failed: {}", error),
                 );
                 return 0;
             }
@@ -1401,22 +1361,18 @@ fn write_geely_columnar_json(
                 Err(error) => {
                     throw(
                         &mut env,
-                        &format!("Geely columnar JSON DOUBLE formatting failed: {}", error),
+                        &format!("columnar text JSON DOUBLE formatting failed: {}", error),
                     );
                     return 0;
                 }
             };
-        let plan_result = if trusted {
-            preflight.complete_trusted(double_values)
-        } else {
-            preflight.complete(double_values)
-        };
+        let plan_result = preflight.complete(double_values);
         let plan = match plan_result {
             Ok(plan) => plan,
             Err(error) => {
                 throw(
                     &mut env,
-                    &format!("Geely columnar JSON DOUBLE validation failed: {}", error),
+                    &format!("columnar text JSON DOUBLE validation failed: {}", error),
                 );
                 return 0;
             }
@@ -1431,7 +1387,7 @@ fn write_geely_columnar_json(
         };
         let mut buffered = BufWriter::with_capacity(JSON_BUFFER_BYTES, output);
         if let Err(error) =
-            columnar_json::write_encoded_supported(&row_group.inner, &plan, &mut buffered)
+            columnar_text_json::write_encoded_supported(&row_group.inner, &plan, &mut buffered)
         {
             let (mut output, _) = buffered.into_parts();
             let pending = output.take_pending_exception();
@@ -1439,7 +1395,7 @@ fn write_geely_columnar_json(
                 Some(exception) => rethrow(&mut env, &exception),
                 None => throw(
                     &mut env,
-                    &format!("Geely columnar JSON write failed: {}", error),
+                    &format!("columnar text JSON write failed: {}", error),
                 ),
             }
             return 0;
@@ -1455,7 +1411,7 @@ fn write_geely_columnar_json(
                     Some(exception) => rethrow(&mut env, &exception),
                     None => throw(
                         &mut env,
-                        &format!("Geely columnar JSON output failed: {}", message),
+                        &format!("columnar text JSON output failed: {}", message),
                     ),
                 }
                 0
