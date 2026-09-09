@@ -830,6 +830,18 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeWriterWrite
 
 struct RowGroupReaderHandle {
     inner: RowGroupReader,
+    #[cfg(test)]
+    _drop_probe: Option<RowGroupReaderDropProbe>,
+}
+
+#[cfg(test)]
+struct RowGroupReaderDropProbe(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(test)]
+impl Drop for RowGroupReaderDropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[no_mangle]
@@ -966,7 +978,11 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeReaderOpenR
         let rh = unsafe { &*(handle as *const ReaderHandle) };
         match rh.reader.row_group_reader(rg_index as usize) {
             Ok(rg) => {
-                let rg_handle = Box::new(RowGroupReaderHandle { inner: rg });
+                let rg_handle = Box::new(RowGroupReaderHandle {
+                    inner: rg,
+                    #[cfg(test)]
+                    _drop_probe: None,
+                });
                 Box::into_raw(rg_handle) as jlong
             }
             Err(e) => {
@@ -1052,8 +1068,8 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
 
 #[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderFree(
-    _env: JNIEnv,
-    _class: JClass,
+    _env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
     handle: jlong,
 ) {
     if handle != 0 {
@@ -1425,5 +1441,61 @@ pub extern "system" fn Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupRea
             throw(&mut env, &panic_message(&error));
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    struct MemoryInput {
+        data: &'static [u8],
+    }
+
+    impl InputFile for MemoryInput {
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+            let start = offset as usize;
+            let end = start
+                .checked_add(buffer.len())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "read overflow"))?;
+            let source = self
+                .data
+                .get(start..end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "read past end"))?;
+            buffer.copy_from_slice(source);
+            Ok(())
+        }
+    }
+
+    fn test_row_group_reader() -> RowGroupReader {
+        let data = include_bytes!("../../core/tests/testdata/v1_no_array.mosaic");
+        let length = data.len() as u64;
+        let reader = MosaicReader::new(MemoryInput { data }, length).unwrap();
+        reader.row_group_reader(0).unwrap()
+    }
+
+    #[test]
+    fn native_row_group_reader_free_drops_handle() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handle = Box::into_raw(Box::new(RowGroupReaderHandle {
+            inner: test_row_group_reader(),
+            _drop_probe: Some(RowGroupReaderDropProbe(Arc::clone(&dropped))),
+        })) as jlong;
+
+        Java_org_apache_paimon_mosaic_NativeLib_nativeRowGroupReaderFree(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            handle,
+        );
+
+        let was_dropped = dropped.load(Ordering::SeqCst);
+        if !was_dropped {
+            // Reclaim the handle before failing if the function under test did not free it.
+            unsafe { drop(Box::from_raw(handle as *mut RowGroupReaderHandle)) };
+        }
+        assert!(was_dropped, "JNI free did not drop the row-group handle");
     }
 }

@@ -75,6 +75,8 @@ public class MosaicRoundtripTest {
 
     private static final long TINY_DOUBLE_ROUNDING_REGRESSION_BITS = 0x3d20000000000000L;
     private static final long LARGE_DOUBLE_ROUNDING_REGRESSION_BITS = 0x43d406c0c77e23e0L;
+    // Produces enough JSON to force more than one native-to-Java output callback.
+    private static final int ROW_COUNT_FOR_MULTIPLE_OUTPUT_WRITES = 500_000;
 
     private BufferAllocator allocator;
 
@@ -197,6 +199,9 @@ public class MosaicRoundtripTest {
 
         private final MosaicRowGroupReader rowGroup;
         private boolean closeRequested;
+        private int writeCalls;
+        private int firstWriteBytes;
+        private long nativeHandleAfterClose;
 
         private CloseOnFirstWriteOutputStream(MosaicRowGroupReader rowGroup) {
             this.rowGroup = rowGroup;
@@ -204,9 +209,12 @@ public class MosaicRoundtripTest {
 
         @Override
         public synchronized void write(byte[] bytes, int offset, int length) {
+            writeCalls++;
             if (!closeRequested) {
                 closeRequested = true;
+                firstWriteBytes = length;
                 rowGroup.close();
+                nativeHandleAfterClose = nativeHandle(rowGroup);
             }
             super.write(bytes, offset, length);
         }
@@ -217,11 +225,15 @@ public class MosaicRoundtripTest {
         private final CountDownLatch enteredWrite = new CountDownLatch(1);
         private final CountDownLatch releaseWrite = new CountDownLatch(1);
         private boolean blocked;
+        private int writeCalls;
+        private int firstWriteBytes;
 
         @Override
         public synchronized void write(byte[] bytes, int offset, int length) {
+            writeCalls++;
             if (!blocked) {
                 blocked = true;
+                firstWriteBytes = length;
                 enteredWrite.countDown();
                 try {
                     releaseWrite.await();
@@ -279,6 +291,17 @@ public class MosaicRoundtripTest {
             System.arraycopy(data, (int) position, buffer, offset, length);
         };
         return MosaicReader.open(inputFile, data.length, allocator);
+    }
+
+    private static long nativeHandle(MosaicRowGroupReader rowGroup) {
+        try {
+            java.lang.reflect.Field field =
+                    MosaicRowGroupReader.class.getDeclaredField("handle");
+            field.setAccessible(true);
+            return field.getLong(rowGroup);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("cannot inspect row-group native handle", e);
+        }
     }
 
     private static Schema wideIntSchema(int width) {
@@ -2653,7 +2676,7 @@ public class MosaicRoundtripTest {
                         Arrays.asList(
                                 Field.notNullable(
                                         "value", new ArrowType.Int(32, true))));
-        int rowCount = 500_000;
+        int rowCount = ROW_COUNT_FOR_MULTIPLE_OUTPUT_WRITES;
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             IntVector values = (IntVector) root.getVector("value");
@@ -2783,7 +2806,7 @@ public class MosaicRoundtripTest {
                         Arrays.asList(
                                 Field.notNullable(
                                         "value", new ArrowType.Int(32, true))));
-        int rowCount = 100_000;
+        int rowCount = ROW_COUNT_FOR_MULTIPLE_OUTPUT_WRITES;
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             IntVector values = (IntVector) root.getVector("value");
@@ -2797,13 +2820,18 @@ public class MosaicRoundtripTest {
 
         try (MosaicReader reader = readerFromBytes(data);
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            long nativeHandle = nativeHandle(rowGroup);
+            assertTrue(nativeHandle != 0);
             CloseOnFirstWriteOutputStream output =
                     new CloseOnFirstWriteOutputStream(rowGroup);
             assertEquals(
                     ColumnarTextJsonWriter.Status.WRITTEN,
                     ColumnarTextJsonWriter.write(rowGroup, output));
             assertTrue(output.closeRequested);
-            assertTrue(output.size() > 256 * 1024);
+            assertEquals(nativeHandle, output.nativeHandleAfterClose);
+            assertTrue(output.writeCalls > 1);
+            assertTrue(output.size() > output.firstWriteBytes);
+            assertEquals(0, nativeHandle(rowGroup));
             assertThrows(
                     IllegalStateException.class,
                     () -> rowGroup.readColumns(allocator));
@@ -2818,7 +2846,7 @@ public class MosaicRoundtripTest {
                         Arrays.asList(
                                 Field.notNullable(
                                         "value", new ArrowType.Int(32, true))));
-        int rowCount = 100_000;
+        int rowCount = 500_000;
         byte[] data;
         try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             IntVector values = (IntVector) root.getVector("value");
@@ -2832,6 +2860,8 @@ public class MosaicRoundtripTest {
 
         try (MosaicReader reader = readerFromBytes(data);
                 MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            long nativeHandle = nativeHandle(rowGroup);
+            assertTrue(nativeHandle != 0);
             BlockingWriteOutputStream output = new BlockingWriteOutputStream();
             AtomicReference<Throwable> writeFailure = new AtomicReference<>();
             AtomicReference<Throwable> closeFailure = new AtomicReference<>();
@@ -2873,6 +2903,7 @@ public class MosaicRoundtripTest {
                         closeReturned.await(
                                 5, java.util.concurrent.TimeUnit.SECONDS));
                 assertNull(closeFailure.get());
+                assertEquals(nativeHandle, nativeHandle(rowGroup));
                 assertThrows(
                         IllegalStateException.class,
                         () -> rowGroup.readColumns(allocator));
@@ -2893,7 +2924,9 @@ public class MosaicRoundtripTest {
             assertFalse(writer.isAlive());
             assertFalse(closer.isAlive());
             assertNull(writeFailure.get());
-            assertTrue(output.size() > 256 * 1024);
+            assertTrue(output.writeCalls > 1);
+            assertTrue(output.size() > output.firstWriteBytes);
+            assertEquals(0, nativeHandle(rowGroup));
             assertThrows(
                     IllegalStateException.class,
                     () -> rowGroup.readColumns(allocator));
