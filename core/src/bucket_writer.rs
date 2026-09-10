@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::sync::Arc;
 
@@ -61,6 +63,71 @@ enum DictTracking {
     Disabled,
 }
 
+#[derive(Clone)]
+struct U64DictBuildHasher {
+    seed: u64,
+}
+
+impl Default for U64DictBuildHasher {
+    fn default() -> Self {
+        let random_state = RandomState::new();
+        let mut seed_hasher = random_state.build_hasher();
+        seed_hasher.write(b"paimon-mosaic-u64-dict");
+        Self {
+            seed: seed_hasher.finish(),
+        }
+    }
+}
+
+impl BuildHasher for U64DictBuildHasher {
+    type Hasher = U64DictHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        U64DictHasher {
+            seed: self.seed,
+            hash: 0,
+        }
+    }
+}
+
+struct U64DictHasher {
+    seed: u64,
+    hash: u64,
+}
+
+impl Hasher for U64DictHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let value = u64::from_ne_bytes(
+            bytes
+                .try_into()
+                .expect("U64DictHasher only supports a single u64 key"),
+        );
+        self.write_u64(value);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.hash = mix_u64_key(value ^ self.seed);
+    }
+}
+
+#[inline]
+fn mix_u64_key(mut value: u64) -> u64 {
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xff51afd7ed558ccd);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xc4ceb9fe1a85ec53);
+    value ^ (value >> 33)
+}
+
+// Fixed-width dictionary values are normalized to a single u64 key, and cardinality
+// is bounded by max_dict_entries. MurmurHash3's fmix64 avoids SipHash overhead while
+// a per-map random seed prevents chosen inputs from forcing clustered probes.
+type U64Dict = HashMap<u64, usize, U64DictBuildHasher>;
+
 pub struct BucketWriter {
     num_primary: usize,
     total_columns: usize,
@@ -73,7 +140,7 @@ pub struct BucketWriter {
     const_tracking: Vec<bool>,
     first_value_len: Vec<usize>,
 
-    long_dict_maps: Vec<Option<HashMap<u64, usize>>>,
+    long_dict_maps: Vec<Option<U64Dict>>,
     byte_dict_maps: Vec<Option<HashMap<Vec<u8>, usize>>>,
     dict_tracking: Vec<DictTracking>,
     dict_total_bytes: Vec<usize>,
@@ -554,7 +621,7 @@ impl BucketWriter {
         self.dict_total_bytes[col] = 0;
         if uses_long_dict(self.fixed_widths[col]) {
             self.long_dict_maps[col]
-                .get_or_insert_with(HashMap::new)
+                .get_or_insert_with(U64Dict::default)
                 .clear();
         } else {
             self.byte_dict_maps[col]
