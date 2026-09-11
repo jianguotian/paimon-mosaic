@@ -641,15 +641,15 @@ impl BucketWriter {
                 let written = self.value_buffers[col].len() - before;
                 col_size += written;
 
-                self.track_encoding_value(
-                    col,
-                    before,
-                    written,
-                    use_direct_fixed_keys.then(|| {
+                let fixed_key = if use_direct_fixed_keys && !self.const_tracking[col] {
+                    Some(
                         fixed_key_for_typed_value(&typed, row)
-                            .expect("fixed-width primitive must provide a dictionary key")
-                    }),
-                );
+                            .expect("fixed-width primitive must provide a dictionary key"),
+                    )
+                } else {
+                    None
+                };
+                self.track_encoding_value(col, before, written, fixed_key);
             }
         }
         self.finish_fixed_dict_batch(col, fixed_dict_was_active, previous_non_null_count);
@@ -924,7 +924,8 @@ impl BucketWriter {
             self.non_null_counts[col] += 1;
 
             if track_encoding {
-                self.track_encoding_value(col, before, 8, Some(values[row] as u64));
+                let fixed_key = (!self.const_tracking[col]).then_some(values[row] as u64);
+                self.track_encoding_value(col, before, 8, fixed_key);
                 track_encoding = self.needs_encoding_tracking(col);
             }
         }
