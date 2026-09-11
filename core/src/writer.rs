@@ -26,17 +26,6 @@ use crate::spec::*;
 use crate::stats::{self, ColumnStats, StatsCollector};
 use crate::varint;
 
-// Bound the number of top-level cell visits in one flush independently of byte
-// size, preventing very wide schemas from concentrating CPU in a single burst.
-const MAX_TOP_LEVEL_VALUES_PER_ROW_GROUP: usize = 4_000_000;
-
-fn max_rows_per_row_group(num_columns: usize) -> usize {
-    MAX_TOP_LEVEL_VALUES_PER_ROW_GROUP
-        .checked_div(num_columns)
-        .unwrap_or(u32::MAX as usize)
-        .max(1)
-}
-
 fn to_u32(val: usize, field: &str) -> io::Result<u32> {
     u32::try_from(val).map_err(|_| {
         io::Error::new(
@@ -44,15 +33,6 @@ fn to_u32(val: usize, field: &str) -> io::Result<u32> {
             format!("{} ({}) exceeds u32::MAX", field, val),
         )
     })
-}
-
-fn should_flush_row_group(
-    buffered_size: u64,
-    max_size: u64,
-    num_rows: usize,
-    num_columns: usize,
-) -> bool {
-    buffered_size >= max_size || num_rows >= max_rows_per_row_group(num_columns)
 }
 
 pub trait OutputFile {
@@ -105,6 +85,7 @@ enum EncodedBucket {
 pub struct MosaicWriter<S: OutputFile> {
     out: S,
     schema: MosaicSchema,
+    serialized_schema: Vec<u8>,
     bucket_writers: Vec<Option<BucketWriter>>,
     active_buckets: Vec<usize>,
     num_buckets: usize,
@@ -155,6 +136,10 @@ impl<S: OutputFile> MosaicWriter<S> {
         options: WriterOptions,
         batch_col_map: Vec<usize>,
     ) -> io::Result<Self> {
+        // Build the stable on-disk schema representation before any row-group data is
+        // buffered. This preserves the established file bytes while keeping schema BPE
+        // work out of the row-group flush/close burst.
+        let serialized_schema = schema.serialize();
         let num_buckets = schema.num_buckets;
         let mut bucket_writers = Vec::with_capacity(num_buckets);
 
@@ -222,6 +207,7 @@ impl<S: OutputFile> MosaicWriter<S> {
         Ok(MosaicWriter {
             out,
             schema,
+            serialized_schema,
             bucket_writers,
             active_buckets,
             num_buckets,
@@ -299,24 +285,10 @@ impl<S: OutputFile> MosaicWriter<S> {
             }
         }
 
-        let max_rows = max_rows_per_row_group(num_cols);
-        if self.current_row_group_rows > 0
-            && batch.num_rows() > max_rows - self.current_row_group_rows
-        {
-            self.flush_row_group()?;
-        }
-
-        let mut offset = 0;
-        while offset < batch.num_rows() {
-            let rows = max_rows.min(batch.num_rows() - offset);
-            let slice = batch.slice(offset, rows);
-            self.write_batch_slice(&slice, num_cols)?;
-            offset += rows;
-        }
-        Ok(())
+        self.write_batch_slice(batch)
     }
 
-    fn write_batch_slice(&mut self, batch: &RecordBatch, num_cols: usize) -> io::Result<()> {
+    fn write_batch_slice(&mut self, batch: &RecordBatch) -> io::Result<()> {
         let mut size = 0u64;
         for &b in &self.active_buckets {
             let global_indices = &self.schema.bucket_to_global[b];
@@ -349,12 +321,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             .checked_add(size)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "buffered size overflow"))?;
 
-        if should_flush_row_group(
-            self.current_buffered_size,
-            self.row_group_max_size,
-            self.current_row_group_rows,
-            num_cols,
-        ) {
+        if self.current_buffered_size >= self.row_group_max_size {
             self.flush_row_group()?;
         }
         Ok(())
@@ -568,14 +535,8 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         self.flush_row_group()?;
 
-        // Write schema block
-        // The schema block is compressed below, so running BPE first only duplicates
-        // compression work and can make the final Zstd payload larger.
-        let schema_raw = if self.compression == COMPRESSION_ZSTD {
-            self.schema.serialize_front_coded()
-        } else {
-            self.schema.serialize()
-        };
+        // Write the exact adaptive schema representation prepared at construction.
+        let schema_raw = &self.serialized_schema;
         let schema_block_offset = self.out.pos();
 
         let uncomp_size = to_u32(schema_raw.len(), "schema uncompressed size")?;
@@ -583,11 +544,11 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         match self.compression {
             COMPRESSION_NONE => {
-                self.out.write(&schema_raw)?;
+                self.out.write(schema_raw)?;
             }
             COMPRESSION_ZSTD => {
                 let compressed =
-                    zstd::bulk::compress(&schema_raw, self.zstd_level).map_err(io::Error::other)?;
+                    zstd::bulk::compress(schema_raw, self.zstd_level).map_err(io::Error::other)?;
                 self.out.write(&compressed)?;
             }
             _ => {
@@ -839,80 +800,6 @@ mod tests {
         writer.close().unwrap();
         let actual = writer.out.buf.len() as u64;
         assert!(actual > 0);
-    }
-
-    #[test]
-    fn test_row_group_flush_is_bounded_by_top_level_values() {
-        assert_eq!(max_rows_per_row_group(0), u32::MAX as usize);
-        assert_eq!(
-            max_rows_per_row_group(MAX_TOP_LEVEL_VALUES_PER_ROW_GROUP + 1),
-            1
-        );
-        let wide_schema_max_rows = max_rows_per_row_group(6_543);
-        assert!(!should_flush_row_group(
-            1024,
-            DEFAULT_ROW_GROUP_MAX_SIZE,
-            wide_schema_max_rows - 1,
-            6_543
-        ));
-        assert!(should_flush_row_group(
-            1024,
-            DEFAULT_ROW_GROUP_MAX_SIZE,
-            wide_schema_max_rows,
-            6_543
-        ));
-        assert!(should_flush_row_group(
-            DEFAULT_ROW_GROUP_MAX_SIZE,
-            DEFAULT_ROW_GROUP_MAX_SIZE,
-            1,
-            1
-        ));
-    }
-
-    #[test]
-    fn test_single_large_batch_is_split_at_top_level_value_limit() {
-        let num_columns = 5_000;
-        let num_rows = 1_000;
-        let arrow_schema = Arc::new(Schema::new(
-            (0..num_columns)
-                .map(|index| Field::new(format!("c{index}"), DataType::Int8, false))
-                .collect::<Vec<_>>(),
-        ));
-        let values = Arc::new(Int8Array::from(
-            (0..num_rows)
-                .map(|row| (row % 31) as i8)
-                .collect::<Vec<_>>(),
-        ));
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            (0..num_columns)
-                .map(|_| values.clone() as ArrayRef)
-                .collect(),
-        )
-        .unwrap();
-        let options = || WriterOptions {
-            compression: COMPRESSION_NONE,
-            num_buckets: 100,
-            ..Default::default()
-        };
-        let row_group_sizes = |writer: &MosaicWriter<MemOutputFile>| {
-            writer
-                .row_group_metas
-                .iter()
-                .map(|meta| meta.num_rows)
-                .collect::<Vec<_>>()
-        };
-
-        let mut writer = MosaicWriter::new(MemOutputFile::new(), &arrow_schema, options()).unwrap();
-        writer.write_batch(&batch).unwrap();
-        writer.close().unwrap();
-        assert_eq!(row_group_sizes(&writer), vec![800, 200]);
-
-        let mut writer = MosaicWriter::new(MemOutputFile::new(), &arrow_schema, options()).unwrap();
-        writer.write_batch(&batch.slice(0, 500)).unwrap();
-        writer.write_batch(&batch.slice(500, 500)).unwrap();
-        writer.close().unwrap();
-        assert_eq!(row_group_sizes(&writer), vec![500, 500]);
     }
 
     #[test]
