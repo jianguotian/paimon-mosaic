@@ -26,6 +26,17 @@ use crate::spec::*;
 use crate::stats::{self, ColumnStats, StatsCollector};
 use crate::varint;
 
+// Bound the number of top-level cell visits in one flush independently of byte
+// size, preventing very wide schemas from concentrating CPU in a single burst.
+const MAX_TOP_LEVEL_VALUES_PER_ROW_GROUP: usize = 4_000_000;
+
+fn max_rows_per_row_group(num_columns: usize) -> usize {
+    MAX_TOP_LEVEL_VALUES_PER_ROW_GROUP
+        .checked_div(num_columns)
+        .unwrap_or(u32::MAX as usize)
+        .max(1)
+}
+
 fn to_u32(val: usize, field: &str) -> io::Result<u32> {
     u32::try_from(val).map_err(|_| {
         io::Error::new(
@@ -33,6 +44,15 @@ fn to_u32(val: usize, field: &str) -> io::Result<u32> {
             format!("{} ({}) exceeds u32::MAX", field, val),
         )
     })
+}
+
+fn should_flush_row_group(
+    buffered_size: u64,
+    max_size: u64,
+    num_rows: usize,
+    num_columns: usize,
+) -> bool {
+    buffered_size >= max_size || num_rows >= max_rows_per_row_group(num_columns)
 }
 
 pub trait OutputFile {
@@ -72,6 +92,14 @@ struct RowGroupMeta {
     bucket_offsets: Vec<u64>,
     bucket_layouts: Vec<BucketLayout>,
     stats: Vec<ColumnStats>,
+}
+
+enum EncodedBucket {
+    Paged {
+        output: PagedBucketOutput,
+        raw_size: usize,
+    },
+    Monolithic(Vec<u8>),
 }
 
 pub struct MosaicWriter<S: OutputFile> {
@@ -271,6 +299,24 @@ impl<S: OutputFile> MosaicWriter<S> {
             }
         }
 
+        let max_rows = max_rows_per_row_group(num_cols);
+        if self.current_row_group_rows > 0
+            && batch.num_rows() > max_rows - self.current_row_group_rows
+        {
+            self.flush_row_group()?;
+        }
+
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            let rows = max_rows.min(batch.num_rows() - offset);
+            let slice = batch.slice(offset, rows);
+            self.write_batch_slice(&slice, num_cols)?;
+            offset += rows;
+        }
+        Ok(())
+    }
+
+    fn write_batch_slice(&mut self, batch: &RecordBatch, num_cols: usize) -> io::Result<()> {
         let mut size = 0u64;
         for &b in &self.active_buckets {
             let global_indices = &self.schema.bucket_to_global[b];
@@ -283,17 +329,32 @@ impl<S: OutputFile> MosaicWriter<S> {
                 .map(|&gi| &self.schema.columns[gi].data_type)
                 .collect();
             let bw = self.bucket_writers[b].as_mut().unwrap();
-            size += bw.write_columns(&arrays, &data_types)? as u64;
+            size = size
+                .checked_add(bw.write_columns(&arrays, &data_types)? as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "buffered size overflow")
+                })?;
         }
 
         if let Some(ref mut collector) = self.stats_collector {
             collector.update_batch(batch);
         }
 
-        self.current_row_group_rows += batch.num_rows();
-        self.current_buffered_size += size;
+        self.current_row_group_rows = self
+            .current_row_group_rows
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "row count overflow"))?;
+        self.current_buffered_size = self
+            .current_buffered_size
+            .checked_add(size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "buffered size overflow"))?;
 
-        if self.current_buffered_size >= self.row_group_max_size {
+        if should_flush_row_group(
+            self.current_buffered_size,
+            self.row_group_max_size,
+            self.current_row_group_rows,
+            num_cols,
+        ) {
             self.flush_row_group()?;
         }
         Ok(())
@@ -311,55 +372,57 @@ impl<S: OutputFile> MosaicWriter<S> {
         let mut actual_uncompressed_sizes = vec![0usize; self.num_buckets];
         for ai in 0..num_active {
             let b = self.active_buckets[ai];
-            let bw = self.bucket_writers[b].as_ref().unwrap();
-            if bw.is_empty() {
-                continue;
-            }
-            let est_size = bw.estimated_raw_size();
-            let try_paged =
-                self.compression == COMPRESSION_ZSTD && est_size >= self.page_size_threshold;
-
-            let paged_output = if try_paged {
-                let paged = bw.finish_paged();
-                let num_pages = paged.column_pages.iter().filter(|p| p.is_some()).count();
-                let total: usize = paged
-                    .column_pages
-                    .iter()
-                    .filter_map(|p| p.as_ref())
-                    .map(|p| p.len())
-                    .sum();
-                let avg_ok = total
-                    .checked_div(num_pages)
-                    .is_some_and(|avg| avg >= self.page_size_threshold);
-                if avg_ok {
-                    Some(paged)
-                } else {
-                    None
+            let encoded = {
+                let bw = self.bucket_writers[b].as_ref().unwrap();
+                if bw.is_empty() {
+                    continue;
                 }
-            } else {
-                None
+                let prepared = bw.prepare();
+                let est_size = prepared.estimated_raw_size();
+                let try_paged =
+                    self.compression == COMPRESSION_ZSTD && est_size >= self.page_size_threshold;
+
+                if try_paged {
+                    let (num_pages, raw_size) = prepared.estimated_paged_size();
+                    let avg_ok = raw_size
+                        .checked_div(num_pages)
+                        .is_some_and(|avg| avg >= self.page_size_threshold);
+                    if avg_ok {
+                        let output = prepared.finish_paged();
+                        debug_assert_eq!(
+                            raw_size,
+                            output
+                                .column_pages
+                                .iter()
+                                .filter_map(|page| page.as_ref())
+                                .map(|page| page.len())
+                                .sum()
+                        );
+                        EncodedBucket::Paged { output, raw_size }
+                    } else {
+                        EncodedBucket::Monolithic(prepared.finish())
+                    }
+                } else {
+                    EncodedBucket::Monolithic(prepared.finish())
+                }
             };
 
-            if let Some(paged) = paged_output {
-                let paged_raw_size: usize = paged
-                    .column_pages
-                    .iter()
-                    .filter_map(|p| p.as_ref())
-                    .map(|p| p.len())
-                    .sum();
-                let total_size = self.write_paged_bucket(&paged)?;
-                bucket_layouts[b] = BucketLayout::Paged { total_size };
-                actual_uncompressed_sizes[b] = paged_raw_size;
-                bucket_offsets[b] = self.out.pos() - total_size as u64;
-            } else {
-                let raw = self.bucket_writers[b].as_ref().unwrap().finish();
-                let comp_size = self.write_compressed(&raw)?;
-                bucket_layouts[b] = BucketLayout::Monolithic {
-                    compressed_size: comp_size,
-                    uncompressed_size: raw.len(),
-                };
-                actual_uncompressed_sizes[b] = raw.len();
-                bucket_offsets[b] = self.out.pos() - comp_size as u64;
+            match encoded {
+                EncodedBucket::Paged { output, raw_size } => {
+                    let total_size = self.write_paged_bucket(&output)?;
+                    bucket_layouts[b] = BucketLayout::Paged { total_size };
+                    actual_uncompressed_sizes[b] = raw_size;
+                    bucket_offsets[b] = self.out.pos() - total_size as u64;
+                }
+                EncodedBucket::Monolithic(raw) => {
+                    let comp_size = self.write_compressed(&raw)?;
+                    bucket_layouts[b] = BucketLayout::Monolithic {
+                        compressed_size: comp_size,
+                        uncompressed_size: raw.len(),
+                    };
+                    actual_uncompressed_sizes[b] = raw.len();
+                    bucket_offsets[b] = self.out.pos() - comp_size as u64;
+                }
             }
         }
 
@@ -506,7 +569,13 @@ impl<S: OutputFile> MosaicWriter<S> {
         self.flush_row_group()?;
 
         // Write schema block
-        let schema_raw = self.schema.serialize();
+        // The schema block is compressed below, so running BPE first only duplicates
+        // compression work and can make the final Zstd payload larger.
+        let schema_raw = if self.compression == COMPRESSION_ZSTD {
+            self.schema.serialize_front_coded()
+        } else {
+            self.schema.serialize()
+        };
         let schema_block_offset = self.out.pos();
 
         let uncomp_size = to_u32(schema_raw.len(), "schema uncompressed size")?;
@@ -770,6 +839,80 @@ mod tests {
         writer.close().unwrap();
         let actual = writer.out.buf.len() as u64;
         assert!(actual > 0);
+    }
+
+    #[test]
+    fn test_row_group_flush_is_bounded_by_top_level_values() {
+        assert_eq!(max_rows_per_row_group(0), u32::MAX as usize);
+        assert_eq!(
+            max_rows_per_row_group(MAX_TOP_LEVEL_VALUES_PER_ROW_GROUP + 1),
+            1
+        );
+        let wide_schema_max_rows = max_rows_per_row_group(6_543);
+        assert!(!should_flush_row_group(
+            1024,
+            DEFAULT_ROW_GROUP_MAX_SIZE,
+            wide_schema_max_rows - 1,
+            6_543
+        ));
+        assert!(should_flush_row_group(
+            1024,
+            DEFAULT_ROW_GROUP_MAX_SIZE,
+            wide_schema_max_rows,
+            6_543
+        ));
+        assert!(should_flush_row_group(
+            DEFAULT_ROW_GROUP_MAX_SIZE,
+            DEFAULT_ROW_GROUP_MAX_SIZE,
+            1,
+            1
+        ));
+    }
+
+    #[test]
+    fn test_single_large_batch_is_split_at_top_level_value_limit() {
+        let num_columns = 5_000;
+        let num_rows = 1_000;
+        let arrow_schema = Arc::new(Schema::new(
+            (0..num_columns)
+                .map(|index| Field::new(format!("c{index}"), DataType::Int8, false))
+                .collect::<Vec<_>>(),
+        ));
+        let values = Arc::new(Int8Array::from(
+            (0..num_rows)
+                .map(|row| (row % 31) as i8)
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            (0..num_columns)
+                .map(|_| values.clone() as ArrayRef)
+                .collect(),
+        )
+        .unwrap();
+        let options = || WriterOptions {
+            compression: COMPRESSION_NONE,
+            num_buckets: 100,
+            ..Default::default()
+        };
+        let row_group_sizes = |writer: &MosaicWriter<MemOutputFile>| {
+            writer
+                .row_group_metas
+                .iter()
+                .map(|meta| meta.num_rows)
+                .collect::<Vec<_>>()
+        };
+
+        let mut writer = MosaicWriter::new(MemOutputFile::new(), &arrow_schema, options()).unwrap();
+        writer.write_batch(&batch).unwrap();
+        writer.close().unwrap();
+        assert_eq!(row_group_sizes(&writer), vec![800, 200]);
+
+        let mut writer = MosaicWriter::new(MemOutputFile::new(), &arrow_schema, options()).unwrap();
+        writer.write_batch(&batch.slice(0, 500)).unwrap();
+        writer.write_batch(&batch.slice(500, 500)).unwrap();
+        writer.close().unwrap();
+        assert_eq!(row_group_sizes(&writer), vec![500, 500]);
     }
 
     #[test]

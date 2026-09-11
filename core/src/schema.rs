@@ -46,6 +46,12 @@ pub struct MosaicSchema {
     pub original_order: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameEncoding {
+    AdaptiveBpe,
+    FrontCoded,
+}
+
 #[derive(Default)]
 struct SchemaSerializationCache {
     entry: Option<(MosaicSchema, Vec<u8>)>,
@@ -76,18 +82,18 @@ std::thread_local! {
 
 #[cfg(test)]
 std::thread_local! {
-    static SERIALIZATION_CACHE_MISSES: Cell<usize> = const { Cell::new(0) };
+    static SERIALIZATION_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
 fn clear_serialization_cache_for_test() {
     SERIALIZED_SCHEMA_CACHE.with(|cache| cache.borrow_mut().entry = None);
-    SERIALIZATION_CACHE_MISSES.with(|misses| misses.set(0));
+    SERIALIZATION_BUILDS.with(|builds| builds.set(0));
 }
 
 #[cfg(test)]
-fn serialization_cache_misses_for_test() -> usize {
-    SERIALIZATION_CACHE_MISSES.with(Cell::get)
+fn serialization_builds_for_test() -> usize {
+    SERIALIZATION_BUILDS.with(Cell::get)
 }
 
 impl MosaicSchema {
@@ -291,15 +297,19 @@ impl MosaicSchema {
             return serialized;
         }
 
-        let serialized = self.serialize_uncached();
+        let serialized = self.serialize_uncached(NameEncoding::AdaptiveBpe);
         let _ =
             SERIALIZED_SCHEMA_CACHE.try_with(|cache| cache.borrow_mut().insert(self, &serialized));
         serialized
     }
 
-    fn serialize_uncached(&self) -> Vec<u8> {
+    pub(crate) fn serialize_front_coded(&self) -> Vec<u8> {
+        self.serialize_uncached(NameEncoding::FrontCoded)
+    }
+
+    fn serialize_uncached(&self, name_encoding: NameEncoding) -> Vec<u8> {
         #[cfg(test)]
-        SERIALIZATION_CACHE_MISSES.with(|misses| misses.set(misses.get() + 1));
+        SERIALIZATION_BUILDS.with(|builds| builds.set(builds.get() + 1));
 
         let num_columns = self.columns.len();
 
@@ -315,7 +325,7 @@ impl MosaicSchema {
         let mut bpe_names = Vec::new();
         let mut bpe_size = usize::MAX;
 
-        if bpe::is_ascii_only(&raw_refs) {
+        if name_encoding == NameEncoding::AdaptiveBpe && bpe::is_ascii_only(&raw_refs) {
             let (rules, names) = bpe::build_vocabulary_and_encode(&raw_refs);
             if !rules.is_empty() {
                 let name_refs: Vec<&[u8]> = names.iter().map(|v| v.as_slice()).collect();
@@ -428,7 +438,7 @@ mod tests {
 
         assert_eq!(first, first_again);
         assert_ne!(first, second);
-        assert_eq!(3, serialization_cache_misses_for_test());
+        assert_eq!(3, serialization_builds_for_test());
     }
 
     #[test]
@@ -444,12 +454,45 @@ mod tests {
         );
 
         let first = first_schema.serialize();
-        let misses_after_first = serialization_cache_misses_for_test();
+        let builds_after_first = serialization_builds_for_test();
         let second = second_schema.serialize();
 
         assert_eq!(first, second);
-        assert_eq!(1, misses_after_first);
-        assert_eq!(misses_after_first, serialization_cache_misses_for_test());
+        assert_eq!(1, builds_after_first);
+        assert_eq!(builds_after_first, serialization_builds_for_test());
+    }
+
+    #[test]
+    fn test_front_coded_serialization_does_not_replace_adaptive_cache() {
+        clear_serialization_cache_for_test();
+        let schema = MosaicSchema::new(
+            (0..256)
+                .map(|index| {
+                    (
+                        format!(
+                            "vehicle_signal_family_{:03}_subsystem_{:03}_measurement_channel_{index:05}",
+                            index % 37,
+                            index % 113
+                        ),
+                        DataType::Int16,
+                        true,
+                    )
+                })
+                .collect(),
+            10,
+        );
+
+        let adaptive = schema.serialize();
+        let front_coded = schema.serialize_front_coded();
+        let front_coded_again = schema.serialize_front_coded();
+        let adaptive_again = schema.serialize();
+
+        assert_ne!(adaptive, front_coded);
+        assert_eq!(front_coded, front_coded_again);
+        assert_eq!(adaptive, adaptive_again);
+        assert_eq!(3, serialization_builds_for_test());
+        assert_eq!(schema, MosaicSchema::deserialize(&adaptive).unwrap());
+        assert_eq!(schema, MosaicSchema::deserialize(&front_coded).unwrap());
     }
 
     #[test]
@@ -465,7 +508,7 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(expected, second);
-        assert_eq!(1, serialization_cache_misses_for_test());
+        assert_eq!(1, serialization_builds_for_test());
     }
 
     #[test]
@@ -474,12 +517,12 @@ mod tests {
         let schema =
             MosaicSchema::new(vec![("signal_speed".to_string(), DataType::Int16, true)], 1);
         schema.serialize();
-        assert_eq!(1, serialization_cache_misses_for_test());
+        assert_eq!(1, serialization_builds_for_test());
 
         let (first, second, misses) = std::thread::spawn(move || {
             let first = schema.serialize();
             let second = schema.serialize();
-            (first, second, serialization_cache_misses_for_test())
+            (first, second, serialization_builds_for_test())
         })
         .join()
         .unwrap();
@@ -500,7 +543,7 @@ mod tests {
         let changed = changed_schema.serialize();
 
         assert_ne!(first, changed);
-        assert_eq!(2, serialization_cache_misses_for_test());
+        assert_eq!(2, serialization_builds_for_test());
     }
 
     #[test]

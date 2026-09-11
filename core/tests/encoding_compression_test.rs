@@ -567,7 +567,7 @@ fn test_const_encoding_all_types() {
 fn test_dict_encoding_boundary_253_254_255_256() {
     let schema = Schema::new(vec![Field::new("v", DataType::Int32, false)]);
 
-    for num_distinct in [253, 254, 255, 256] {
+    for num_distinct in [2, 253, 254, 255, 256] {
         let num_rows = 50_000;
         let vals: Vec<i32> = (0..num_rows).map(|i| (i % num_distinct) as i32).collect();
         let batch = RecordBatch::try_new(
@@ -613,6 +613,137 @@ fn test_dict_encoding_boundary_253_254_255_256() {
     }
 
     println!("test_dict_encoding_boundary_253_254_255_256: PASSED");
+}
+
+#[test]
+fn test_fixed_width_dict_roundtrip_preserves_bits_across_slices_and_batches() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i8", DataType::Int8, true),
+        Field::new("i16", DataType::Int16, true),
+        Field::new("i32", DataType::Int32, true),
+        Field::new("i64", DataType::Int64, true),
+        Field::new("f32", DataType::Float32, true),
+        Field::new("f64", DataType::Float64, true),
+    ]));
+    let source_rows = 1_031;
+    let i8_values = (0..source_rows)
+        .map(|row| (row % 11 != 0).then_some((row % 2) as i8 - 1))
+        .collect::<Vec<_>>();
+    let i16_values = (0..source_rows)
+        .map(|row| (row % 13 != 0).then_some((row % 7) as i16 - 3))
+        .collect::<Vec<_>>();
+    let i32_values = (0..source_rows)
+        .map(|row| (row % 17 != 0).then_some((row % 31) as i32 - 15))
+        .collect::<Vec<_>>();
+    let i64_values = (0..source_rows)
+        .map(|row| (row % 19 != 0).then_some((row % 127) as i64 - 63))
+        .collect::<Vec<_>>();
+    let f32_patterns = [
+        0.0_f32.to_bits(),
+        (-0.0_f32).to_bits(),
+        0x7fc0_0001,
+        0x7fc0_0011,
+    ];
+    let f64_patterns = [
+        0.0_f64.to_bits(),
+        (-0.0_f64).to_bits(),
+        0x7ff8_0000_0000_0001,
+        0x7ff8_0000_0000_0011,
+    ];
+    let f32_values = (0..source_rows)
+        .map(|row| {
+            (row % 23 != 0).then_some(f32::from_bits(f32_patterns[row % f32_patterns.len()]))
+        })
+        .collect::<Vec<_>>();
+    let f64_values = (0..source_rows)
+        .map(|row| {
+            (row % 29 != 0).then_some(f64::from_bits(f64_patterns[row % f64_patterns.len()]))
+        })
+        .collect::<Vec<_>>();
+    let source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int8Array::from(i8_values)),
+            Arc::new(Int16Array::from(i16_values)),
+            Arc::new(Int32Array::from(i32_values)),
+            Arc::new(Int64Array::from(i64_values)),
+            Arc::new(Float32Array::from(f32_values)),
+            Arc::new(Float64Array::from(f64_values)),
+        ],
+    )
+    .unwrap();
+    let sliced = source.slice(3, 1_024);
+    let batches = vec![
+        sliced.slice(0, 257),
+        sliced.slice(257, 511),
+        sliced.slice(768, 256),
+    ];
+
+    let data = write_file(
+        &schema,
+        &batches,
+        WriterOptions {
+            num_buckets: 1,
+            compression: spec::COMPRESSION_NONE,
+            ..Default::default()
+        },
+    );
+    let result = read_all(&data);
+
+    assert_batches_equal(&batches, &result);
+    let actual_f32_bits = result
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column_by_name("f32")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            (0..values.len())
+                .map(|row| (!values.is_null(row)).then_some(values.value(row).to_bits()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let actual_f64_bits = result
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column_by_name("f64")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            (0..values.len())
+                .map(|row| (!values.is_null(row)).then_some(values.value(row).to_bits()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let expected_f32_bits = (0..sliced.num_rows())
+        .map(|row| {
+            let values = sliced
+                .column_by_name("f32")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            (!values.is_null(row)).then_some(values.value(row).to_bits())
+        })
+        .collect::<Vec<_>>();
+    let expected_f64_bits = (0..sliced.num_rows())
+        .map(|row| {
+            let values = sliced
+                .column_by_name("f64")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            (!values.is_null(row)).then_some(values.value(row).to_bits())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual_f32_bits, expected_f32_bits);
+    assert_eq!(actual_f64_bits, expected_f64_bits);
 }
 
 // 3. test_dict_encoding_string_cardinality
@@ -667,6 +798,44 @@ fn test_dict_encoding_string_cardinality() {
     }
 
     println!("test_dict_encoding_string_cardinality: PASSED");
+}
+
+#[test]
+fn test_nullable_long_string_dict_roundtrip() {
+    let schema = Schema::new(vec![Field::new("v", DataType::Utf8, true)]);
+    let distinct_vals = [
+        format!("alpha_{}", "a".repeat(130)),
+        format!("beta_{}", "b".repeat(260)),
+        format!("gamma_{}", "c".repeat(390)),
+    ];
+    let expected: Vec<Option<String>> = (0..1_000)
+        .map(|row| {
+            if row % 5 == 0 {
+                None
+            } else {
+                Some(distinct_vals[row % distinct_vals.len()].clone())
+            }
+        })
+        .collect();
+    let input = expected.iter().map(Option::as_deref).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(StringArray::from(input))],
+    )
+    .unwrap();
+
+    let data = write_file(
+        &schema,
+        &[batch],
+        WriterOptions {
+            num_buckets: 1,
+            compression: spec::COMPRESSION_NONE,
+            ..Default::default()
+        },
+    );
+    let result = read_all(&data);
+
+    assert_eq!(concat_column_string(&result, "v"), expected);
 }
 
 // 4. test_dict_budget_exceeded
