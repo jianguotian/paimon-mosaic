@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::sync::Arc;
 
@@ -37,6 +39,275 @@ pub struct PagedBucketOutput {
     pub children: Vec<ChildColumnMeta>,
 }
 
+struct PreparedFixedDict {
+    values: Vec<u64>,
+    packed_indices: Vec<u8>,
+}
+
+impl PreparedFixedDict {
+    fn write_metadata(&self, out: &mut Vec<u8>, fixed_width: i32) {
+        varint::encode(out, self.values.len() as u32);
+        for &value in &self.values {
+            write_fixed_key_to_vec(out, value, fixed_width);
+        }
+    }
+
+    fn write_payload(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.packed_indices);
+    }
+
+    fn encoded_size(&self, fixed_width: i32) -> usize {
+        varint::encoded_size(self.values.len() as u32)
+            + self.values.len() * fixed_width as usize
+            + self.packed_indices.len()
+    }
+}
+
+pub(crate) struct PreparedBucket<'a> {
+    writer: &'a BucketWriter,
+    encodings: Vec<u8>,
+    has_nulls: Vec<bool>,
+    fixed_dicts: Vec<Option<PreparedFixedDict>>,
+    fixed_plain: Vec<Option<Vec<u8>>>,
+}
+
+enum CompactIndices {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    Usize(Vec<usize>),
+}
+
+impl CompactIndices {
+    fn with_capacity(max_index: usize, capacity: usize) -> Self {
+        if u8::try_from(max_index).is_ok() {
+            Self::U8(Vec::with_capacity(capacity))
+        } else if u16::try_from(max_index).is_ok() {
+            Self::U16(Vec::with_capacity(capacity))
+        } else if u32::try_from(max_index).is_ok() {
+            Self::U32(Vec::with_capacity(capacity))
+        } else {
+            Self::Usize(Vec::with_capacity(capacity))
+        }
+    }
+
+    fn push(&mut self, value: usize) {
+        match self {
+            Self::U8(values) => values.push(value as u8),
+            Self::U16(values) => values.push(value as u16),
+            Self::U32(values) => values.push(value as u32),
+            Self::Usize(values) => values.push(value),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U8(values) => values.len(),
+            Self::U16(values) => values.len(),
+            Self::U32(values) => values.len(),
+            Self::Usize(values) => values.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> usize {
+        match self {
+            Self::U8(values) => values[index] as usize,
+            Self::U16(values) => values[index] as usize,
+            Self::U32(values) => values[index] as usize,
+            Self::Usize(values) => values[index],
+        }
+    }
+
+    fn write_bit_packed(&self, out: &mut [u8], bit_width: usize) {
+        match self {
+            Self::U8(values) => write_u8_indices(values, out, bit_width),
+            Self::U16(values) => write_indices(values, out, bit_width),
+            Self::U32(values) => write_indices(values, out, bit_width),
+            Self::Usize(values) => write_indices(values, out, bit_width),
+        }
+    }
+}
+
+struct IncrementalFixedDict {
+    slots: FixedDictSlots,
+    slot_mask: usize,
+    seed: u64,
+    values: Vec<u64>,
+    indices: CompactIndices,
+}
+
+enum FixedDictSlots {
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    Usize(Vec<usize>),
+}
+
+impl FixedDictSlots {
+    fn new(max_dict_entries: usize, slot_count: usize) -> Self {
+        if u16::try_from(max_dict_entries).is_ok() {
+            Self::U16(vec![0; slot_count])
+        } else if u32::try_from(max_dict_entries).is_ok() {
+            Self::U32(vec![0; slot_count])
+        } else {
+            Self::Usize(vec![0; slot_count])
+        }
+    }
+
+    fn get(&self, slot: usize) -> Option<usize> {
+        let stored = match self {
+            Self::U16(slots) => slots[slot] as usize,
+            Self::U32(slots) => slots[slot] as usize,
+            Self::Usize(slots) => slots[slot],
+        };
+        stored.checked_sub(1)
+    }
+
+    fn set(&mut self, slot: usize, index: usize) {
+        let stored = index + 1;
+        match self {
+            Self::U16(slots) => slots[slot] = stored as u16,
+            Self::U32(slots) => slots[slot] = stored as u32,
+            Self::Usize(slots) => slots[slot] = stored,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U16(slots) => slots.len(),
+            Self::U32(slots) => slots.len(),
+            Self::Usize(slots) => slots.len(),
+        }
+    }
+}
+
+impl IncrementalFixedDict {
+    fn new(max_dict_entries: usize, seed: u64) -> Self {
+        let initial_entries = max_dict_entries.clamp(1, 2);
+        let slot_count = (initial_entries * 2).next_power_of_two();
+        Self {
+            slots: FixedDictSlots::new(max_dict_entries, slot_count),
+            slot_mask: slot_count - 1,
+            seed,
+            values: Vec::new(),
+            indices: CompactIndices::with_capacity(max_dict_entries.saturating_sub(1), 0),
+        }
+    }
+
+    fn lookup_or_insert(&mut self, key: u64, max_dict_entries: usize) -> Option<usize> {
+        loop {
+            let mut slot = mix_u64_key(key ^ self.seed) as usize & self.slot_mask;
+            loop {
+                let Some(index) = self.slots.get(slot) else {
+                    if self.values.len() == max_dict_entries {
+                        return None;
+                    }
+                    if (self.values.len() + 1) * 2 > self.slots.len() {
+                        self.grow_slots(max_dict_entries);
+                        break;
+                    }
+                    let index = self.values.len();
+                    self.values.push(key);
+                    self.slots.set(slot, index);
+                    return Some(index);
+                };
+                if self.values[index] == key {
+                    return Some(index);
+                }
+                slot = (slot + 1) & self.slot_mask;
+            }
+        }
+    }
+
+    fn grow_slots(&mut self, max_dict_entries: usize) {
+        let slot_count = self
+            .slots
+            .len()
+            .checked_mul(2)
+            .expect("fixed dictionary slot count overflow");
+        self.slots = FixedDictSlots::new(max_dict_entries, slot_count);
+        self.slot_mask = slot_count - 1;
+        for (index, &key) in self.values.iter().enumerate() {
+            let mut slot = mix_u64_key(key ^ self.seed) as usize & self.slot_mask;
+            while self.slots.get(slot).is_some() {
+                slot = (slot + 1) & self.slot_mask;
+            }
+            self.slots.set(slot, index);
+        }
+    }
+
+    fn write_plain_prefix(&self, count: usize, fixed_width: i32, out: &mut Vec<u8>) {
+        debug_assert!(count <= self.indices.len());
+        out.reserve(count * fixed_width as usize);
+        for position in 0..count {
+            write_fixed_key_to_vec(out, self.values[self.indices.get(position)], fixed_width);
+        }
+    }
+
+    fn cannot_beat_plain(&self, fixed_width: i32) -> bool {
+        bit_width(self.values.len()) >= fixed_width as usize * 8
+    }
+}
+
+fn write_u8_indices(indices: &[u8], out: &mut [u8], bit_width: usize) {
+    if bit_width == 0 {
+        return;
+    }
+    if bit_width == 8 {
+        out.copy_from_slice(indices);
+        return;
+    }
+
+    let mut input_pos = 0usize;
+    let mut output_pos = 0usize;
+    while input_pos + 8 <= indices.len() {
+        let mut packed = 0u64;
+        for offset in 0..8 {
+            packed |= (indices[input_pos + offset] as u64) << (offset * bit_width);
+        }
+        let bytes = packed.to_le_bytes();
+        out[output_pos..output_pos + bit_width].copy_from_slice(&bytes[..bit_width]);
+        input_pos += 8;
+        output_pos += bit_width;
+    }
+
+    if input_pos < indices.len() {
+        let mut packed = 0u64;
+        for (offset, &index) in indices[input_pos..].iter().enumerate() {
+            packed |= (index as u64) << (offset * bit_width);
+        }
+        let remaining_bytes = ((indices.len() - input_pos) * bit_width).div_ceil(8);
+        let bytes = packed.to_le_bytes();
+        out[output_pos..output_pos + remaining_bytes].copy_from_slice(&bytes[..remaining_bytes]);
+    }
+}
+
+fn write_indices<T>(indices: &[T], out: &mut [u8], bit_width: usize)
+where
+    T: Copy + TryInto<usize>,
+    <T as TryInto<usize>>::Error: std::fmt::Debug,
+{
+    if bit_width == 0 {
+        return;
+    }
+
+    let mut accumulator = 0u128;
+    let mut accumulator_bits = 0usize;
+    let mut out_pos = 0usize;
+    for &index in indices {
+        accumulator |= (index.try_into().unwrap() as u128) << accumulator_bits;
+        accumulator_bits += bit_width;
+        while accumulator_bits >= 8 {
+            out[out_pos] = accumulator as u8;
+            out_pos += 1;
+            accumulator >>= 8;
+            accumulator_bits -= 8;
+        }
+    }
+    if accumulator_bits != 0 {
+        out[out_pos] = accumulator as u8;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildColumnRole {
     ListElement,
@@ -54,6 +325,22 @@ pub struct ChildColumnMeta {
     pub num_elements: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DictTracking {
+    Pending,
+    Active,
+    Disabled,
+}
+
+#[inline]
+fn mix_u64_key(mut value: u64) -> u64 {
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xff51afd7ed558ccd);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xc4ceb9fe1a85ec53);
+    value ^ (value >> 33)
+}
+
 pub struct BucketWriter {
     num_primary: usize,
     total_columns: usize,
@@ -66,8 +353,10 @@ pub struct BucketWriter {
     const_tracking: Vec<bool>,
     first_value_len: Vec<usize>,
 
-    long_dict_maps: Vec<Option<HashMap<u64, usize>>>,
+    fixed_dict_seed: u64,
+    fixed_dict_states: Vec<Option<IncrementalFixedDict>>,
     byte_dict_maps: Vec<Option<HashMap<Vec<u8>, usize>>>,
+    dict_tracking: Vec<DictTracking>,
     dict_total_bytes: Vec<usize>,
     max_dict_total_bytes: usize,
     max_dict_entries: usize,
@@ -86,18 +375,9 @@ impl BucketWriter {
         let (physical_types, children) = expand_col_types(col_types);
         let total_columns = physical_types.len();
         let fixed_widths: Vec<i32> = physical_types.iter().map(types::fixed_width).collect();
-
-        let mut long_dict_maps = Vec::with_capacity(total_columns);
-        let mut byte_dict_maps = Vec::with_capacity(total_columns);
-        for fw in &fixed_widths {
-            if uses_long_dict(*fw) {
-                long_dict_maps.push(Some(HashMap::new()));
-                byte_dict_maps.push(None);
-            } else {
-                long_dict_maps.push(None);
-                byte_dict_maps.push(Some(HashMap::new()));
-            }
-        }
+        let random_state = RandomState::new();
+        let mut seed_hasher = random_state.build_hasher();
+        seed_hasher.write(b"paimon-mosaic-u64-dict");
 
         BucketWriter {
             num_primary,
@@ -108,8 +388,10 @@ impl BucketWriter {
             non_null_counts: vec![0; total_columns],
             const_tracking: vec![true; total_columns],
             first_value_len: vec![0; total_columns],
-            long_dict_maps,
-            byte_dict_maps,
+            fixed_dict_seed: seed_hasher.finish(),
+            fixed_dict_states: (0..total_columns).map(|_| None).collect(),
+            byte_dict_maps: (0..total_columns).map(|_| None).collect(),
+            dict_tracking: vec![DictTracking::Pending; total_columns],
             dict_total_bytes: vec![0; total_columns],
             max_dict_total_bytes,
             max_dict_entries,
@@ -169,8 +451,7 @@ impl BucketWriter {
         if self.num_rows == 0 {
             return 0;
         }
-        let (encodings, has_nulls) = self.compute_encodings();
-        self.compute_out_size(&encodings, &has_nulls)
+        self.prepare().estimated_raw_size()
     }
 
     pub fn write_columns(
@@ -312,22 +593,43 @@ impl BucketWriter {
         start_row: usize,
     ) -> io::Result<usize> {
         let num_new_rows = array.len();
+        let fixed_dict_was_active = uses_long_dict(self.fixed_widths[col])
+            && self.dict_tracking[col] == DictTracking::Active;
+        let previous_non_null_count = self.non_null_counts[col];
         let needed_bytes = (start_row + num_new_rows).div_ceil(8);
         if self.null_bitmaps[col].len() < needed_bytes {
             self.null_bitmaps[col].resize(needed_bytes.next_power_of_two(), 0);
         }
 
         let typed = downcast_array(array, dt)?;
+        let null_count = array.null_count();
 
-        if array.null_count() == 0 {
+        if null_count == num_new_rows {
+            let nulls = array
+                .nulls()
+                .expect("an all-null array must have a physical null buffer");
+            append_null_bitmap(&mut self.null_bitmaps[col], start_row, nulls);
+            return Ok(0);
+        }
+
+        if null_count == 0 {
             if let Some(col_size) =
                 self.append_no_null_batch(col, &typed, start_row, num_new_rows)?
             {
+                self.finish_fixed_dict_batch(col, fixed_dict_was_active, previous_non_null_count);
                 return Ok(col_size);
             }
         }
 
+        if let TypedArrayRef::TimestampMillis(array) = &typed {
+            let col_size =
+                self.append_nullable_timestamp_millis_batch(col, array, start_row, num_new_rows);
+            self.finish_fixed_dict_batch(col, fixed_dict_was_active, previous_non_null_count);
+            return Ok(col_size);
+        }
+
         let mut col_size = 0usize;
+        let use_direct_fixed_keys = uses_long_dict(self.fixed_widths[col]);
         for row in 0..num_new_rows {
             let abs_row = start_row + row;
             if array.is_null(row) {
@@ -339,42 +641,18 @@ impl BucketWriter {
                 let written = self.value_buffers[col].len() - before;
                 col_size += written;
 
-                if self.const_tracking[col] {
-                    if self.non_null_counts[col] == 1 {
-                        self.first_value_len[col] = written;
-                    } else if written != self.first_value_len[col]
-                        || !equals_first_value(&self.value_buffers[col], before, written)
-                    {
-                        self.const_tracking[col] = false;
-                    }
-                }
-
-                if let Some(ref mut dict) = self.long_dict_maps[col] {
-                    let key = values::extract_fixed_key(
-                        &self.value_buffers[col],
-                        before,
-                        self.fixed_widths[col],
-                    );
-                    let len = dict.len();
-                    dict.entry(key).or_insert(len);
-                    if dict.len() > self.max_dict_entries {
-                        self.long_dict_maps[col] = None;
-                    }
-                } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
-                    let slice = &self.value_buffers[col][before..before + written];
-                    if !dict.contains_key(slice) {
-                        let len = dict.len();
-                        dict.insert(slice.to_vec(), len);
-                        self.dict_total_bytes[col] += written;
-                    }
-                    if dict.len() > self.max_dict_entries
-                        || self.dict_total_bytes[col] > self.max_dict_total_bytes
-                    {
-                        self.byte_dict_maps[col] = None;
-                    }
-                }
+                let fixed_key = if use_direct_fixed_keys && !self.const_tracking[col] {
+                    Some(
+                        fixed_key_for_typed_value(&typed, row)
+                            .expect("fixed-width primitive must provide a dictionary key"),
+                    )
+                } else {
+                    None
+                };
+                self.track_encoding_value(col, before, written, fixed_key);
             }
         }
+        self.finish_fixed_dict_batch(col, fixed_dict_was_active, previous_non_null_count);
         Ok(col_size)
     }
 
@@ -385,6 +663,13 @@ impl BucketWriter {
         start_row: usize,
         num_rows: usize,
     ) -> io::Result<Option<usize>> {
+        if uses_long_dict(self.fixed_widths[col]) && self.dict_tracking[col] == DictTracking::Active
+        {
+            return self
+                .append_active_fixed_no_null_batch(col, typed, num_rows)
+                .map(Some);
+        }
+
         let buf = &mut self.value_buffers[col];
         let before_all = buf.len();
 
@@ -492,52 +777,14 @@ impl BucketWriter {
 
         let col_size = buf.len() - before_all;
         let fw = self.fixed_widths[col] as usize;
-        let prev_non_null = self.non_null_counts[col];
-        self.non_null_counts[col] += num_rows;
-
-        if self.const_tracking[col] {
-            if prev_non_null == 0 {
-                self.first_value_len[col] = fw;
-                for i in 1..num_rows {
-                    if !equals_first_value(buf, before_all + i * fw, fw) {
-                        self.const_tracking[col] = false;
-                        break;
-                    }
-                }
-            } else {
-                for i in 0..num_rows {
-                    if !equals_first_value(buf, before_all + i * fw, fw) {
-                        self.const_tracking[col] = false;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(ref mut dict) = self.long_dict_maps[col] {
+        if !self.needs_encoding_tracking(col) {
+            self.non_null_counts[col] += num_rows;
+        } else {
             for i in 0..num_rows {
-                let key =
-                    values::extract_fixed_key(buf, before_all + i * fw, self.fixed_widths[col]);
-                let len = dict.len();
-                dict.entry(key).or_insert(len);
-                if dict.len() > self.max_dict_entries {
-                    self.long_dict_maps[col] = None;
-                    break;
-                }
-            }
-        } else if let Some(ref mut dict) = self.byte_dict_maps[col] {
-            for i in 0..num_rows {
-                let start = before_all + i * fw;
-                let slice = &buf[start..start + fw];
-                if !dict.contains_key(slice) {
-                    let len = dict.len();
-                    dict.insert(slice.to_vec(), len);
-                    self.dict_total_bytes[col] += fw;
-                }
-                if dict.len() > self.max_dict_entries
-                    || self.dict_total_bytes[col] > self.max_dict_total_bytes
-                {
-                    self.byte_dict_maps[col] = None;
+                self.non_null_counts[col] += 1;
+                self.track_encoding_value(col, before_all + i * fw, fw, None);
+                if !self.needs_encoding_tracking(col) {
+                    self.non_null_counts[col] += num_rows - i - 1;
                     break;
                 }
             }
@@ -549,9 +796,331 @@ impl BucketWriter {
         Ok(Some(col_size))
     }
 
-    fn compute_encodings(&self) -> (Vec<u8>, Vec<bool>) {
+    fn append_active_fixed_no_null_batch(
+        &mut self,
+        col: usize,
+        typed: &TypedArrayRef,
+        num_rows: usize,
+    ) -> io::Result<usize> {
+        macro_rules! append_keys {
+            ($keys:expr) => {
+                return self.append_active_fixed_keys(col, typed, $keys, num_rows);
+            };
+        }
+
+        match typed {
+            TypedArrayRef::Boolean(array) => {
+                append_keys!((0..num_rows).map(|row| u64::from(array.value(row))));
+            }
+            TypedArrayRef::Int8(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u8 as u64));
+            }
+            TypedArrayRef::Int16(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u16 as u64));
+            }
+            TypedArrayRef::Int32(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u32 as u64));
+            }
+            TypedArrayRef::Date32(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u32 as u64));
+            }
+            TypedArrayRef::Time32(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u32 as u64));
+            }
+            TypedArrayRef::Int64(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u64));
+            }
+            TypedArrayRef::Decimal128Compact(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u64));
+            }
+            TypedArrayRef::TimestampMillis(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u64));
+            }
+            TypedArrayRef::TimestampMicros(array) => {
+                append_keys!(array.values().iter().map(|&value| value as u64));
+            }
+            TypedArrayRef::Float32(array) => {
+                append_keys!(array.values().iter().map(|&value| value.to_bits() as u64));
+            }
+            TypedArrayRef::Float64(array) => {
+                append_keys!(array.values().iter().map(|&value| value.to_bits()));
+            }
+            _ => unreachable!("active fixed dictionary requires a 1-8 byte primitive"),
+        }
+    }
+
+    fn append_active_fixed_keys<I>(
+        &mut self,
+        col: usize,
+        typed: &TypedArrayRef,
+        keys: I,
+        num_rows: usize,
+    ) -> io::Result<usize>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let previous_non_null_count = self.non_null_counts[col];
+        let fallback_to_plain = {
+            let state = self.fixed_dict_states[col]
+                .as_mut()
+                .expect("active fixed dictionary must have state");
+            let mut fallback_to_plain = false;
+            for key in keys {
+                if let Some(index) = state.lookup_or_insert(key, self.max_dict_entries) {
+                    if state.cannot_beat_plain(self.fixed_widths[col]) {
+                        fallback_to_plain = true;
+                        break;
+                    }
+                    state.indices.push(index);
+                } else {
+                    fallback_to_plain = true;
+                    break;
+                }
+            }
+            fallback_to_plain
+        };
+
+        if fallback_to_plain {
+            let state = self.fixed_dict_states[col]
+                .take()
+                .expect("plain-fallback fixed dictionary must retain state");
+            let width = self.fixed_widths[col];
+            let mut raw = Vec::with_capacity((previous_non_null_count + num_rows) * width as usize);
+            state.write_plain_prefix(previous_non_null_count, width, &mut raw);
+            for row in 0..num_rows {
+                write_typed_value(&mut raw, typed, row)?;
+            }
+            self.value_buffers[col] = raw;
+            self.dict_tracking[col] = DictTracking::Disabled;
+        }
+
+        self.non_null_counts[col] += num_rows;
+        Ok(num_rows * self.fixed_widths[col] as usize)
+    }
+
+    fn append_nullable_timestamp_millis_batch(
+        &mut self,
+        col: usize,
+        array: &TimestampMillisecondArray,
+        start_row: usize,
+        num_rows: usize,
+    ) -> usize {
+        let nulls = array
+            .nulls()
+            .expect("nullable timestamp batch must have a physical null buffer");
+        debug_assert!(nulls.null_count() > 0);
+        debug_assert!(nulls.null_count() < num_rows);
+
+        append_null_bitmap(&mut self.null_bitmaps[col], start_row, nulls);
+
+        let valid_count = num_rows - nulls.null_count();
+        self.value_buffers[col].reserve(valid_count * 8);
+        let values = array.values();
+        let mut track_encoding = self.needs_encoding_tracking(col);
+
+        for row in nulls.valid_indices() {
+            let before = self.value_buffers[col].len();
+            self.value_buffers[col].extend_from_slice(&values[row].to_be_bytes());
+            self.non_null_counts[col] += 1;
+
+            if track_encoding {
+                let fixed_key = (!self.const_tracking[col]).then_some(values[row] as u64);
+                self.track_encoding_value(col, before, 8, fixed_key);
+                track_encoding = self.needs_encoding_tracking(col);
+            }
+        }
+
+        valid_count * 8
+    }
+
+    fn needs_encoding_tracking(&self, col: usize) -> bool {
+        self.const_tracking[col] || self.dict_tracking[col] != DictTracking::Disabled
+    }
+
+    fn track_encoding_value(
+        &mut self,
+        col: usize,
+        value_start: usize,
+        value_len: usize,
+        fixed_key: Option<u64>,
+    ) {
+        if self.non_null_counts[col] == 1 {
+            self.first_value_len[col] = value_len;
+            return;
+        }
+
+        if self.const_tracking[col] {
+            if value_len == self.first_value_len[col]
+                && equals_first_value(&self.value_buffers[col], value_start, value_len)
+            {
+                return;
+            }
+
+            self.const_tracking[col] = false;
+            self.activate_dict_tracking(col, value_start, value_len);
+        } else {
+            self.track_dict_value(col, value_start, value_len, fixed_key);
+        }
+    }
+
+    fn activate_dict_tracking(&mut self, col: usize, value_start: usize, value_len: usize) {
+        debug_assert_eq!(self.dict_tracking[col], DictTracking::Pending);
+        if self.max_dict_entries < 2 {
+            self.dict_tracking[col] = DictTracking::Disabled;
+            return;
+        }
+
+        if uses_long_dict(self.fixed_widths[col]) {
+            let first_key =
+                values::extract_fixed_key(&self.value_buffers[col], 0, self.fixed_widths[col]);
+            let current_key = values::extract_fixed_key(
+                &self.value_buffers[col],
+                value_start,
+                self.fixed_widths[col],
+            );
+            let mut state = IncrementalFixedDict::new(self.max_dict_entries, self.fixed_dict_seed);
+            let first_index = state
+                .lookup_or_insert(first_key, self.max_dict_entries)
+                .expect("a newly activated dictionary accepts its first value");
+            debug_assert_eq!(first_index, 0);
+            for _ in 0..self.non_null_counts[col] - 1 {
+                state.indices.push(0);
+            }
+            let current_index = state
+                .lookup_or_insert(current_key, self.max_dict_entries)
+                .expect("a newly activated dictionary contains at most two values");
+            state.indices.push(current_index);
+            self.fixed_dict_states[col] = Some(state);
+            self.dict_tracking[col] = DictTracking::Active;
+            return;
+        }
+
+        self.dict_total_bytes[col] = 0;
+        self.byte_dict_maps[col]
+            .get_or_insert_with(HashMap::new)
+            .clear();
+        self.dict_tracking[col] = DictTracking::Active;
+
+        self.track_dict_value(col, 0, self.first_value_len[col], None);
+        if self.dict_tracking[col] == DictTracking::Active {
+            self.track_dict_value(col, value_start, value_len, None);
+        }
+    }
+
+    fn track_dict_value(
+        &mut self,
+        col: usize,
+        value_start: usize,
+        value_len: usize,
+        fixed_key: Option<u64>,
+    ) {
+        if self.dict_tracking[col] != DictTracking::Active {
+            return;
+        }
+
+        if uses_long_dict(self.fixed_widths[col]) {
+            let key = fixed_key.unwrap_or_else(|| {
+                values::extract_fixed_key(
+                    &self.value_buffers[col],
+                    value_start,
+                    self.fixed_widths[col],
+                )
+            });
+            let fallback_to_plain = {
+                let state = self.fixed_dict_states[col]
+                    .as_mut()
+                    .expect("active fixed dictionary must have state");
+                if let Some(index) = state.lookup_or_insert(key, self.max_dict_entries) {
+                    if state.cannot_beat_plain(self.fixed_widths[col]) {
+                        true
+                    } else {
+                        state.indices.push(index);
+                        false
+                    }
+                } else {
+                    true
+                }
+            };
+            if fallback_to_plain {
+                self.dict_tracking[col] = DictTracking::Disabled;
+            }
+            return;
+        }
+
+        let disable = if let Some(ref mut dict) = self.byte_dict_maps[col] {
+            let value = &self.value_buffers[col][value_start..value_start + value_len];
+            if !dict.contains_key(value) {
+                let len = dict.len();
+                dict.insert(value.to_vec(), len);
+                self.dict_total_bytes[col] += value_len;
+            }
+            dict.len() > self.max_dict_entries
+                || self.dict_total_bytes[col] > self.max_dict_total_bytes
+        } else {
+            unreachable!("active dictionary tracking must have a dictionary map")
+        };
+
+        if disable {
+            self.dict_tracking[col] = DictTracking::Disabled;
+            self.byte_dict_maps[col] = None;
+        }
+    }
+
+    fn finish_fixed_dict_batch(
+        &mut self,
+        col: usize,
+        was_active: bool,
+        previous_non_null_count: usize,
+    ) {
+        if !uses_long_dict(self.fixed_widths[col]) {
+            return;
+        }
+
+        match self.dict_tracking[col] {
+            DictTracking::Active => {
+                debug_assert_eq!(
+                    self.fixed_dict_states[col]
+                        .as_ref()
+                        .expect("active fixed dictionary must have state")
+                        .indices
+                        .len(),
+                    self.non_null_counts[col]
+                );
+                self.value_buffers[col].clear();
+            }
+            DictTracking::Disabled if was_active => {
+                if let Some(state) = self.fixed_dict_states[col].take() {
+                    let current_batch = std::mem::take(&mut self.value_buffers[col]);
+                    let mut raw = Vec::with_capacity(
+                        previous_non_null_count * self.fixed_widths[col] as usize
+                            + current_batch.len(),
+                    );
+                    state.write_plain_prefix(
+                        previous_non_null_count,
+                        self.fixed_widths[col],
+                        &mut raw,
+                    );
+                    raw.extend_from_slice(&current_batch);
+                    self.value_buffers[col] = raw;
+                } else {
+                    debug_assert_eq!(
+                        self.value_buffers[col].len(),
+                        self.non_null_counts[col] * self.fixed_widths[col] as usize
+                    );
+                }
+            }
+            DictTracking::Disabled => {
+                self.fixed_dict_states[col] = None;
+            }
+            DictTracking::Pending => {}
+        }
+    }
+
+    pub(crate) fn prepare(&self) -> PreparedBucket<'_> {
         let mut encodings = vec![0u8; self.total_columns];
         let mut has_nulls = vec![false; self.total_columns];
+        let mut fixed_dicts = (0..self.total_columns).map(|_| None).collect::<Vec<_>>();
+        let mut fixed_plain = (0..self.total_columns).map(|_| None).collect::<Vec<_>>();
         for i in 0..self.total_columns {
             let col_rows = self.col_num_rows(i);
             if self.non_null_counts[i] == 0 {
@@ -560,19 +1129,73 @@ impl BucketWriter {
                 encodings[i] = ENCODING_CONST;
                 has_nulls[i] = self.non_null_counts[i] < col_rows;
             } else {
-                let dict_size = self.get_dict_size(i);
-                if dict_size >= 2
-                    && dict_size <= self.max_dict_entries
-                    && self.dict_encoded_size(i) < self.value_buffers[i].len()
-                {
-                    encodings[i] = ENCODING_DICT;
+                if uses_long_dict(self.fixed_widths[i]) {
+                    let (dict, plain) = self.prepare_fixed_dict(i);
+                    fixed_dicts[i] = dict;
+                    fixed_plain[i] = plain;
+                    encodings[i] = if fixed_dicts[i].is_some() {
+                        ENCODING_DICT
+                    } else {
+                        ENCODING_PLAIN
+                    };
                 } else {
-                    encodings[i] = ENCODING_PLAIN;
+                    let dict_size = self.get_byte_dict_size(i);
+                    encodings[i] = if dict_size >= 2
+                        && dict_size <= self.max_dict_entries
+                        && self.byte_dict_encoded_size(i) < self.value_buffers[i].len()
+                    {
+                        ENCODING_DICT
+                    } else {
+                        ENCODING_PLAIN
+                    };
                 }
                 has_nulls[i] = self.non_null_counts[i] < col_rows;
             }
         }
-        (encodings, has_nulls)
+        PreparedBucket {
+            writer: self,
+            encodings,
+            has_nulls,
+            fixed_dicts,
+            fixed_plain,
+        }
+    }
+
+    fn prepare_fixed_dict(&self, col: usize) -> (Option<PreparedFixedDict>, Option<Vec<u8>>) {
+        let width = self.fixed_widths[col] as usize;
+        let non_null_count = self.non_null_counts[col];
+        if self.dict_tracking[col] != DictTracking::Active {
+            debug_assert_eq!(self.value_buffers[col].len(), non_null_count * width);
+            return (None, None);
+        }
+
+        let state = self.fixed_dict_states[col]
+            .as_ref()
+            .expect("active fixed dictionary must have state");
+        debug_assert_eq!(state.indices.len(), non_null_count);
+        let bit_width = bit_width(state.values.len());
+        let packed_size = (non_null_count * bit_width).div_ceil(8);
+        let encoded_size = varint::encoded_size(state.values.len() as u32)
+            + state.values.len() * width
+            + packed_size;
+        let plain_size = non_null_count * width;
+        if encoded_size >= plain_size {
+            let mut plain = Vec::with_capacity(plain_size);
+            state.write_plain_prefix(non_null_count, self.fixed_widths[col], &mut plain);
+            return (None, Some(plain));
+        }
+
+        let mut packed_indices = vec![0; packed_size];
+        state
+            .indices
+            .write_bit_packed(&mut packed_indices, bit_width);
+        (
+            Some(PreparedFixedDict {
+                values: state.values.clone(),
+                packed_indices,
+            }),
+            None,
+        )
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -580,9 +1203,11 @@ impl BucketWriter {
         if self.num_rows == 0 {
             return Vec::new();
         }
+        self.prepare().finish()
+    }
 
-        let (encodings, has_nulls) = self.compute_encodings();
-
+    #[allow(clippy::needless_range_loop)]
+    fn finish_prepared(&self, prepared: &PreparedBucket<'_>) -> Vec<u8> {
         let mut out = Vec::new();
 
         // Header: only written when ARRAY columns exist (backward compatible with v1)
@@ -601,7 +1226,7 @@ impl BucketWriter {
         for i in 0..self.total_columns {
             let byte_idx = (i * 2) / 8;
             let bit_idx = (i * 2) % 8;
-            out[ef_start + byte_idx] |= encodings[i] << bit_idx;
+            out[ef_start + byte_idx] |= prepared.encodings[i] << bit_idx;
         }
 
         // Has-nulls flags: 1 bit per column
@@ -609,14 +1234,14 @@ impl BucketWriter {
         let hn_start = out.len();
         out.resize(hn_start + has_nulls_bytes, 0);
         for i in 0..self.total_columns {
-            if has_nulls[i] {
+            if prepared.has_nulls[i] {
                 out[hn_start + i / 8] |= 1 << (i % 8);
             }
         }
 
         // CONST metadata
         for i in 0..self.total_columns {
-            if encodings[i] == ENCODING_CONST {
+            if prepared.encodings[i] == ENCODING_CONST {
                 let len = self.first_value_len[i];
                 out.extend_from_slice(&self.value_buffers[i][..len]);
             }
@@ -624,18 +1249,9 @@ impl BucketWriter {
 
         // Dict metadata
         for i in 0..self.total_columns {
-            if encodings[i] == ENCODING_DICT {
-                if let Some(ref dict) = self.long_dict_maps[i] {
-                    let num_entries = dict.len();
-                    varint::encode(&mut out, num_entries as u32);
-                    let w = self.fixed_widths[i];
-                    let mut keys = vec![0u64; num_entries];
-                    for (&key, &idx) in dict {
-                        keys[idx] = key;
-                    }
-                    for key in &keys {
-                        write_fixed_key_to_vec(&mut out, *key, w);
-                    }
+            if prepared.encodings[i] == ENCODING_DICT {
+                if let Some(ref dict) = prepared.fixed_dicts[i] {
+                    dict.write_metadata(&mut out, self.fixed_widths[i]);
                 } else if let Some(ref dict) = self.byte_dict_maps[i] {
                     let num_entries = dict.len();
                     varint::encode(&mut out, num_entries as u32);
@@ -650,7 +1266,7 @@ impl BucketWriter {
 
         // Null bitmaps (per-column row count)
         for i in 0..self.total_columns {
-            if has_nulls[i] && encodings[i] != ENCODING_ALL_NULL {
+            if prepared.has_nulls[i] && prepared.encodings[i] != ENCODING_ALL_NULL {
                 let nbytes = self.col_num_rows(i).div_ceil(8);
                 out.extend_from_slice(&self.null_bitmaps[i][..nbytes]);
             }
@@ -658,14 +1274,23 @@ impl BucketWriter {
 
         // Column data
         for i in 0..self.total_columns {
-            if encodings[i] == ENCODING_PLAIN {
-                out.extend_from_slice(&self.value_buffers[i]);
-            } else if encodings[i] == ENCODING_DICT {
-                let bw = bit_width(self.get_dict_size(i));
-                let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
-                let data_start = out.len();
-                out.resize(data_start + packed_bytes, 0);
-                self.write_dict_bit_packed(i, &mut out, data_start);
+            if prepared.encodings[i] == ENCODING_PLAIN {
+                if let Some(ref plain) = prepared.fixed_plain[i] {
+                    out.extend_from_slice(plain);
+                } else {
+                    out.extend_from_slice(&self.value_buffers[i]);
+                }
+            } else if prepared.encodings[i] == ENCODING_DICT {
+                if let Some(ref dict) = prepared.fixed_dicts[i] {
+                    dict.write_payload(&mut out);
+                } else {
+                    let dict_size = self.get_byte_dict_size(i);
+                    let bit_width = bit_width(dict_size);
+                    let packed_bytes = (self.non_null_counts[i] * bit_width).div_ceil(8);
+                    let data_start = out.len();
+                    out.resize(data_start + packed_bytes, 0);
+                    self.write_byte_dict_bit_packed(i, &mut out, data_start);
+                }
             }
         }
 
@@ -684,9 +1309,11 @@ impl BucketWriter {
                 children: self.children.clone(),
             };
         }
+        self.prepare().finish_paged()
+    }
 
-        let (encodings, has_nulls) = self.compute_encodings();
-
+    #[allow(clippy::needless_range_loop)]
+    fn finish_paged_prepared(&self, prepared: &PreparedBucket<'_>) -> PagedBucketOutput {
         let mut const_data = vec![Vec::new(); self.total_columns];
         let mut column_pages: Vec<Option<Vec<u8>>> = vec![None; self.total_columns];
 
@@ -694,28 +1321,19 @@ impl BucketWriter {
             let col_rows = self.col_num_rows(i);
             let null_bitmap_bytes = col_rows.div_ceil(8);
 
-            match encodings[i] {
+            match prepared.encodings[i] {
                 ENCODING_ALL_NULL => {}
                 ENCODING_CONST => {
                     let len = self.first_value_len[i];
                     const_data[i] = self.value_buffers[i][..len].to_vec();
-                    if has_nulls[i] {
+                    if prepared.has_nulls[i] {
                         column_pages[i] = Some(self.null_bitmaps[i][..null_bitmap_bytes].to_vec());
                     }
                 }
                 ENCODING_DICT => {
                     let mut page = Vec::new();
-                    if let Some(ref dict) = self.long_dict_maps[i] {
-                        let num_entries = dict.len();
-                        varint::encode(&mut page, num_entries as u32);
-                        let w = self.fixed_widths[i];
-                        let mut keys = vec![0u64; num_entries];
-                        for (&key, &idx) in dict {
-                            keys[idx] = key;
-                        }
-                        for key in &keys {
-                            write_fixed_key_to_vec(&mut page, *key, w);
-                        }
+                    if let Some(ref dict) = prepared.fixed_dicts[i] {
+                        dict.write_metadata(&mut page, self.fixed_widths[i]);
                     } else if let Some(ref dict) = self.byte_dict_maps[i] {
                         let num_entries = dict.len();
                         varint::encode(&mut page, num_entries as u32);
@@ -725,23 +1343,31 @@ impl BucketWriter {
                             page.extend_from_slice(key);
                         }
                     }
-                    if has_nulls[i] {
+                    if prepared.has_nulls[i] {
                         page.extend_from_slice(&self.null_bitmaps[i][..null_bitmap_bytes]);
                     }
-                    let dict_size = self.get_dict_size(i);
-                    let bw = bit_width(dict_size);
-                    let packed_bytes = (self.non_null_counts[i] * bw).div_ceil(8);
-                    let data_start = page.len();
-                    page.resize(data_start + packed_bytes, 0);
-                    self.write_dict_bit_packed(i, &mut page, data_start);
+                    if let Some(ref dict) = prepared.fixed_dicts[i] {
+                        dict.write_payload(&mut page);
+                    } else {
+                        let dict_size = self.get_byte_dict_size(i);
+                        let bit_width = bit_width(dict_size);
+                        let packed_bytes = (self.non_null_counts[i] * bit_width).div_ceil(8);
+                        let data_start = page.len();
+                        page.resize(data_start + packed_bytes, 0);
+                        self.write_byte_dict_bit_packed(i, &mut page, data_start);
+                    }
                     column_pages[i] = Some(page);
                 }
                 ENCODING_PLAIN => {
                     let mut page = Vec::new();
-                    if has_nulls[i] {
+                    if prepared.has_nulls[i] {
                         page.extend_from_slice(&self.null_bitmaps[i][..null_bitmap_bytes]);
                     }
-                    page.extend_from_slice(&self.value_buffers[i]);
+                    if let Some(ref plain) = prepared.fixed_plain[i] {
+                        page.extend_from_slice(plain);
+                    } else {
+                        page.extend_from_slice(&self.value_buffers[i]);
+                    }
                     column_pages[i] = Some(page);
                 }
                 _ => {}
@@ -749,8 +1375,8 @@ impl BucketWriter {
         }
 
         PagedBucketOutput {
-            encodings,
-            has_nulls,
+            encodings: prepared.encodings.clone(),
+            has_nulls: prepared.has_nulls.clone(),
             const_data,
             column_pages,
             num_primary: self.num_primary,
@@ -760,24 +1386,16 @@ impl BucketWriter {
 
     pub fn reset(&mut self) {
         for i in 0..self.total_columns {
-            for b in &mut self.null_bitmaps[i] {
-                *b = 0;
-            }
+            self.null_bitmaps[i].fill(0);
             self.value_buffers[i].clear();
             self.non_null_counts[i] = 0;
             self.const_tracking[i] = true;
             self.first_value_len[i] = 0;
+            self.dict_tracking[i] = DictTracking::Pending;
             self.dict_total_bytes[i] = 0;
-            if uses_long_dict(self.fixed_widths[i]) {
-                if let Some(ref mut dict) = self.long_dict_maps[i] {
-                    dict.clear();
-                } else {
-                    self.long_dict_maps[i] = Some(HashMap::new());
-                }
-            } else if let Some(ref mut dict) = self.byte_dict_maps[i] {
+            self.fixed_dict_states[i] = None;
+            if let Some(ref mut dict) = self.byte_dict_maps[i] {
                 dict.clear();
-            } else {
-                self.byte_dict_maps[i] = Some(HashMap::new());
             }
         }
         self.num_rows = 0;
@@ -786,9 +1404,9 @@ impl BucketWriter {
         }
     }
 
-    fn get_dict_size(&self, col: usize) -> usize {
-        if let Some(ref dict) = self.long_dict_maps[col] {
-            return dict.len();
+    fn get_byte_dict_size(&self, col: usize) -> usize {
+        if self.dict_tracking[col] != DictTracking::Active {
+            return 0;
         }
         if let Some(ref dict) = self.byte_dict_maps[col] {
             return dict.len();
@@ -796,46 +1414,41 @@ impl BucketWriter {
         0
     }
 
-    fn write_dict_bit_packed(&self, col: usize, buf: &mut [u8], data_start: usize) -> usize {
-        let dict_size = self.get_dict_size(col);
+    fn write_byte_dict_bit_packed(&self, col: usize, buf: &mut [u8], data_start: usize) -> usize {
+        let dict_size = self.get_byte_dict_size(col);
         let bw = bit_width(dict_size);
         let w = self.fixed_widths[col];
         let mut bit_offset = 0usize;
-        let mut val_pos = 0usize;
 
-        for r in 0..self.col_num_rows(col) {
-            let is_null = (self.null_bitmaps[col][r / 8] & (1 << (r % 8))) != 0;
-            if !is_null {
-                let idx = if let Some(ref dict) = self.long_dict_maps[col] {
-                    let key = values::extract_fixed_key(&self.value_buffers[col], val_pos, w);
+        if let Some(ref dict) = self.byte_dict_maps[col] {
+            let mut val_pos = 0usize;
+            while val_pos < self.value_buffers[col].len() {
+                let value_start = val_pos;
+                if w > 0 {
                     val_pos += w as usize;
-                    *dict.get(&key).unwrap()
-                } else if let Some(ref dict) = self.byte_dict_maps[col] {
-                    let value_len = if w > 0 {
-                        w as usize
-                    } else {
-                        let var_len =
-                            varint::decode(&self.value_buffers[col], &mut val_pos.clone())
-                                .expect("internal varint in value buffer");
-                        varint::encoded_size(var_len) + var_len as usize
-                    };
-                    let slice = &self.value_buffers[col][val_pos..val_pos + value_len];
-                    val_pos += value_len;
-                    *dict.get(slice).unwrap()
                 } else {
-                    unreachable!()
-                };
+                    let value_len = varint::decode(&self.value_buffers[col], &mut val_pos)
+                        .expect("internal varint in value buffer");
+                    val_pos += value_len as usize;
+                }
+                let idx = *dict
+                    .get(&self.value_buffers[col][value_start..val_pos])
+                    .unwrap();
                 write_bit_packed(buf, data_start, bit_offset, idx, bw);
                 bit_offset += bw;
             }
+        } else {
+            unreachable!()
         }
+        debug_assert_eq!(bit_offset, self.non_null_counts[col] * bw);
         bit_offset
     }
 
-    fn dict_encoded_size(&self, col: usize) -> usize {
-        let (num_entries, entry_bytes) = if let Some(ref dict) = self.long_dict_maps[col] {
-            (dict.len(), dict.len() * self.fixed_widths[col] as usize)
-        } else if let Some(ref dict) = self.byte_dict_maps[col] {
+    fn byte_dict_encoded_size(&self, col: usize) -> usize {
+        if self.dict_tracking[col] != DictTracking::Active {
+            return usize::MAX;
+        }
+        let (num_entries, entry_bytes) = if let Some(ref dict) = self.byte_dict_maps[col] {
             let bytes: usize = dict.keys().map(|k| k.len()).sum();
             (dict.len(), bytes)
         } else {
@@ -845,7 +1458,7 @@ impl BucketWriter {
         varint::encoded_size(num_entries as u32) + entry_bytes + index_bytes
     }
 
-    fn compute_out_size(&self, encodings: &[u8], has_nulls: &[bool]) -> usize {
+    fn compute_out_size(&self, prepared: &PreparedBucket<'_>) -> usize {
         // Header: varint(num_primary) + varint(num_children) + varint per child
         let mut size = 0;
         if !self.children.is_empty() {
@@ -859,21 +1472,19 @@ impl BucketWriter {
         size += (self.total_columns * 2).div_ceil(8) + self.total_columns.div_ceil(8);
 
         for i in 0..self.total_columns {
-            if encodings[i] == ENCODING_ALL_NULL {
+            if prepared.encodings[i] == ENCODING_ALL_NULL {
                 continue;
             }
-            if has_nulls[i] {
+            if prepared.has_nulls[i] {
                 size += self.col_num_rows(i).div_ceil(8);
             }
-            match encodings[i] {
+            match prepared.encodings[i] {
                 ENCODING_CONST => {
                     size += self.first_value_len[i];
                 }
                 ENCODING_DICT => {
-                    if let Some(ref dict) = self.long_dict_maps[i] {
-                        let n = dict.len();
-                        size += varint::encoded_size(n as u32) + n * self.fixed_widths[i] as usize;
-                        size += (self.non_null_counts[i] * bit_width(n)).div_ceil(8);
+                    if let Some(ref dict) = prepared.fixed_dicts[i] {
+                        size += dict.encoded_size(self.fixed_widths[i]);
                     } else if let Some(ref dict) = self.byte_dict_maps[i] {
                         let n = dict.len();
                         size += varint::encoded_size(n as u32);
@@ -882,12 +1493,107 @@ impl BucketWriter {
                     }
                 }
                 ENCODING_PLAIN => {
-                    size += self.value_buffers[i].len();
+                    size += prepared.fixed_plain[i]
+                        .as_ref()
+                        .map_or(self.value_buffers[i].len(), Vec::len);
                 }
                 _ => {}
             }
         }
         size
+    }
+
+    fn column_page_size(&self, prepared: &PreparedBucket<'_>, col: usize) -> Option<usize> {
+        let null_bitmap_size = if prepared.has_nulls[col] {
+            self.col_num_rows(col).div_ceil(8)
+        } else {
+            0
+        };
+        match prepared.encodings[col] {
+            ENCODING_ALL_NULL => None,
+            ENCODING_CONST => prepared.has_nulls[col].then_some(null_bitmap_size),
+            ENCODING_DICT => {
+                let dict_size = if let Some(ref dict) = prepared.fixed_dicts[col] {
+                    dict.encoded_size(self.fixed_widths[col])
+                } else if let Some(ref dict) = self.byte_dict_maps[col] {
+                    let num_entries = dict.len();
+                    varint::encoded_size(num_entries as u32)
+                        + dict.keys().map(|key| key.len()).sum::<usize>()
+                        + (self.non_null_counts[col] * bit_width(num_entries)).div_ceil(8)
+                } else {
+                    unreachable!("dictionary encoding must have prepared dictionary data")
+                };
+                Some(null_bitmap_size + dict_size)
+            }
+            ENCODING_PLAIN => Some(
+                null_bitmap_size
+                    + prepared.fixed_plain[col]
+                        .as_ref()
+                        .map_or(self.value_buffers[col].len(), Vec::len),
+            ),
+            _ => unreachable!("unknown encoding"),
+        }
+    }
+}
+
+impl PreparedBucket<'_> {
+    pub(crate) fn estimated_raw_size(&self) -> usize {
+        self.writer.compute_out_size(self)
+    }
+
+    pub(crate) fn estimated_paged_size(&self) -> (usize, usize) {
+        let mut num_pages = 0;
+        let mut total_size = 0;
+        for col in 0..self.writer.total_columns {
+            if let Some(size) = self.writer.column_page_size(self, col) {
+                num_pages += 1;
+                total_size += size;
+            }
+        }
+        (num_pages, total_size)
+    }
+
+    pub(crate) fn finish(&self) -> Vec<u8> {
+        self.writer.finish_prepared(self)
+    }
+
+    pub(crate) fn finish_paged(&self) -> PagedBucketOutput {
+        self.writer.finish_paged_prepared(self)
+    }
+}
+
+fn append_null_bitmap(bitmap: &mut [u8], start_row: usize, nulls: &NullBuffer) {
+    debug_assert!(start_row + nulls.len() <= bitmap.len() * 8);
+
+    let chunks = nulls.inner().bit_chunks();
+    for (chunk, valid_bits) in chunks.iter().enumerate() {
+        or_null_bits(bitmap, start_row + chunk * 64, !valid_bits, 64);
+    }
+
+    let remainder_len = nulls.len() % 64;
+    if remainder_len != 0 {
+        let remainder_mask = (1u64 << remainder_len) - 1;
+        let null_bits = !chunks.remainder_bits() & remainder_mask;
+        or_null_bits(
+            bitmap,
+            start_row + nulls.len() - remainder_len,
+            null_bits,
+            remainder_len,
+        );
+    }
+}
+
+#[inline]
+fn or_null_bits(bitmap: &mut [u8], mut bit_offset: usize, mut bits: u64, mut len: usize) {
+    while len != 0 {
+        let byte_offset = bit_offset / 8;
+        let bit_in_byte = bit_offset % 8;
+        let take = len.min(8 - bit_in_byte);
+        let mask = ((1u16 << take) - 1) as u8;
+        bitmap[byte_offset] |= ((bits as u8) & mask) << bit_in_byte;
+        bits >>= take;
+        bit_offset += take;
+        len -= take;
     }
 }
 
@@ -1565,6 +2271,25 @@ fn uses_long_dict(fixed_width: i32) -> bool {
     fixed_width > 0 && fixed_width <= 8
 }
 
+#[inline]
+fn fixed_key_for_typed_value(typed: &TypedArrayRef<'_>, row: usize) -> Option<u64> {
+    match typed {
+        TypedArrayRef::Boolean(array) => Some(u64::from(array.value(row))),
+        TypedArrayRef::Int8(array) => Some(array.value(row) as u8 as u64),
+        TypedArrayRef::Int16(array) => Some(array.value(row) as u16 as u64),
+        TypedArrayRef::Int32(array) => Some(array.value(row) as u32 as u64),
+        TypedArrayRef::Date32(array) => Some(array.value(row) as u32 as u64),
+        TypedArrayRef::Time32(array) => Some(array.value(row) as u32 as u64),
+        TypedArrayRef::Int64(array) => Some(array.value(row) as u64),
+        TypedArrayRef::Decimal128Compact(array) => Some(array.value(row) as u64),
+        TypedArrayRef::TimestampMillis(array) => Some(array.value(row) as u64),
+        TypedArrayRef::TimestampMicros(array) => Some(array.value(row) as u64),
+        TypedArrayRef::Float32(array) => Some(array.value(row).to_bits() as u64),
+        TypedArrayRef::Float64(array) => Some(array.value(row).to_bits()),
+        _ => None,
+    }
+}
+
 fn bit_width(num_entries: usize) -> usize {
     if num_entries <= 1 {
         return 0;
@@ -1702,6 +2427,101 @@ mod tests {
     }
 
     #[test]
+    fn test_fixed_dict_encoding_matrix() {
+        for (data_type, width) in [
+            (DataType::Int8, 1),
+            (DataType::Int16, 2),
+            (DataType::Int32, 4),
+            (DataType::Int64, 8),
+        ] {
+            for distinct in [2, 255, 256] {
+                let values: ArrayRef = match width {
+                    1 => Arc::new(Int8Array::from(
+                        (0..10_000)
+                            .map(|row| (row % distinct) as i8)
+                            .collect::<Vec<_>>(),
+                    )),
+                    2 => Arc::new(Int16Array::from(
+                        (0..10_000)
+                            .map(|row| (row % distinct) as i16)
+                            .collect::<Vec<_>>(),
+                    )),
+                    4 => Arc::new(Int32Array::from(
+                        (0..10_000).map(|row| row % distinct).collect::<Vec<_>>(),
+                    )),
+                    8 => Arc::new(Int64Array::from(
+                        (0..10_000)
+                            .map(|row| (row % distinct) as i64)
+                            .collect::<Vec<_>>(),
+                    )),
+                    _ => unreachable!(),
+                };
+                let mut writer = BucketWriter::new(&[&data_type], 32768, 255);
+                writer
+                    .write_columns(&[values.as_ref()], &[&data_type])
+                    .unwrap();
+
+                let encoding = writer.finish()[0] & 0x03;
+                let expected = if distinct == 2 || (distinct == 255 && width > 1) {
+                    ENCODING_DICT
+                } else {
+                    ENCODING_PLAIN
+                };
+                assert_eq!(encoding, expected, "width={width}, distinct={distinct}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_incremental_fixed_dict_preserves_bit_pattern_keys() {
+        let mut dict = IncrementalFixedDict::new(4, 123);
+        assert_eq!(dict.slots.len(), 4);
+        assert_eq!(dict.lookup_or_insert(0, 4), Some(0));
+        assert_eq!(dict.lookup_or_insert(u64::MAX, 4), Some(1));
+        assert_eq!(dict.lookup_or_insert((-0.0_f64).to_bits(), 4), Some(2));
+        assert_eq!(dict.slots.len(), 8);
+        assert_eq!(dict.lookup_or_insert(0, 4), Some(0));
+        assert_eq!(dict.lookup_or_insert(u64::MAX, 4), Some(1));
+        assert_eq!(dict.lookup_or_insert((-0.0_f64).to_bits(), 4), Some(2));
+    }
+
+    #[test]
+    fn test_incremental_fixed_dict_does_not_preallocate_configured_maximum() {
+        let dict = IncrementalFixedDict::new(65_536, 123);
+        assert_eq!(dict.slots.len(), 4);
+    }
+
+    #[test]
+    fn test_u8_block_packing_matches_scalar_reference() {
+        for bit_width in 0usize..=8 {
+            for len in 0usize..=65 {
+                let mask = if bit_width == 8 {
+                    u8::MAX
+                } else {
+                    ((1u16 << bit_width) - 1) as u8
+                };
+                let indices = (0..len)
+                    .map(|index| (index as u8).wrapping_mul(37) & mask)
+                    .collect::<Vec<_>>();
+                let packed_size = (len * bit_width).div_ceil(8);
+                let mut expected = vec![0; packed_size];
+                for (position, &index) in indices.iter().enumerate() {
+                    write_bit_packed(
+                        &mut expected,
+                        0,
+                        position * bit_width,
+                        index as usize,
+                        bit_width,
+                    );
+                }
+                let mut actual = vec![0; packed_size];
+                write_u8_indices(&indices, &mut actual, bit_width);
+                assert_eq!(actual, expected, "bit_width={bit_width}, len={len}");
+            }
+        }
+    }
+
+    #[test]
     fn test_plain_encoding() {
         let types = [DataType::Int32];
         let type_refs: Vec<&DataType> = types.iter().collect();
@@ -1728,6 +2548,193 @@ mod tests {
         let data = writer.finish();
         let h = header_size(&data);
         assert_eq!(data[h] & 0x03, ENCODING_CONST);
+    }
+
+    #[test]
+    fn test_const_columns_do_not_build_dictionaries() {
+        let types = [DataType::Int32, DataType::Utf8];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let ints = Int32Array::from(vec![42; 100]);
+        let strings = StringArray::from(vec!["same"; 100]);
+        writer
+            .write_columns(&[&ints, &strings], &[&types[0], &types[1]])
+            .unwrap();
+
+        assert_eq!(writer.dict_tracking[0], DictTracking::Pending);
+        assert!(writer.byte_dict_maps[1].is_none());
+        assert_eq!(writer.dict_total_bytes[1], 0);
+    }
+
+    #[test]
+    fn test_dictionary_tracking_compacts_fixed_width_and_activates_variable_width() {
+        let types = [DataType::Int32, DataType::Utf8];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let const_ints = Int32Array::from(vec![42; 50]);
+        let const_strings = StringArray::from(vec!["same"; 50]);
+        writer
+            .write_columns(&[&const_ints, &const_strings], &[&types[0], &types[1]])
+            .unwrap();
+
+        let varied_ints = Int32Array::from(vec![42, 7, 42, 7]);
+        let varied_strings = StringArray::from(vec!["same", "other", "same", "other"]);
+        writer
+            .write_columns(&[&varied_ints, &varied_strings], &[&types[0], &types[1]])
+            .unwrap();
+
+        assert_eq!(
+            writer.dict_tracking,
+            vec![DictTracking::Active, DictTracking::Active]
+        );
+        let fixed = writer.fixed_dict_states[0].as_ref().unwrap();
+        assert_eq!(fixed.values.len(), 2);
+        assert_eq!(fixed.indices.len(), 54);
+        assert!(writer.value_buffers[0].is_empty());
+        assert_eq!(writer.byte_dict_maps[1].as_ref().unwrap().len(), 2);
+
+        let prepared = writer.prepare();
+        assert_eq!(prepared.fixed_dicts[0].as_ref().unwrap().values.len(), 2);
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        assert_eq!((data[0] >> 2) & 0x03, ENCODING_DICT);
+    }
+
+    #[test]
+    fn test_append_null_bitmap_handles_source_and_destination_offsets() {
+        let validity = BooleanBuffer::from(vec![
+            true, false, true, false, false, true, true, false, true, false, true,
+        ]);
+        let nulls = NullBuffer::new(validity).slice(2, 7);
+        let mut bitmap = vec![0b0000_0101, 0, 0];
+
+        append_null_bitmap(&mut bitmap, 3, &nulls);
+
+        assert_eq!(bitmap, vec![0b0011_0101, 0b0000_0001, 0]);
+    }
+
+    #[test]
+    fn test_append_null_bitmap_matches_scalar_copy_across_chunk_boundaries() {
+        for source_offset in 0..8 {
+            for destination_offset in 0..16 {
+                for len in [1, 7, 8, 9, 63, 64, 65, 127, 128, 129] {
+                    let validity: Vec<bool> = (0..source_offset + len)
+                        .map(|i| i % 3 != 0 && i % 11 != 0)
+                        .collect();
+                    let nulls = NullBuffer::new(BooleanBuffer::from(validity.clone()))
+                        .slice(source_offset, len);
+                    let mut actual = vec![0u8; (destination_offset + len).div_ceil(8) + 1];
+                    let mut expected = actual.clone();
+
+                    for row in 0..len {
+                        if !validity[source_offset + row] {
+                            let bit = destination_offset + row;
+                            expected[bit / 8] |= 1 << (bit % 8);
+                        }
+                    }
+                    append_null_bitmap(&mut actual, destination_offset, &nulls);
+
+                    assert_eq!(
+                        actual, expected,
+                        "source_offset={source_offset}, destination_offset={destination_offset}, len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nullable_timestamp_millis_batch_preserves_slices_and_append_offsets() {
+        let data_type = DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None);
+        let mut writer = BucketWriter::new(&[&data_type], 32768, 255);
+
+        let source = TimestampMillisecondArray::from(vec![
+            Some(99),
+            Some(10),
+            None,
+            Some(10),
+            Some(20),
+            None,
+        ]);
+        let first = source.slice(1, 4);
+        writer.write_columns(&[&first], &[&data_type]).unwrap();
+
+        let second = TimestampMillisecondArray::from(vec![None, Some(20), None]);
+        writer.write_columns(&[&second], &[&data_type]).unwrap();
+
+        assert_eq!(writer.num_rows, 7);
+        assert_eq!(writer.non_null_counts[0], 4);
+        assert_eq!(writer.null_bitmaps[0][0], 0b0101_0010);
+        assert!(writer.value_buffers[0].is_empty());
+        assert!(!writer.const_tracking[0]);
+        assert_eq!(writer.dict_tracking[0], DictTracking::Active);
+        let fixed = writer.fixed_dict_states[0].as_ref().unwrap();
+        assert_eq!(fixed.values.len(), 2);
+        assert_eq!(fixed.indices.len(), 4);
+        let prepared = writer.prepare();
+        assert_eq!(prepared.fixed_dicts[0].as_ref().unwrap().values.len(), 2);
+    }
+
+    #[test]
+    fn test_fixed_dict_overflow_reconstructs_plain_across_batches() {
+        let data_type = DataType::Int32;
+        let mut writer = BucketWriter::new(&[&data_type], 32768, 2);
+
+        let first = Int32Array::from(vec![1, 2, 1, 2]);
+        writer.write_columns(&[&first], &[&data_type]).unwrap();
+        assert_eq!(writer.dict_tracking[0], DictTracking::Active);
+        assert!(writer.value_buffers[0].is_empty());
+
+        let second = Int32Array::from(vec![3, 4]);
+        writer.write_columns(&[&second], &[&data_type]).unwrap();
+        assert_eq!(writer.dict_tracking[0], DictTracking::Disabled);
+        assert!(writer.fixed_dict_states[0].is_none());
+        assert_eq!(
+            writer.value_buffers[0],
+            [1_i32, 2, 1, 2, 3, 4]
+                .into_iter()
+                .flat_map(i32::to_be_bytes)
+                .collect::<Vec<_>>()
+        );
+
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_PLAIN);
+    }
+
+    #[test]
+    fn test_fixed_dict_stops_when_indices_cannot_beat_plain_across_batches() {
+        let data_type = DataType::Int8;
+        let mut writer = BucketWriter::new(&[&data_type], 32768, 255);
+
+        let first_values = (0..256).map(|row| (row % 128) as i8).collect::<Vec<_>>();
+        let first = Int8Array::from(first_values.clone());
+        writer.write_columns(&[&first], &[&data_type]).unwrap();
+        assert_eq!(writer.dict_tracking[0], DictTracking::Active);
+        assert!(writer.value_buffers[0].is_empty());
+        assert_eq!(
+            writer.fixed_dict_states[0].as_ref().unwrap().values.len(),
+            128
+        );
+
+        let second_values = vec![i8::MIN, 0, 1];
+        let second = Int8Array::from(second_values.clone());
+        writer.write_columns(&[&second], &[&data_type]).unwrap();
+
+        assert_eq!(writer.dict_tracking[0], DictTracking::Disabled);
+        assert!(writer.fixed_dict_states[0].is_none());
+        assert_eq!(
+            writer.value_buffers[0],
+            first_values
+                .into_iter()
+                .chain(second_values)
+                .map(|value| value as u8)
+                .collect::<Vec<_>>()
+        );
+
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_PLAIN);
     }
 
     #[test]
@@ -1823,6 +2830,52 @@ mod tests {
         assert_eq!(data[h] & 0x03, ENCODING_ALL_NULL);
         assert_eq!((data[h] >> 2) & 0x03, ENCODING_CONST);
         assert_eq!((data[h] >> 4) & 0x03, ENCODING_DICT);
+    }
+
+    #[test]
+    fn test_estimated_paged_size_matches_materialized_pages() {
+        let types = [
+            DataType::Int32,
+            DataType::Utf8,
+            DataType::Int64,
+            DataType::Float64,
+        ];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let all_null = Int32Array::new_null(100);
+        let const_with_nulls = StringArray::from(
+            (0..100)
+                .map(|row| (row % 5 != 0).then_some("same"))
+                .collect::<Vec<_>>(),
+        );
+        let dict_values =
+            Int64Array::from((0..100).map(|row| (row % 7) as i64).collect::<Vec<_>>());
+        let plain_values =
+            Float64Array::from((0..100).map(|row| row as f64 + 0.25).collect::<Vec<_>>());
+        writer
+            .write_columns(
+                &[&all_null, &const_with_nulls, &dict_values, &plain_values],
+                &[&types[0], &types[1], &types[2], &types[3]],
+            )
+            .unwrap();
+
+        let prepared = writer.prepare();
+        let estimated = prepared.estimated_paged_size();
+        let paged = prepared.finish_paged();
+        let actual_pages = paged
+            .column_pages
+            .iter()
+            .filter(|page| page.is_some())
+            .count();
+        let actual_size = paged
+            .column_pages
+            .iter()
+            .filter_map(|page| page.as_ref())
+            .map(Vec::len)
+            .sum();
+
+        assert_eq!(estimated, (actual_pages, actual_size));
     }
 
     #[test]

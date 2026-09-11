@@ -74,9 +74,18 @@ struct RowGroupMeta {
     stats: Vec<ColumnStats>,
 }
 
+enum EncodedBucket {
+    Paged {
+        output: PagedBucketOutput,
+        raw_size: usize,
+    },
+    Monolithic(Vec<u8>),
+}
+
 pub struct MosaicWriter<S: OutputFile> {
     out: S,
     schema: MosaicSchema,
+    serialized_schema: Vec<u8>,
     bucket_writers: Vec<Option<BucketWriter>>,
     active_buckets: Vec<usize>,
     num_buckets: usize,
@@ -96,15 +105,19 @@ pub struct MosaicWriter<S: OutputFile> {
     closed: bool,
 }
 
+fn batch_column_map(schema: &MosaicSchema) -> Vec<usize> {
+    let mut batch_col_map = vec![0; schema.original_order.len()];
+    for (input_index, &sorted_index) in schema.original_order.iter().enumerate() {
+        batch_col_map[sorted_index] = input_index;
+    }
+    batch_col_map
+}
+
 impl<S: OutputFile> MosaicWriter<S> {
     pub fn new(out: S, schema: &Schema, options: WriterOptions) -> io::Result<Self> {
         let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let batch_col_map: Vec<usize> = mosaic_schema
-            .columns
-            .iter()
-            .map(|col| schema.index_of(&col.name).unwrap())
-            .collect();
+        let batch_col_map = batch_column_map(&mosaic_schema);
         Self::from_mosaic_schema_with_map(out, mosaic_schema, options, batch_col_map)
     }
 
@@ -123,6 +136,10 @@ impl<S: OutputFile> MosaicWriter<S> {
         options: WriterOptions,
         batch_col_map: Vec<usize>,
     ) -> io::Result<Self> {
+        // Build the stable on-disk schema representation before any row-group data is
+        // buffered. This preserves the established file bytes while keeping schema BPE
+        // work out of the row-group flush/close burst.
+        let serialized_schema = schema.serialize();
         let num_buckets = schema.num_buckets;
         let mut bucket_writers = Vec::with_capacity(num_buckets);
 
@@ -190,6 +207,7 @@ impl<S: OutputFile> MosaicWriter<S> {
         Ok(MosaicWriter {
             out,
             schema,
+            serialized_schema,
             bucket_writers,
             active_buckets,
             num_buckets,
@@ -267,6 +285,10 @@ impl<S: OutputFile> MosaicWriter<S> {
             }
         }
 
+        self.write_batch_slice(batch)
+    }
+
+    fn write_batch_slice(&mut self, batch: &RecordBatch) -> io::Result<()> {
         let mut size = 0u64;
         for &b in &self.active_buckets {
             let global_indices = &self.schema.bucket_to_global[b];
@@ -279,15 +301,25 @@ impl<S: OutputFile> MosaicWriter<S> {
                 .map(|&gi| &self.schema.columns[gi].data_type)
                 .collect();
             let bw = self.bucket_writers[b].as_mut().unwrap();
-            size += bw.write_columns(&arrays, &data_types)? as u64;
+            size = size
+                .checked_add(bw.write_columns(&arrays, &data_types)? as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "buffered size overflow")
+                })?;
         }
 
         if let Some(ref mut collector) = self.stats_collector {
             collector.update_batch(batch);
         }
 
-        self.current_row_group_rows += batch.num_rows();
-        self.current_buffered_size += size;
+        self.current_row_group_rows = self
+            .current_row_group_rows
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "row count overflow"))?;
+        self.current_buffered_size = self
+            .current_buffered_size
+            .checked_add(size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "buffered size overflow"))?;
 
         if self.current_buffered_size >= self.row_group_max_size {
             self.flush_row_group()?;
@@ -307,55 +339,57 @@ impl<S: OutputFile> MosaicWriter<S> {
         let mut actual_uncompressed_sizes = vec![0usize; self.num_buckets];
         for ai in 0..num_active {
             let b = self.active_buckets[ai];
-            let bw = self.bucket_writers[b].as_ref().unwrap();
-            if bw.is_empty() {
-                continue;
-            }
-            let est_size = bw.estimated_raw_size();
-            let try_paged =
-                self.compression == COMPRESSION_ZSTD && est_size >= self.page_size_threshold;
-
-            let paged_output = if try_paged {
-                let paged = bw.finish_paged();
-                let num_pages = paged.column_pages.iter().filter(|p| p.is_some()).count();
-                let total: usize = paged
-                    .column_pages
-                    .iter()
-                    .filter_map(|p| p.as_ref())
-                    .map(|p| p.len())
-                    .sum();
-                let avg_ok = total
-                    .checked_div(num_pages)
-                    .is_some_and(|avg| avg >= self.page_size_threshold);
-                if avg_ok {
-                    Some(paged)
-                } else {
-                    None
+            let encoded = {
+                let bw = self.bucket_writers[b].as_ref().unwrap();
+                if bw.is_empty() {
+                    continue;
                 }
-            } else {
-                None
+                let prepared = bw.prepare();
+                let est_size = prepared.estimated_raw_size();
+                let try_paged =
+                    self.compression == COMPRESSION_ZSTD && est_size >= self.page_size_threshold;
+
+                if try_paged {
+                    let (num_pages, raw_size) = prepared.estimated_paged_size();
+                    let avg_ok = raw_size
+                        .checked_div(num_pages)
+                        .is_some_and(|avg| avg >= self.page_size_threshold);
+                    if avg_ok {
+                        let output = prepared.finish_paged();
+                        debug_assert_eq!(
+                            raw_size,
+                            output
+                                .column_pages
+                                .iter()
+                                .filter_map(|page| page.as_ref())
+                                .map(|page| page.len())
+                                .sum()
+                        );
+                        EncodedBucket::Paged { output, raw_size }
+                    } else {
+                        EncodedBucket::Monolithic(prepared.finish())
+                    }
+                } else {
+                    EncodedBucket::Monolithic(prepared.finish())
+                }
             };
 
-            if let Some(paged) = paged_output {
-                let paged_raw_size: usize = paged
-                    .column_pages
-                    .iter()
-                    .filter_map(|p| p.as_ref())
-                    .map(|p| p.len())
-                    .sum();
-                let total_size = self.write_paged_bucket(&paged)?;
-                bucket_layouts[b] = BucketLayout::Paged { total_size };
-                actual_uncompressed_sizes[b] = paged_raw_size;
-                bucket_offsets[b] = self.out.pos() - total_size as u64;
-            } else {
-                let raw = self.bucket_writers[b].as_ref().unwrap().finish();
-                let comp_size = self.write_compressed(&raw)?;
-                bucket_layouts[b] = BucketLayout::Monolithic {
-                    compressed_size: comp_size,
-                    uncompressed_size: raw.len(),
-                };
-                actual_uncompressed_sizes[b] = raw.len();
-                bucket_offsets[b] = self.out.pos() - comp_size as u64;
+            match encoded {
+                EncodedBucket::Paged { output, raw_size } => {
+                    let total_size = self.write_paged_bucket(&output)?;
+                    bucket_layouts[b] = BucketLayout::Paged { total_size };
+                    actual_uncompressed_sizes[b] = raw_size;
+                    bucket_offsets[b] = self.out.pos() - total_size as u64;
+                }
+                EncodedBucket::Monolithic(raw) => {
+                    let comp_size = self.write_compressed(&raw)?;
+                    bucket_layouts[b] = BucketLayout::Monolithic {
+                        compressed_size: comp_size,
+                        uncompressed_size: raw.len(),
+                    };
+                    actual_uncompressed_sizes[b] = raw.len();
+                    bucket_offsets[b] = self.out.pos() - comp_size as u64;
+                }
             }
         }
 
@@ -501,8 +535,8 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         self.flush_row_group()?;
 
-        // Write schema block
-        let schema_raw = self.schema.serialize();
+        // Write the exact adaptive schema representation prepared at construction.
+        let schema_raw = &self.serialized_schema;
         let schema_block_offset = self.out.pos();
 
         let uncomp_size = to_u32(schema_raw.len(), "schema uncompressed size")?;
@@ -510,11 +544,11 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         match self.compression {
             COMPRESSION_NONE => {
-                self.out.write(&schema_raw)?;
+                self.out.write(schema_raw)?;
             }
             COMPRESSION_ZSTD => {
                 let compressed =
-                    zstd::bulk::compress(&schema_raw, self.zstd_level).map_err(io::Error::other)?;
+                    zstd::bulk::compress(schema_raw, self.zstd_level).map_err(io::Error::other)?;
                 self.out.write(&compressed)?;
             }
             _ => {
@@ -612,6 +646,18 @@ mod tests {
         fn pos(&self) -> u64 {
             self.buf.len() as u64
         }
+    }
+
+    #[test]
+    fn test_batch_column_map_inverts_original_order() {
+        let arrow_schema = Schema::new(vec![
+            Field::new("zebra", DataType::Int32, true),
+            Field::new("alpha", DataType::Int32, true),
+            Field::new("middle", DataType::Int32, true),
+        ]);
+        let mosaic_schema = MosaicSchema::from_arrow(&arrow_schema, 2).unwrap();
+
+        assert_eq!(batch_column_map(&mosaic_schema), vec![1, 2, 0]);
     }
 
     #[test]
