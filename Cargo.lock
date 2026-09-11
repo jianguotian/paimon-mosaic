@@ -921,6 +921,7 @@ dependencies = [
  "arrow-schema",
  "jni",
  "paimon-mosaic-core",
+ "ryu",
 ]
 
 [[package]]
