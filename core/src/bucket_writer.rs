@@ -629,6 +629,7 @@ impl BucketWriter {
         }
 
         let mut col_size = 0usize;
+        let use_direct_fixed_keys = uses_long_dict(self.fixed_widths[col]);
         for row in 0..num_new_rows {
             let abs_row = start_row + row;
             if array.is_null(row) {
@@ -640,7 +641,15 @@ impl BucketWriter {
                 let written = self.value_buffers[col].len() - before;
                 col_size += written;
 
-                self.track_encoding_value(col, before, written);
+                self.track_encoding_value(
+                    col,
+                    before,
+                    written,
+                    use_direct_fixed_keys.then(|| {
+                        fixed_key_for_typed_value(&typed, row)
+                            .expect("fixed-width primitive must provide a dictionary key")
+                    }),
+                );
             }
         }
         self.finish_fixed_dict_batch(col, fixed_dict_was_active, previous_non_null_count);
@@ -773,7 +782,7 @@ impl BucketWriter {
         } else {
             for i in 0..num_rows {
                 self.non_null_counts[col] += 1;
-                self.track_encoding_value(col, before_all + i * fw, fw);
+                self.track_encoding_value(col, before_all + i * fw, fw, None);
                 if !self.needs_encoding_tracking(col) {
                     self.non_null_counts[col] += num_rows - i - 1;
                     break;
@@ -915,7 +924,7 @@ impl BucketWriter {
             self.non_null_counts[col] += 1;
 
             if track_encoding {
-                self.track_encoding_value(col, before, 8);
+                self.track_encoding_value(col, before, 8, Some(values[row] as u64));
                 track_encoding = self.needs_encoding_tracking(col);
             }
         }
@@ -927,7 +936,13 @@ impl BucketWriter {
         self.const_tracking[col] || self.dict_tracking[col] != DictTracking::Disabled
     }
 
-    fn track_encoding_value(&mut self, col: usize, value_start: usize, value_len: usize) {
+    fn track_encoding_value(
+        &mut self,
+        col: usize,
+        value_start: usize,
+        value_len: usize,
+        fixed_key: Option<u64>,
+    ) {
         if self.non_null_counts[col] == 1 {
             self.first_value_len[col] = value_len;
             return;
@@ -943,7 +958,7 @@ impl BucketWriter {
             self.const_tracking[col] = false;
             self.activate_dict_tracking(col, value_start, value_len);
         } else {
-            self.track_dict_value(col, value_start, value_len);
+            self.track_dict_value(col, value_start, value_len, fixed_key);
         }
     }
 
@@ -985,23 +1000,31 @@ impl BucketWriter {
             .clear();
         self.dict_tracking[col] = DictTracking::Active;
 
-        self.track_dict_value(col, 0, self.first_value_len[col]);
+        self.track_dict_value(col, 0, self.first_value_len[col], None);
         if self.dict_tracking[col] == DictTracking::Active {
-            self.track_dict_value(col, value_start, value_len);
+            self.track_dict_value(col, value_start, value_len, None);
         }
     }
 
-    fn track_dict_value(&mut self, col: usize, value_start: usize, value_len: usize) {
+    fn track_dict_value(
+        &mut self,
+        col: usize,
+        value_start: usize,
+        value_len: usize,
+        fixed_key: Option<u64>,
+    ) {
         if self.dict_tracking[col] != DictTracking::Active {
             return;
         }
 
         if uses_long_dict(self.fixed_widths[col]) {
-            let key = values::extract_fixed_key(
-                &self.value_buffers[col],
-                value_start,
-                self.fixed_widths[col],
-            );
+            let key = fixed_key.unwrap_or_else(|| {
+                values::extract_fixed_key(
+                    &self.value_buffers[col],
+                    value_start,
+                    self.fixed_widths[col],
+                )
+            });
             let fallback_to_plain = {
                 let state = self.fixed_dict_states[col]
                     .as_mut()
@@ -2245,6 +2268,25 @@ fn expand_element(
 
 fn uses_long_dict(fixed_width: i32) -> bool {
     fixed_width > 0 && fixed_width <= 8
+}
+
+#[inline]
+fn fixed_key_for_typed_value(typed: &TypedArrayRef<'_>, row: usize) -> Option<u64> {
+    match typed {
+        TypedArrayRef::Boolean(array) => Some(u64::from(array.value(row))),
+        TypedArrayRef::Int8(array) => Some(array.value(row) as u8 as u64),
+        TypedArrayRef::Int16(array) => Some(array.value(row) as u16 as u64),
+        TypedArrayRef::Int32(array) => Some(array.value(row) as u32 as u64),
+        TypedArrayRef::Date32(array) => Some(array.value(row) as u32 as u64),
+        TypedArrayRef::Time32(array) => Some(array.value(row) as u32 as u64),
+        TypedArrayRef::Int64(array) => Some(array.value(row) as u64),
+        TypedArrayRef::Decimal128Compact(array) => Some(array.value(row) as u64),
+        TypedArrayRef::TimestampMillis(array) => Some(array.value(row) as u64),
+        TypedArrayRef::TimestampMicros(array) => Some(array.value(row) as u64),
+        TypedArrayRef::Float32(array) => Some(array.value(row).to_bits() as u64),
+        TypedArrayRef::Float64(array) => Some(array.value(row).to_bits()),
+        _ => None,
+    }
 }
 
 fn bit_width(num_entries: usize) -> usize {
