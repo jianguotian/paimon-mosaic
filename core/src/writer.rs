@@ -35,10 +35,56 @@ fn to_u32(val: usize, field: &str) -> io::Result<u32> {
     })
 }
 
+fn check_zstd_block_size(size: usize, field: &str) -> io::Result<()> {
+    if size > MAX_ZSTD_DECOMPRESS_BLOCK_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} ({}) exceeds max zstd decompressed block size ({})",
+                field, size, MAX_ZSTD_DECOMPRESS_BLOCK_SIZE
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub trait OutputFile {
     fn write(&mut self, data: &[u8]) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
     fn pos(&self) -> u64;
+}
+
+/// File-backed [`OutputFile`] sink that tracks its own write position. The
+/// standard sink for writing a Mosaic file to disk; shared by the CLI and tests.
+pub struct FileSink {
+    f: std::fs::File,
+    pos: u64,
+}
+
+impl FileSink {
+    /// Create or truncate `path` for writing.
+    pub fn create(path: &std::path::Path) -> io::Result<Self> {
+        Ok(Self {
+            f: std::fs::File::create(path)?,
+            pos: 0,
+        })
+    }
+}
+
+impl OutputFile for FileSink {
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        use io::Write;
+        self.f.write_all(data)?;
+        self.pos += data.len() as u64;
+        Ok(())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        use io::Write;
+        self.f.flush()
+    }
+    fn pos(&self) -> u64 {
+        self.pos
+    }
 }
 
 pub struct WriterOptions {
@@ -74,6 +120,13 @@ struct RowGroupMeta {
     stats: Vec<ColumnStats>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriterState {
+    Open,
+    Aborted,
+    Closed,
+}
+
 pub struct MosaicWriter<S: OutputFile> {
     out: S,
     schema: MosaicSchema,
@@ -93,7 +146,7 @@ pub struct MosaicWriter<S: OutputFile> {
     total_uncompressed: u64,
     total_compressed: u64,
     stats_collector: Option<StatsCollector>,
-    closed: bool,
+    state: WriterState,
 }
 
 fn batch_column_map(schema: &MosaicSchema) -> Vec<usize> {
@@ -209,7 +262,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             total_uncompressed: 0,
             total_compressed: 0,
             stats_collector,
-            closed: false,
+            state: WriterState::Open,
         })
     }
 
@@ -240,12 +293,36 @@ impl<S: OutputFile> MosaicWriter<S> {
     }
 
     pub fn write_batch(&mut self, batch: &RecordBatch) -> io::Result<()> {
-        if self.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "writer is already closed",
-            ));
+        match self.state {
+            WriterState::Open => {}
+            WriterState::Aborted => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writer is aborted after a previous failure",
+                ));
+            }
+            WriterState::Closed => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writer is already closed",
+                ));
+            }
         }
+
+        self.validate_batch(batch)?;
+
+        // From this point on, an error or panic can leave bucket, row-group, or output state
+        // partially advanced. Keep the writer aborted until the whole operation succeeds so
+        // retry, close, and Drop cannot flush a batch whose write was reported as failed.
+        self.state = WriterState::Aborted;
+        let result = self.write_batch_mutating(batch);
+        if result.is_ok() {
+            self.state = WriterState::Open;
+        }
+        result
+    }
+
+    fn validate_batch(&self, batch: &RecordBatch) -> io::Result<()> {
         let num_cols = self.schema.columns.len();
         if batch.num_columns() != num_cols {
             return Err(io::Error::new(
@@ -259,18 +336,33 @@ impl<S: OutputFile> MosaicWriter<S> {
         }
 
         for (i, col) in self.schema.columns.iter().enumerate() {
-            if !col.nullable && batch.column(self.batch_col_map[i]).null_count() > 0 {
+            let array = batch.column(self.batch_col_map[i]);
+            if array.data_type() != &col.data_type {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "column '{}' type mismatch: expected {:?}, got {:?}",
+                        col.name,
+                        col.data_type,
+                        array.data_type()
+                    ),
+                ));
+            }
+            if !col.nullable && array.null_count() > 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
                         "non-nullable column '{}' has {} nulls in batch",
                         col.name,
-                        batch.column(self.batch_col_map[i]).null_count()
+                        array.null_count()
                     ),
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn write_batch_mutating(&mut self, batch: &RecordBatch) -> io::Result<()> {
         let mut size = 0u64;
         for &b in &self.active_buckets {
             let global_indices = &self.schema.bucket_to_global[b];
@@ -406,6 +498,7 @@ impl<S: OutputFile> MosaicWriter<S> {
                 Ok(raw.len())
             }
             COMPRESSION_ZSTD => {
+                check_zstd_block_size(raw.len(), "bucket uncompressed size")?;
                 let compressed =
                     zstd::bulk::compress(raw, self.zstd_level).map_err(io::Error::other)?;
                 self.out.write(&compressed)?;
@@ -455,6 +548,7 @@ impl<S: OutputFile> MosaicWriter<S> {
 
             // Compress and build on-disk slot: uncompressed_size varint + compressed data
             let uncompressed_size = page_content.len();
+            check_zstd_block_size(uncompressed_size, "page uncompressed size")?;
             let compressed =
                 zstd::bulk::compress(&page_content, self.zstd_level).map_err(io::Error::other)?;
             let mut slot = Vec::new();
@@ -498,11 +592,27 @@ impl<S: OutputFile> MosaicWriter<S> {
     }
 
     pub fn close(&mut self) -> io::Result<()> {
-        if self.closed {
-            return Ok(());
+        match self.state {
+            WriterState::Closed => return Ok(()),
+            WriterState::Aborted => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writer is aborted after a previous failure",
+                ));
+            }
+            WriterState::Open => {}
         }
-        self.closed = true;
+        // Closing mutates row-group metadata and the output stream. Keep failures sticky so a
+        // retry cannot report success for a file whose footer or final flush was not completed.
+        self.state = WriterState::Aborted;
+        let result = self.close_inner();
+        if result.is_ok() {
+            self.state = WriterState::Closed;
+        }
+        result
+    }
 
+    fn close_inner(&mut self) -> io::Result<()> {
         self.flush_row_group()?;
 
         // Write schema block
@@ -517,6 +627,7 @@ impl<S: OutputFile> MosaicWriter<S> {
                 self.out.write(&schema_raw)?;
             }
             COMPRESSION_ZSTD => {
+                check_zstd_block_size(schema_raw.len(), "schema uncompressed size")?;
                 let compressed =
                     zstd::bulk::compress(&schema_raw, self.zstd_level).map_err(io::Error::other)?;
                 self.out.write(&compressed)?;
@@ -581,7 +692,7 @@ impl<S: OutputFile> MosaicWriter<S> {
 
 impl<S: OutputFile> Drop for MosaicWriter<S> {
     fn drop(&mut self) {
-        if !self.closed {
+        if self.state == WriterState::Open {
             if let Err(e) = self.close() {
                 eprintln!("MosaicWriter::drop: close failed: {}", e);
             }
@@ -593,7 +704,7 @@ impl<S: OutputFile> Drop for MosaicWriter<S> {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     struct MemOutputFile {
         buf: Vec<u8>,
@@ -616,6 +727,137 @@ mod tests {
         fn pos(&self) -> u64 {
             self.buf.len() as u64
         }
+    }
+
+    #[derive(Default)]
+    struct FailingOutputState {
+        write_calls: usize,
+        flush_calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    struct FailOnceOutputFile {
+        state: Arc<Mutex<FailingOutputState>>,
+        fail: bool,
+    }
+
+    impl OutputFile for FailOnceOutputFile {
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.write_calls += 1;
+            if self.fail {
+                self.fail = false;
+                return Err(io::Error::other("sentinel output failure"));
+            }
+            state.bytes.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.state.lock().unwrap().flush_calls += 1;
+            Ok(())
+        }
+
+        fn pos(&self) -> u64 {
+            self.state.lock().unwrap().bytes.len() as u64
+        }
+    }
+
+    #[test]
+    fn test_write_failure_aborts_writer_without_retry_or_drop_flush() {
+        let arrow_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![7]))],
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(FailingOutputState::default()));
+
+        {
+            let out = FailOnceOutputFile {
+                state: Arc::clone(&state),
+                fail: true,
+            };
+            let mut writer = MosaicWriter::new(
+                out,
+                &arrow_schema,
+                WriterOptions {
+                    compression: COMPRESSION_NONE,
+                    num_buckets: 1,
+                    row_group_max_size: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let error = writer.write_batch(&batch).unwrap_err();
+            assert_eq!("sentinel output failure", error.to_string());
+            let calls_after_failure = state.lock().unwrap().write_calls;
+            assert_eq!(1, calls_after_failure);
+
+            let retry_error = writer.write_batch(&batch).unwrap_err();
+            assert!(retry_error
+                .to_string()
+                .contains("writer is aborted after a previous failure"));
+            assert_eq!(calls_after_failure, state.lock().unwrap().write_calls);
+
+            let close_error = writer.close().unwrap_err();
+            assert!(close_error
+                .to_string()
+                .contains("writer is aborted after a previous failure"));
+            assert_eq!(calls_after_failure, state.lock().unwrap().write_calls);
+        }
+
+        let state = state.lock().unwrap();
+        assert_eq!(1, state.write_calls);
+        assert_eq!(0, state.flush_calls);
+        assert!(state.bytes.is_empty());
+    }
+
+    #[test]
+    fn test_close_failure_aborts_writer_without_retry_or_drop_flush() {
+        let arrow_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![7]))],
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(FailingOutputState::default()));
+
+        {
+            let out = FailOnceOutputFile {
+                state: Arc::clone(&state),
+                fail: true,
+            };
+            let mut writer = MosaicWriter::new(
+                out,
+                &arrow_schema,
+                WriterOptions {
+                    compression: COMPRESSION_NONE,
+                    num_buckets: 1,
+                    row_group_max_size: u64::MAX,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            writer.write_batch(&batch).unwrap();
+            let error = writer.close().unwrap_err();
+            assert_eq!("sentinel output failure", error.to_string());
+            let calls_after_failure = state.lock().unwrap().write_calls;
+            assert_eq!(1, calls_after_failure);
+
+            let retry_error = writer.close().unwrap_err();
+            assert!(retry_error
+                .to_string()
+                .contains("writer is aborted after a previous failure"));
+            assert_eq!(calls_after_failure, state.lock().unwrap().write_calls);
+        }
+
+        let state = state.lock().unwrap();
+        assert_eq!(1, state.write_calls);
+        assert_eq!(0, state.flush_calls);
+        assert!(state.bytes.is_empty());
     }
 
     #[test]

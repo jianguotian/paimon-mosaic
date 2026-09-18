@@ -20,15 +20,31 @@
 package org.apache.paimon.mosaic;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.lang.ref.WeakReference;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.arrow.c.jni.JniWrapper;
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.DecimalVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
@@ -57,7 +73,196 @@ import static org.junit.Assert.*;
 
 public class MosaicRoundtripTest {
 
+    private static final long TINY_DOUBLE_ROUNDING_REGRESSION_BITS = 0x3d20000000000000L;
+    private static final long LARGE_DOUBLE_ROUNDING_REGRESSION_BITS = 0x43d406c0c77e23e0L;
+    // Produces enough JSON to force more than one native-to-Java output callback.
+    private static final int ROW_COUNT_FOR_MULTIPLE_OUTPUT_WRITES = 500_000;
+
     private BufferAllocator allocator;
+
+    private static final class InjectableListVector extends ListVector {
+
+        private InjectableListVector(String name, BufferAllocator allocator) {
+            super(name, allocator, FieldType.nullable(ArrowType.List.INSTANCE), null);
+        }
+
+        private void setDataVector(FieldVector vector) {
+            replaceDataVector(vector);
+        }
+    }
+
+    private static final class InjectedExportException extends RuntimeException {}
+
+    private static final class FailOnceListVector extends ListVector {
+
+        private boolean fail = true;
+
+        private FailOnceListVector(String name, BufferAllocator allocator) {
+            super(name, allocator, FieldType.nullable(ArrowType.List.INSTANCE), null);
+            replaceDataVector(new IntVector(ListVector.DATA_VECTOR_NAME, allocator));
+        }
+
+        @Override
+        public List<ArrowBuf> getFieldBuffers() {
+            if (fail) {
+                fail = false;
+                throw new InjectedExportException();
+            }
+            return super.getFieldBuffers();
+        }
+    }
+
+    private enum FailurePoint {
+        WRITE,
+        FLUSH
+    }
+
+    private static final class FailOnceOutputStream extends OutputStream {
+
+        private final ByteArrayOutputStream delegate = new ByteArrayOutputStream();
+        private final FailurePoint failurePoint;
+        private final int failOnWriteCall;
+        private final IllegalStateException failureCause;
+        private final IOException failure;
+        private boolean failed;
+        private int writeCalls;
+        private int flushCalls;
+
+        private FailOnceOutputStream(FailurePoint failurePoint, String message) {
+            this(failurePoint, 1, message);
+        }
+
+        private FailOnceOutputStream(
+                FailurePoint failurePoint, int failOnWriteCall, String message) {
+            this.failurePoint = failurePoint;
+            this.failOnWriteCall = failOnWriteCall;
+            this.failureCause = new IllegalStateException(message + "-cause");
+            this.failure = new IOException(message, failureCause);
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            write(new byte[] {(byte) value}, 0, 1);
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length) throws IOException {
+            writeCalls++;
+            if (!failed
+                    && failurePoint == FailurePoint.WRITE
+                    && writeCalls == failOnWriteCall) {
+                failed = true;
+                throw failure;
+            }
+            delegate.write(bytes, offset, length);
+        }
+
+        @Override
+        public void flush() throws IOException {
+            flushCalls++;
+            if (!failed && failurePoint == FailurePoint.FLUSH) {
+                failed = true;
+                throw failure;
+            }
+        }
+
+        private int size() {
+            return delegate.size();
+        }
+    }
+
+    private static final class ReentrantWriteOutputStream extends ByteArrayOutputStream {
+
+        private final MosaicRowGroupReader rowGroup;
+        private Throwable reentrantFailure;
+        private boolean attempted;
+
+        private ReentrantWriteOutputStream(MosaicRowGroupReader rowGroup) {
+            this.rowGroup = rowGroup;
+        }
+
+        @Override
+        public synchronized void write(byte[] bytes, int offset, int length) {
+            if (!attempted) {
+                attempted = true;
+                try {
+                    ColumnarTextJsonWriter.write(rowGroup, new ByteArrayOutputStream());
+                } catch (Throwable failure) {
+                    reentrantFailure = failure;
+                }
+            }
+            super.write(bytes, offset, length);
+        }
+    }
+
+    private static final class CloseOnFirstWriteOutputStream extends ByteArrayOutputStream {
+
+        private final MosaicRowGroupReader rowGroup;
+        private boolean closeRequested;
+        private int writeCalls;
+        private int firstWriteBytes;
+        private long nativeHandleAfterClose;
+
+        private CloseOnFirstWriteOutputStream(MosaicRowGroupReader rowGroup) {
+            this.rowGroup = rowGroup;
+        }
+
+        @Override
+        public synchronized void write(byte[] bytes, int offset, int length) {
+            writeCalls++;
+            if (!closeRequested) {
+                closeRequested = true;
+                firstWriteBytes = length;
+                rowGroup.close();
+                nativeHandleAfterClose = nativeHandle(rowGroup);
+            }
+            super.write(bytes, offset, length);
+        }
+    }
+
+    private static final class BlockingWriteOutputStream extends ByteArrayOutputStream {
+
+        private final CountDownLatch enteredWrite = new CountDownLatch(1);
+        private final CountDownLatch releaseWrite = new CountDownLatch(1);
+        private boolean blocked;
+        private int writeCalls;
+        private int firstWriteBytes;
+
+        @Override
+        public synchronized void write(byte[] bytes, int offset, int length) {
+            writeCalls++;
+            if (!blocked) {
+                blocked = true;
+                firstWriteBytes = length;
+                enteredWrite.countDown();
+                try {
+                    releaseWrite.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while blocking native output", e);
+                }
+            }
+            super.write(bytes, offset, length);
+        }
+    }
+
+    private static final class OwnershipTrackingOutputStream extends ByteArrayOutputStream {
+
+        private int flushCalls;
+        private int closeCalls;
+
+        @Override
+        public void flush() throws IOException {
+            flushCalls++;
+            throw new IOException("unexpected flush");
+        }
+
+        @Override
+        public void close() throws IOException {
+            closeCalls++;
+            throw new IOException("unexpected close");
+        }
+    }
 
     @Before
     public void setUp() {
@@ -81,11 +286,30 @@ public class MosaicRoundtripTest {
         return baos.toByteArray();
     }
 
-    private MosaicReader readerFromBytes(byte[] data) {
+    private MosaicReader readerFromBytes(byte[] data) throws IOException {
         InputFile inputFile = (position, buffer, offset, length) -> {
             System.arraycopy(data, (int) position, buffer, offset, length);
         };
         return MosaicReader.open(inputFile, data.length, allocator);
+    }
+
+    private static long nativeHandle(MosaicRowGroupReader rowGroup) {
+        try {
+            java.lang.reflect.Field field =
+                    MosaicRowGroupReader.class.getDeclaredField("handle");
+            field.setAccessible(true);
+            return field.getLong(rowGroup);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("cannot inspect row-group native handle", e);
+        }
+    }
+
+    private static Schema wideIntSchema(int width) {
+        List<Field> fields = new ArrayList<>(width);
+        for (int i = 0; i < width; i++) {
+            fields.add(Field.nullable("c" + i, new ArrowType.Int(32, true)));
+        }
+        return new Schema(fields);
     }
 
     private static void awaitGarbageCollection(WeakReference<?> reference) throws InterruptedException {
@@ -94,7 +318,14 @@ public class MosaicRoundtripTest {
             System.runFinalization();
             Thread.sleep(50L);
         }
-        assertNull("expected input file to be released after failed open", reference.get());
+        assertNull("expected native callback object to be released", reference.get());
+    }
+
+    private static void awaitGarbageCollection(List<WeakReference<?>> references)
+            throws InterruptedException {
+        for (WeakReference<?> reference : references) {
+            awaitGarbageCollection(reference);
+        }
     }
 
     private WeakReference<InputFile> openReaderWithClosedAllocator(byte[] data) {
@@ -113,8 +344,96 @@ public class MosaicRoundtripTest {
         return reference;
     }
 
+    private List<WeakReference<?>> openReaderWithFailingInput() {
+        IOException expected = new IOException("intentional native input failure");
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        throw expected;
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        try (MosaicReader ignored = MosaicReader.open(inputFile, 64L, allocator)) {
+            fail("expected IOException");
+        } catch (IOException error) {
+            assertSame(expected, error);
+        }
+        return Arrays.asList(inputReference, exceptionReference);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <E extends Throwable> void throwUnchecked(Throwable failure) throws E {
+        throw (E) failure;
+    }
+
+    private WeakReference<InputFile> openReaderWithCheckedAllocatorFailure(byte[] data)
+            throws Exception {
+        IOException expected = new IOException("schema allocation callback failed");
+        InputFile input = (position, buffer, offset, length) ->
+                System.arraycopy(data, (int) position, buffer, offset, length);
+        WeakReference<InputFile> reference = new WeakReference<>(input);
+        try (BufferAllocator failingAllocator = new RootAllocator() {
+            @Override
+            public ArrowBuf buffer(long size) {
+                MosaicRoundtripTest.<RuntimeException>throwUnchecked(expected);
+                throw new AssertionError("unreachable");
+            }
+        }) {
+            assertSame(expected, assertThrows(IOException.class,
+                    () -> MosaicReader.open(input, data.length, failingAllocator)));
+        }
+        return reference;
+    }
+
+    private List<WeakReference<?>> readRowGroupWithFailingInput(byte[] data) throws IOException {
+        IOException expected = new IOException("intentional native background input failure");
+        long callingThreadId = Thread.currentThread().getId();
+        AtomicBoolean failReads = new AtomicBoolean();
+        AtomicInteger reads = new AtomicInteger();
+        AtomicLong failingThreadId = new AtomicLong(-1L);
+        InputFile inputFile =
+                new InputFile() {
+                    @Override
+                    public void readFully(
+                            long position, byte[] buffer, int offset, int length)
+                            throws IOException {
+                        reads.incrementAndGet();
+                        if (failReads.get()) {
+                            failingThreadId.compareAndSet(
+                                    -1L, Thread.currentThread().getId());
+                            throw expected;
+                        }
+                        System.arraycopy(data, (int) position, buffer, offset, length);
+                    }
+                };
+        WeakReference<InputFile> inputReference = new WeakReference<>(inputFile);
+        WeakReference<IOException> exceptionReference = new WeakReference<>(expected);
+
+        MosaicReader reader = MosaicReader.open(inputFile, data.length, allocator);
+        int readsAfterOpen = reads.get();
+        try {
+            failReads.set(true);
+            try (VectorSchemaRoot ignored = reader.readRowGroup(0, allocator)) {
+                fail("expected IOException");
+            } catch (IOException actual) {
+                assertSame(expected, actual);
+            }
+            assertTrue("expected a row-group read", reads.get() > readsAfterOpen);
+            assertNotEquals(callingThreadId, failingThreadId.get());
+            assertEquals(1, reader.numRowGroups());
+        } finally {
+            reader.close();
+        }
+        return Arrays.asList(inputReference, exceptionReference);
+    }
+
     @Test
-    public void testBasicRoundtrip() {
+    public void testBasicRoundtrip() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.notNullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -182,7 +501,634 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testNullValues() {
+    public void testWriteFromIndependentRootAllocator() throws IOException {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", ArrowType.Utf8.INSTANCE)
+        ));
+
+        byte[] data;
+        try (BufferAllocator inputAllocator = new RootAllocator();
+             VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            VarCharVector names = (VarCharVector) root.getVector("name");
+
+            ids.allocateNew(3);
+            names.allocateNew(3);
+            for (int i = 0; i < 3; i++) {
+                ids.set(i, i + 1);
+                names.setSafe(i, ("input_" + i).getBytes());
+            }
+            root.setRowCount(3);
+
+            data = writeToBytes(arrowSchema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(3, batch.getRowCount());
+            IntVector ids = (IntVector) batch.getVector("id");
+            VarCharVector names = (VarCharVector) batch.getVector("name");
+            for (int i = 0; i < 3; i++) {
+                assertEquals(i + 1, ids.get(i));
+                assertEquals("input_" + i, new String(names.get(i)));
+            }
+        }
+    }
+
+    @Test
+    public void testWriteFromLimitedChildAllocator() throws IOException {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (BufferAllocator inputRoot = new RootAllocator();
+             BufferAllocator limitedAllocator =
+                     inputRoot.newChildAllocator("limited-input", 0, 512);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, limitedAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+
+            long inputBytes = inputRoot.getAllocatedMemory();
+            long inputPeak = limitedAllocator.getPeakMemoryAllocation();
+            int inputChildren = inputRoot.getChildAllocators().size();
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, allocator)) {
+                writer.write(root);
+                assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                assertEquals(inputPeak, limitedAllocator.getPeakMemoryAllocation());
+                assertEquals(inputChildren, inputRoot.getChildAllocators().size());
+            }
+            data = output.toByteArray();
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(1, batch.getRowCount());
+            assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
+        }
+    }
+
+    @Test
+    public void testCrossRootExportUsesWriterAllocatorAndReleasesMetadata() {
+        Schema arrowSchema = wideIntSchema(5_000);
+
+        byte[] data;
+        try (RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024);
+             BufferAllocator limitedAllocator =
+                     inputRoot.newChildAllocator("limited-input", 0, 512);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, limitedAllocator)) {
+            root.setRowCount(0);
+            long inputBytes = inputRoot.getAllocatedMemory();
+            long inputPeak = inputRoot.getPeakMemoryAllocation();
+            int inputChildren = inputRoot.getChildAllocators().size();
+            long writerBytes = allocator.getAllocatedMemory();
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, allocator)) {
+                long writerPeak = allocator.getPeakMemoryAllocation();
+                writer.write(root);
+                assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                assertEquals(inputPeak, inputRoot.getPeakMemoryAllocation());
+                assertEquals(inputChildren, inputRoot.getChildAllocators().size());
+                assertEquals(writerBytes, allocator.getAllocatedMemory());
+                assertTrue(
+                        "expected Arrow C Data metadata on the writer allocator",
+                        allocator.getPeakMemoryAllocation() > writerPeak);
+            }
+            data = output.toByteArray();
+        }
+
+        assertTrue(data.length > 32);
+    }
+
+    @Test
+    public void testSameRootExportKeepsWriterAllocatorAccounting() throws IOException {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (RootAllocator sharedRoot = new RootAllocator(16L * 1024 * 1024);
+             BufferAllocator writerAllocator =
+                     sharedRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+             BufferAllocator inputAllocator =
+                     sharedRoot.newChildAllocator("input", 0, 16L * 1024 * 1024);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+
+            long inputBytes = inputAllocator.getAllocatedMemory();
+            long inputPeak = inputAllocator.getPeakMemoryAllocation();
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, writerAllocator)) {
+                long writerPeak = writerAllocator.getPeakMemoryAllocation();
+                writer.write(root);
+                assertTrue(
+                        "expected Arrow C Data metadata on the writer allocator",
+                        writerAllocator.getPeakMemoryAllocation() > writerPeak);
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(inputPeak, inputAllocator.getPeakMemoryAllocation());
+            }
+            data = output.toByteArray();
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(1, batch.getRowCount());
+            assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
+        }
+    }
+
+    @Test
+    public void testCrossRootWriterAllocatorOutOfMemoryCanRetryWithoutLeak() throws IOException {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024)) {
+            try (BufferAllocator writerAllocator =
+                         writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+                 BufferAllocator inputAllocator =
+                         inputRoot.newChildAllocator("limited-input", 0, 16L * 1024 * 1024);
+                 VectorSchemaRoot root =
+                         VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+                IntVector ids = (IntVector) root.getVector("id");
+                int rowCount = 65_536;
+                ids.allocateNew(rowCount);
+                for (int i = 0; i < rowCount; i++) {
+                    ids.set(i, i);
+                }
+                root.setRowCount(rowCount);
+
+                long inputBytes = inputRoot.getAllocatedMemory();
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                try (MosaicWriter writer =
+                        new MosaicWriter(output, arrowSchema, writerAllocator)) {
+                    long writerBytes = writerAllocator.getAllocatedMemory();
+                    writerAllocator.setLimit(writerBytes + 512);
+                    assertThrows(OutOfMemoryException.class, () -> writer.write(root));
+                    assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                    assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                    assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                    assertEquals(rowCount - 1, ids.get(rowCount - 1));
+
+                    writerAllocator.setLimit(16L * 1024 * 1024);
+                    writer.write(root);
+                }
+                data = output.toByteArray();
+            }
+            assertEquals(0, inputRoot.getAllocatedMemory());
+            assertEquals(0, writerRoot.getAllocatedMemory());
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(65_536, batch.getRowCount());
+            assertEquals(65_535, ((IntVector) batch.getVector("id")).get(65_535));
+        }
+    }
+
+    @Test
+    public void testCrossRootFailureAfterRootRegistrationCanRetryWithoutLeak() throws IOException {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        OutOfMemoryError injected =
+                new OutOfMemoryError("injected after root callback registration");
+        boolean[] failOnce = {true};
+        MosaicWriter.RootArrayExporter rootArrayExporter =
+                (address, privateData) -> {
+                    JniWrapper.get().exportArray(address, privateData);
+                    if (failOnce[0]) {
+                        failOnce[0] = false;
+                        throw injected;
+                    }
+                };
+
+        byte[] data;
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024);
+             BufferAllocator writerAllocator =
+                     writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+             BufferAllocator inputAllocator =
+                     inputRoot.newChildAllocator("input", 0, 16L * 1024 * 1024);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+
+            long inputBytes = inputAllocator.getAllocatedMemory();
+            List<ArrowBuf> fieldBuffers = ids.getFieldBuffers();
+            int[] refCounts = new int[fieldBuffers.size()];
+            for (int i = 0; i < fieldBuffers.size(); i++) {
+                refCounts[i] = fieldBuffers.get(i).refCnt();
+            }
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(
+                            output,
+                            arrowSchema,
+                            new WriterOptions(),
+                            writerAllocator,
+                            rootArrayExporter)) {
+                long writerBytes = writerAllocator.getAllocatedMemory();
+                assertSame(injected, assertThrows(OutOfMemoryError.class, () -> writer.write(root)));
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                for (int i = 0; i < fieldBuffers.size(); i++) {
+                    assertEquals(refCounts[i], fieldBuffers.get(i).refCnt());
+                }
+
+                writer.write(root);
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                for (int i = 0; i < fieldBuffers.size(); i++) {
+                    assertEquals(refCounts[i], fieldBuffers.get(i).refCnt());
+                }
+            }
+            data = output.toByteArray();
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(1, batch.getRowCount());
+            assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
+        }
+    }
+
+    @Test
+    public void testCrossRootPreflightValidationFailureCanRetryWithoutLeak() throws IOException {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data;
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024);
+             BufferAllocator writerAllocator =
+                     writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+             BufferAllocator inputAllocator =
+                     inputRoot.newChildAllocator("input", 0, 16L * 1024 * 1024);
+             VectorSchemaRoot root =
+                     VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            root.setRowCount(1);
+
+            long inputBytes = inputAllocator.getAllocatedMemory();
+            List<ArrowBuf> fieldBuffers = ids.getFieldBuffers();
+            int[] refCounts = new int[fieldBuffers.size()];
+            for (int i = 0; i < fieldBuffers.size(); i++) {
+                refCounts[i] = fieldBuffers.get(i).refCnt();
+            }
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, writerAllocator)) {
+                long writerBytes = writerAllocator.getAllocatedMemory();
+                RuntimeException error =
+                        assertThrows(RuntimeException.class, () -> writer.write(root));
+                assertTrue(error.getMessage().contains("non-nullable column 'id' has 1 nulls"));
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                for (int i = 0; i < fieldBuffers.size(); i++) {
+                    assertEquals(refCounts[i], fieldBuffers.get(i).refCnt());
+                }
+
+                ids.set(0, 7);
+                writer.write(root);
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                for (int i = 0; i < fieldBuffers.size(); i++) {
+                    assertEquals(refCounts[i], fieldBuffers.get(i).refCnt());
+                }
+            }
+            data = output.toByteArray();
+        }
+
+        int totalRows = 0;
+        try (MosaicReader reader = readerFromBytes(data)) {
+            for (int rg = 0; rg < reader.numRowGroups(); rg++) {
+                try (VectorSchemaRoot batch = reader.readRowGroup(rg, allocator)) {
+                    totalRows += batch.getRowCount();
+                    assertEquals(7, ((IntVector) batch.getVector("id")).get(0));
+                }
+            }
+        }
+        assertEquals(1, totalRows);
+    }
+
+    @Test
+    public void testOutputWriteFailureAbortsWriterAndPreservesThrowable() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        WriterOptions options =
+                new WriterOptions()
+                        .compression(0)
+                        .numBuckets(1)
+                        .rowGroupMaxSize(1);
+
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024)) {
+            try (BufferAllocator writerAllocator =
+                         writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+                 BufferAllocator inputAllocator =
+                         inputRoot.newChildAllocator("input", 0, 16L * 1024 * 1024);
+                 VectorSchemaRoot root =
+                         VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+                IntVector ids = (IntVector) root.getVector("id");
+                ids.allocateNew(1);
+                ids.set(0, 7);
+                root.setRowCount(1);
+
+                long inputBytes = inputAllocator.getAllocatedMemory();
+                long writerBytes = writerAllocator.getAllocatedMemory();
+                FailOnceOutputStream output =
+                        new FailOnceOutputStream(
+                                FailurePoint.WRITE, "sentinel-output-write");
+                MosaicWriter writer =
+                        new MosaicWriter(output, arrowSchema, options, writerAllocator);
+
+                RuntimeException error =
+                        assertThrows(RuntimeException.class, () -> writer.write(root));
+                assertEquals("write batch failed", error.getMessage());
+                assertSame(output.failure, error.getCause());
+                assertEquals("sentinel-output-write", error.getCause().getMessage());
+                assertSame(output.failureCause, error.getCause().getCause());
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                assertEquals(1, output.writeCalls);
+                assertEquals(0, output.size());
+
+                RuntimeException retryError =
+                        assertThrows(RuntimeException.class, () -> writer.write(root));
+                assertTrue(retryError
+                        .getMessage()
+                        .contains("writer is aborted after a previous failure"));
+                assertEquals(1, output.writeCalls);
+
+                RuntimeException closeError =
+                        assertThrows(RuntimeException.class, writer::close);
+                assertTrue(closeError
+                        .getMessage()
+                        .contains("writer is aborted after a previous failure"));
+                assertEquals(1, output.writeCalls);
+                assertEquals(0, output.flushCalls);
+                assertEquals(0, output.size());
+                assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+            }
+            assertEquals(0, inputRoot.getAllocatedMemory());
+            assertEquals(0, writerRoot.getAllocatedMemory());
+        }
+    }
+
+    @Test
+    public void testOutputFlushFailurePreservesThrowableWithoutFreeRetry() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        WriterOptions options =
+                new WriterOptions()
+                        .compression(0)
+                        .numBuckets(1)
+                        .rowGroupMaxSize(1);
+
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+
+            FailOnceOutputStream output =
+                    new FailOnceOutputStream(
+                            FailurePoint.FLUSH, "sentinel-output-flush");
+            MosaicWriter writer =
+                    new MosaicWriter(output, arrowSchema, options, allocator);
+            writer.write(root);
+            int writesBeforeClose = output.writeCalls;
+
+            RuntimeException error = assertThrows(RuntimeException.class, writer::close);
+            assertEquals("close failed", error.getMessage());
+            assertSame(output.failure, error.getCause());
+            assertEquals("sentinel-output-flush", error.getCause().getMessage());
+            assertSame(output.failureCause, error.getCause().getCause());
+            assertTrue(output.writeCalls > writesBeforeClose);
+            assertEquals(1, output.flushCalls);
+            assertTrue(output.size() > 0);
+
+            int writesAfterClose = output.writeCalls;
+            writer.close();
+            assertEquals(writesAfterClose, output.writeCalls);
+            assertEquals(1, output.flushCalls);
+        }
+    }
+
+    @Test
+    public void testCrossRootPartialExportFailureCanRetryWithoutLeak() throws IOException {
+        byte[] data;
+        try (RootAllocator writerRoot = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator inputRoot = new RootAllocator(16L * 1024 * 1024)) {
+            try (BufferAllocator writerAllocator =
+                         writerRoot.newChildAllocator("writer", 0, 16L * 1024 * 1024);
+                 BufferAllocator inputAllocator =
+                         inputRoot.newChildAllocator("input", 0, 16L * 1024 * 1024)) {
+                IntVector first = new IntVector("first", inputAllocator);
+                FailOnceListVector second = new FailOnceListVector("second", inputAllocator);
+                try (VectorSchemaRoot root = VectorSchemaRoot.of(first, second)) {
+                    first.allocateNew(2);
+                    second.allocateNew();
+                    first.set(0, 1);
+                    first.set(1, 2);
+                    UnionListWriter listWriter = second.getWriter();
+                    listWriter.setPosition(0);
+                    listWriter.startList();
+                    listWriter.writeInt(3);
+                    listWriter.endList();
+                    listWriter.setPosition(1);
+                    listWriter.startList();
+                    listWriter.writeInt(4);
+                    listWriter.endList();
+                    root.setRowCount(2);
+
+                    long inputBytes = inputRoot.getAllocatedMemory();
+                    ByteArrayOutputStream output = new ByteArrayOutputStream();
+                    try (MosaicWriter writer =
+                            new MosaicWriter(output, root.getSchema(), writerAllocator)) {
+                        long writerBytes = writerAllocator.getAllocatedMemory();
+                        assertThrows(InjectedExportException.class, () -> writer.write(root));
+                        assertEquals(inputBytes, inputRoot.getAllocatedMemory());
+                        assertEquals(inputBytes, inputAllocator.getAllocatedMemory());
+                        assertEquals(writerBytes, writerAllocator.getAllocatedMemory());
+                        assertEquals(2, first.get(1));
+                        assertEquals("[4]", second.getObject(1).toString());
+
+                        writer.write(root);
+                    }
+                    data = output.toByteArray();
+                }
+            }
+            assertEquals(0, inputRoot.getAllocatedMemory());
+            assertEquals(0, writerRoot.getAllocatedMemory());
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+             VectorSchemaRoot batch = reader.readRowGroup(0, allocator)) {
+            assertEquals(2, batch.getRowCount());
+            assertEquals(1, ((IntVector) batch.getVector("first")).get(0));
+            assertEquals(2, ((IntVector) batch.getVector("first")).get(1));
+            assertEquals("[3]", batch.getVector("second").getObject(0).toString());
+            assertEquals("[4]", batch.getVector("second").getObject(1).toString());
+        }
+    }
+
+    @Test
+    public void testWriteSequentialBundlesFromDifferentRootAllocators() throws IOException {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+
+        byte[] data = writeToBytes(arrowSchema, writer -> {
+            for (int batch = 0; batch < 2; batch++) {
+                try (BufferAllocator inputAllocator = new RootAllocator();
+                     VectorSchemaRoot root =
+                             VectorSchemaRoot.create(arrowSchema, inputAllocator)) {
+                    IntVector ids = (IntVector) root.getVector("id");
+                    ids.allocateNew(2);
+                    ids.set(0, batch * 2);
+                    ids.set(1, batch * 2 + 1);
+                    root.setRowCount(2);
+                    writer.write(root);
+                }
+            }
+        });
+
+        boolean[] seen = new boolean[4];
+        int totalRows = 0;
+        try (MosaicReader reader = readerFromBytes(data)) {
+            for (int rg = 0; rg < reader.numRowGroups(); rg++) {
+                try (VectorSchemaRoot batch = reader.readRowGroup(rg, allocator)) {
+                    IntVector ids = (IntVector) batch.getVector("id");
+                    for (int i = 0; i < batch.getRowCount(); i++) {
+                        seen[ids.get(i)] = true;
+                        totalRows++;
+                    }
+                }
+            }
+        }
+        assertEquals(4, totalRows);
+        assertArrayEquals(new boolean[]{true, true, true, true}, seen);
+    }
+
+    @Test
+    public void testRejectsFieldVectorsFromDifferentAllocatorRoots() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", ArrowType.Utf8.INSTANCE)
+        ));
+
+        try (BufferAllocator idAllocator = new RootAllocator();
+             BufferAllocator nameAllocator = new RootAllocator()) {
+            IntVector ids = new IntVector("id", idAllocator);
+            VarCharVector names = new VarCharVector("name", nameAllocator);
+            try (VectorSchemaRoot root = VectorSchemaRoot.of(ids, names)) {
+                ids.allocateNew(1);
+                names.allocateNew(1);
+                ids.set(0, 1);
+                names.setSafe(0, "one".getBytes());
+                root.setRowCount(1);
+
+                IllegalArgumentException error =
+                        assertThrows(
+                                IllegalArgumentException.class,
+                                () -> writeToBytes(arrowSchema, writer -> writer.write(root)));
+                assertTrue(error.getMessage().contains("same allocator root"));
+                assertTrue(error.getMessage().contains("name"));
+            }
+        }
+    }
+
+    @Test
+    public void testRejectsNestedFieldVectorFromDifferentAllocatorRootWithoutLeak() {
+        try (RootAllocator parentAllocator = new RootAllocator(16L * 1024 * 1024);
+             RootAllocator nestedAllocator = new RootAllocator(16L * 1024 * 1024)) {
+            InjectableListVector list = new InjectableListVector("items", parentAllocator);
+            IntVector data = new IntVector(ListVector.DATA_VECTOR_NAME, nestedAllocator);
+            list.setDataVector(data);
+
+            try (VectorSchemaRoot root = VectorSchemaRoot.of(list)) {
+                list.allocateNew();
+                list.startNewValue(0);
+                data.set(0, 7);
+                list.endValue(0, 1);
+                list.setValueCount(1);
+                root.setRowCount(1);
+
+                long parentBefore = parentAllocator.getAllocatedMemory();
+                long nestedBefore = nestedAllocator.getAllocatedMemory();
+
+                IllegalArgumentException error =
+                        assertThrows(
+                                IllegalArgumentException.class,
+                                () -> writeToBytes(root.getSchema(), writer -> writer.write(root)));
+                assertTrue(error.getMessage().contains("same allocator root"));
+                assertTrue(error.getMessage().contains("items." + ListVector.DATA_VECTOR_NAME));
+                assertEquals(parentBefore, parentAllocator.getAllocatedMemory());
+                assertEquals(nestedBefore, nestedAllocator.getAllocatedMemory());
+            } finally {
+                data.close();
+            }
+
+            assertEquals(0, parentAllocator.getAllocatedMemory());
+            assertEquals(0, nestedAllocator.getAllocatedMemory());
+        }
+    }
+
+    @Test
+    public void testWriterOpenFailurePreservesNativeMessage() {
+        Schema arrowSchema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        WriterOptions options = new WriterOptions().statsColumns("missing");
+
+        RuntimeException error =
+                assertThrows(
+                        RuntimeException.class,
+                        () ->
+                                new MosaicWriter(
+                                        new ByteArrayOutputStream(),
+                                        arrowSchema,
+                                        options,
+                                        allocator));
+
+        assertTrue(
+                error.getMessage(),
+                error.getMessage()
+                        .contains(
+                                "writer open failed: stats_columns: column 'missing' not found in schema"));
+    }
+
+    @Test
+    public void testNullValues() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -242,7 +1188,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testProjection() {
+    public void testProjection() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("a", new ArrowType.Int(32, true)),
                 Field.nullable("b", ArrowType.Utf8.INSTANCE),
@@ -288,7 +1234,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testProjectionOrder() {
+    public void testProjectionOrder() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("a", new ArrowType.Int(32, true)),
                 Field.nullable("b", ArrowType.Utf8.INSTANCE),
@@ -336,7 +1282,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testProjectionEmpty() {
+    public void testProjectionEmpty() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("a", new ArrowType.Int(32, true)),
                 Field.nullable("b", ArrowType.Utf8.INSTANCE)
@@ -368,7 +1314,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testStats() {
+    public void testStats() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
@@ -416,7 +1362,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testAllTypes() {
+    public void testAllTypes() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("f_bool", ArrowType.Bool.INSTANCE),
                 Field.nullable("f_int8", new ArrowType.Int(8, true)),
@@ -492,7 +1438,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testTimestampNsRoundtrip() {
+    public void testTimestampNsRoundtrip() throws IOException {
         ArrowType.Timestamp tsNsType = new ArrowType.Timestamp(TimeUnit.NANOSECOND, null);
         ArrowType.Timestamp tsNsTzType = new ArrowType.Timestamp(TimeUnit.NANOSECOND, "Asia/Shanghai");
         Schema arrowSchema = new Schema(Arrays.asList(
@@ -538,7 +1484,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testCompressionNone() {
+    public void testCompressionNone() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true)),
                 Field.nullable("y", ArrowType.Utf8.INSTANCE)
@@ -570,7 +1516,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testMultipleRowGroups() {
+    public void testMultipleRowGroups() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("data", new ArrowType.Int(64, true))
@@ -617,7 +1563,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testMultipleWrites() {
+    public void testMultipleWrites() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true))
         ));
@@ -684,7 +1630,1385 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testSingleRow() {
+    public void testReaderOpenReleasesInputGlobalRefWhenReadFails() throws Exception {
+        awaitGarbageCollection(openReaderWithFailingInput());
+    }
+
+    @Test
+    public void testReaderOpenReleasesNativeHandleOnCheckedAllocatorFailure() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("value", new ArrowType.Int(32, true))));
+        byte[] data = writeToBytes(schema, writer -> {});
+        awaitGarbageCollection(openReaderWithCheckedAllocatorFailure(data));
+    }
+
+    @Test
+    public void testReaderRestoresBackgroundInputExceptionAndReleasesGlobalRef()
+            throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("value", new ArrowType.Int(32, true))
+        ));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        awaitGarbageCollection(readRowGroupWithFailingInput(data));
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterWritesExactPrimitiveProtocol() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("i\"8", new ArrowType.Int(8, true)),
+                Field.nullable("i16", new ArrowType.Int(16, true)),
+                Field.nullable("i32", new ArrowType.Int(32, true)),
+                Field.nullable("i64", new ArrowType.Int(64, true)),
+                Field.nullable(
+                        "double",
+                        new ArrowType.FloatingPoint(
+                                org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE)),
+                Field.nullable("text", ArrowType.Utf8.INSTANCE)
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            TinyIntVector i8 = (TinyIntVector) root.getVector("i\"8");
+            SmallIntVector i16 = (SmallIntVector) root.getVector("i16");
+            IntVector i32 = (IntVector) root.getVector("i32");
+            BigIntVector i64 = (BigIntVector) root.getVector("i64");
+            Float8Vector doubles = (Float8Vector) root.getVector("double");
+            VarCharVector text = (VarCharVector) root.getVector("text");
+            i8.allocateNew(3);
+            i16.allocateNew(3);
+            i32.allocateNew(3);
+            i64.allocateNew(3);
+            doubles.allocateNew(3);
+            text.allocateNew();
+
+            i8.set(0, -1);
+            i8.setNull(1);
+            i8.set(2, 9);
+            i16.set(0, 0);
+            i16.set(1, -7);
+            i16.set(2, 12);
+            i32.set(0, Integer.MIN_VALUE);
+            i32.set(1, 0);
+            i32.set(2, Integer.MAX_VALUE);
+            i64.set(0, Long.MIN_VALUE);
+            i64.setNull(1);
+            i64.set(2, Long.MAX_VALUE);
+            doubles.set(0, -0.0);
+            doubles.set(1, 1.2);
+            doubles.set(2, 9_999_999.0);
+            text.setSafe(0, "a\"\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            text.setNull(1);
+            text.setSafe(2, "中\t".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(3);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"i\\\"8\":\"-1,,9\",\"i16\":\"0,-7,12\","
+                            + "\"i32\":\"-2147483648,0,2147483647\","
+                            + "\"i64\":\"-9223372036854775808,,9223372036854775807\","
+                            + "\"double\":\"-0.0,1.2,9999999.0\","
+                            + "\"text\":\"a\\\"\\n,,中\\t\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterMatchesJavaDoubleFormatting() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.FloatingPoint(
+                                                FloatingPointPrecision.DOUBLE))));
+        int rowCount = 4096;
+        double[] values = new double[rowCount];
+        double[] fixedValues = {
+            0.0,
+            -0.0,
+            Math.nextDown(1.0e-6),
+            1.0e-6,
+            Math.nextUp(1.0e-6),
+            -Math.nextDown(1.0e-6),
+            -1.0e-6,
+            -Math.nextUp(1.0e-6),
+            Math.nextDown(1.0e9),
+            1.0e9,
+            Math.nextUp(1.0e9),
+            -Math.nextDown(1.0e9),
+            -1.0e9,
+            -Math.nextUp(1.0e9),
+            1_234_567.0,
+            -1_234_567.0,
+            1_234_567.8,
+            -1_234_567.8,
+            Double.MIN_VALUE,
+            -Double.MIN_VALUE,
+            Double.MAX_VALUE,
+            -Double.MAX_VALUE,
+            Double.longBitsToDouble(TINY_DOUBLE_ROUNDING_REGRESSION_BITS),
+            Double.longBitsToDouble(LARGE_DOUBLE_ROUNDING_REGRESSION_BITS)
+        };
+        System.arraycopy(fixedValues, 0, values, 0, fixedValues.length);
+        java.util.Random random = new java.util.Random(20260820L);
+        int randomBitPatternEnd = fixedValues.length + 256;
+        for (int row = fixedValues.length; row < randomBitPatternEnd; row++) {
+            double value;
+            do {
+                value = Double.longBitsToDouble(random.nextLong());
+            } while (!Double.isFinite(value));
+            values[row] = value;
+        }
+        for (int row = randomBitPatternEnd; row < rowCount; row++) {
+            int exponent = random.nextInt(15) - 6;
+            double significand = 1.0 + random.nextDouble() * 9.0;
+            double value = significand * Math.pow(10.0, exponent);
+            values[row] = random.nextBoolean() ? value : -value;
+            assertTrue(Math.abs(values[row]) >= 1.0e-6);
+            assertTrue(Math.abs(values[row]) <= 1.0e9);
+        }
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            Float8Vector vector = (Float8Vector) root.getVector("value");
+            vector.allocateNew(rowCount);
+            for (int row = 0; row < rowCount; row++) {
+                vector.set(row, values[row]);
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            String actual =
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8);
+            String prefix = "{\"value\":\"";
+            assertTrue(actual.startsWith(prefix));
+            assertTrue(actual.endsWith("\"}"));
+            String[] rendered =
+                    actual.substring(prefix.length(), actual.length() - 2).split(",", -1);
+            assertEquals(rowCount, rendered.length);
+            for (int row = 0; row < rowCount; row++) {
+                assertEquals(
+                        "DOUBLE mismatch at row " + row,
+                        Double.toString(values[row]),
+                        rendered[row]);
+            }
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterNestedColumnFallsBackWithoutTouchingOutput()
+            throws Exception {
+        Field element =
+                new Field(
+                        "item",
+                        FieldType.nullable(new ArrowType.Int(32, true)),
+                        null);
+        Field list =
+                new Field(
+                        "items",
+                        FieldType.nullable(ArrowType.List.INSTANCE),
+                        Arrays.asList(element));
+        Schema schema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true)),
+                list
+        ));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ListVector items = (ListVector) root.getVector("items");
+            ids.allocateNew(1);
+            items.allocateNew();
+            ids.set(0, 7);
+            UnionListWriter writer = items.getWriter();
+            writer.setPosition(0);
+            writer.startList();
+            writer.writeInt(11);
+            writer.endList();
+            root.setRowCount(1);
+            data = writeToBytes(schema, mosaicWriter -> mosaicWriter.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(9);
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.UNSUPPORTED,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+            try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
+                assertEquals(1, fallback.getRowCount());
+                assertEquals(7, ((IntVector) fallback.getVector("id")).get(0));
+                assertEquals(
+                        11,
+                        ((java.util.List<?>) fallback.getVector("items").getObject(0))
+                                .get(0));
+            }
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterWritesProjectedRowGroup() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("id", new ArrowType.Int(32, true)),
+                                Field.notNullable("value", new ArrowType.Int(32, true))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            IntVector values = (IntVector) root.getVector("value");
+            ids.allocateNew(1);
+            values.allocateNew(1);
+            ids.set(0, 7);
+            values.set(0, 11);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data)) {
+            reader.project(new String[] {"id"});
+            try (MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                assertEquals(
+                        ColumnarTextJsonWriter.Status.WRITTEN,
+                        ColumnarTextJsonWriter.write(rowGroup, output));
+                assertEquals("{\"id\":\"7\"}", output.toString("UTF-8"));
+
+                try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
+                    assertEquals(1, fallback.getFieldVectors().size());
+                    assertEquals(7, ((IntVector) fallback.getVector("id")).get(0));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonValidatesUtf8DuringStreamingWrite() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.notNullable("padding", ArrowType.Utf8.INSTANCE),
+                Field.notNullable("text", ArrowType.Utf8.INSTANCE)));
+        byte[] padding = new byte[1024 * 1024 + 1];
+        Arrays.fill(padding, (byte) 'x');
+        byte[] marker = "invalid_utf8_marker".getBytes("UTF-8");
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            VarCharVector first = (VarCharVector) root.getVector("padding");
+            VarCharVector second = (VarCharVector) root.getVector("text");
+            first.allocateNew();
+            second.allocateNew();
+            first.setSafe(0, padding);
+            second.setSafe(0, marker);
+            root.setRowCount(1);
+            data = writeToBytes(schema, new WriterOptions().compression(0).numBuckets(1),
+                    writer -> writer.write(root));
+        }
+        int markerOffset = -1;
+        for (int i = 0; i <= data.length - marker.length; i++) {
+            if (data[i] == marker[0]
+                    && Arrays.equals(marker, Arrays.copyOfRange(data, i, i + marker.length))) {
+                markerOffset = i;
+                break;
+            }
+        }
+        assertTrue("test marker must be in the uncompressed data", markerOffset >= 0);
+        data[markerOffset] = (byte) 0xff;
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            RuntimeException failure = assertThrows(RuntimeException.class,
+                    () -> ColumnarTextJsonWriter.write(rowGroup, output));
+            assertTrue(failure.getMessage().contains("invalid UTF-8"));
+            assertTrue("the public writer must stream instead of pre-reading all text",
+                    output.size() > 0);
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterPreservesTextAggregationSemantics() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("text", ArrowType.Utf8.INSTANCE),
+                Field.notNullable("index", new ArrowType.Int(32, true))));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            VarCharVector text = (VarCharVector) root.getVector("text");
+            IntVector indexes = (IntVector) root.getVector("index");
+            text.allocateNew();
+            indexes.allocateNew(4);
+            text.setNull(0);
+            text.setSafe(1, new byte[0]);
+            text.setSafe(2, "a,b".getBytes("UTF-8"));
+            text.setSafe(3, "x\"\n".getBytes("UTF-8"));
+            for (int i = 0; i < 4; i++) {
+                indexes.set(i, i);
+            }
+            root.setRowCount(4);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+        try (MosaicReader reader = readerFromBytes(data)) {
+            reader.project(new String[] {"index", "text"});
+            try (MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                assertEquals(ColumnarTextJsonWriter.Status.WRITTEN,
+                        ColumnarTextJsonWriter.write(rowGroup, output));
+                assertEquals("{\"index\":\"0,1,2,3\",\"text\":\",,a,b,x\\\"\\n\"}",
+                        output.toString("UTF-8"));
+            }
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterUnsupportedBooleanDoesNotTouchOutput() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "id", new ArrowType.Int(32, true)),
+                                Field.notNullable("value", ArrowType.Bool.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            BitVector values = (BitVector) root.getVector("value");
+            ids.allocateNew(1);
+            values.allocateNew(1);
+            ids.set(0, 7);
+            values.set(0, 1);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            output.write(9);
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.UNSUPPORTED,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterWritesAllNullUnsupportedScalarType() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(Field.nullable("value", ArrowType.Bool.INSTANCE)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            BitVector values = (BitVector) root.getVector("value");
+            values.allocateNew(3);
+            root.setRowCount(3);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\",,\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterWritesDecimal128AsPlainString() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable(
+                                        "value",
+                                        new ArrowType.Decimal(20, 0, 128))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector values = (DecimalVector) root.getVector("value");
+            values.allocateNew(3);
+            values.set(0, new BigDecimal("18446744073709551615"));
+            values.setNull(1);
+            values.set(2, new BigDecimal("-9223372036854775809"));
+            root.setRowCount(3);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"18446744073709551615,,-9223372036854775809\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterPreservesDecimal128Scale() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.Decimal(18, 3, 128))));
+        BigDecimal[] expectedValues = {
+            new BigDecimal("12.340"),
+            new BigDecimal("-0.005"),
+            new BigDecimal("0.000")
+        };
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector values = (DecimalVector) root.getVector("value");
+            values.allocateNew(expectedValues.length);
+            for (int row = 0; row < expectedValues.length; row++) {
+                values.set(row, expectedValues[row]);
+            }
+            root.setRowCount(expectedValues.length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"12.340,-0.005,0.000\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterPreservesNegativeDecimalScale() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.Decimal(18, -2, 128))));
+        BigDecimal[] expectedValues = {
+            new BigDecimal(BigInteger.ZERO, -2),
+            new BigDecimal(BigInteger.valueOf(123), -2)
+        };
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector values = (DecimalVector) root.getVector("value");
+            values.allocateNew(expectedValues.length);
+            for (int row = 0; row < expectedValues.length; row++) {
+                values.set(row, expectedValues[row]);
+            }
+            root.setRowCount(expectedValues.length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"0,12300\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterPreserves128BitDecimalValuesAcrossScales() throws Exception {
+        assertLargeDecimalJson(
+                new ArrowType.Decimal(20, 3, 128),
+                new BigDecimal[] {
+                    new BigDecimal("18446744073709551.615"),
+                    new BigDecimal("-9223372036854775.809"),
+                    new BigDecimal("0.000")
+                },
+                "{\"value\":\"18446744073709551.615,-9223372036854775.809,0.000\"}");
+        assertLargeDecimalJson(
+                new ArrowType.Decimal(20, -2, 128),
+                new BigDecimal[] {
+                    new BigDecimal(new BigInteger("18446744073709551615"), -2),
+                    new BigDecimal(new BigInteger("-9223372036854775809"), -2),
+                    new BigDecimal(BigInteger.ZERO, -2)
+                },
+                "{\"value\":\"1844674407370955161500,-922337203685477580900,0\"}");
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterMatchesArrowDecimalPlainStringOracle() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable(
+                                        "scale_minus_1",
+                                        new ArrowType.Decimal(18, -1, 128)),
+                                Field.nullable(
+                                        "scale_minus_2",
+                                        new ArrowType.Decimal(19, -2, 128)),
+                                Field.nullable(
+                                        "scale_minus_3",
+                                        new ArrowType.Decimal(19, -3, 128)),
+                                Field.nullable(
+                                        "precision_19_scale_4",
+                                        new ArrowType.Decimal(19, 4, 128)),
+                                Field.nullable(
+                                        "precision_19_scale_0",
+                                        new ArrowType.Decimal(19, 0, 128))));
+        BigDecimal[][] values = {
+            {
+                new BigDecimal(BigInteger.ZERO, -1),
+                new BigDecimal(new BigInteger("123456789012345678"), -1),
+                new BigDecimal(new BigInteger("-123456789012345678"), -1),
+                null
+            },
+            {
+                new BigDecimal(BigInteger.ZERO, -2),
+                new BigDecimal(new BigInteger("1234567890123456789"), -2),
+                new BigDecimal(new BigInteger("-1234567890123456789"), -2),
+                null
+            },
+            {
+                new BigDecimal(BigInteger.ZERO, -3),
+                new BigDecimal(new BigInteger("9876543210123456789"), -3),
+                new BigDecimal(new BigInteger("-9876543210123456789"), -3),
+                null
+            },
+            {
+                new BigDecimal("0.0000"),
+                new BigDecimal("123456789012345.6789"),
+                new BigDecimal("-999999999999999.9999"),
+                null
+            },
+            {
+                new BigDecimal("0"),
+                new BigDecimal("9999999999999999999"),
+                new BigDecimal("-9223372036854775809"),
+                null
+            }
+        };
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            for (int column = 0; column < values.length; column++) {
+                DecimalVector vector = (DecimalVector) root.getVector(column);
+                vector.allocateNew(values[column].length);
+                for (int row = 0; row < values[column].length; row++) {
+                    if (values[column][row] == null) {
+                        vector.setNull(row);
+                    } else {
+                        vector.set(row, values[column][row]);
+                    }
+                }
+            }
+            root.setRowCount(values[0].length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            try (VectorSchemaRoot arrow = rowGroup.readColumns(allocator)) {
+                assertEquals(
+                        renderDecimalColumnarJson(arrow),
+                        new String(
+                                output.toByteArray(),
+                                java.nio.charset.StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterWritesReadableDecimalBeyondDeclaredPrecision()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.Decimal(1, 0, 128))));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector value = (DecimalVector) root.getVector("value");
+            value.allocateNew(1);
+            value.set(0, 123L);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            try (VectorSchemaRoot arrow = rowGroup.readColumns(allocator)) {
+                assertEquals(new BigDecimal("123"), arrow.getVector("value").getObject(0));
+            }
+
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"123\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    private void assertLargeDecimalJson(
+            ArrowType.Decimal type, BigDecimal[] values, String expected) throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("value", type)));
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            DecimalVector vector = (DecimalVector) root.getVector("value");
+            vector.allocateNew(values.length);
+            for (int row = 0; row < values.length; row++) {
+                vector.set(row, values[row]);
+            }
+            root.setRowCount(values.length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    expected,
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterFormatsDoublesOutsideNativeRangeWithJava() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value",
+                                        new ArrowType.FloatingPoint(
+                                                FloatingPointPrecision.DOUBLE))));
+
+        double[] expectedValues = {
+            Double.MIN_VALUE,
+            Double.longBitsToDouble(TINY_DOUBLE_ROUNDING_REGRESSION_BITS),
+            Double.longBitsToDouble(LARGE_DOUBLE_ROUNDING_REGRESSION_BITS)
+        };
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            Float8Vector values = (Float8Vector) root.getVector("value");
+            values.allocateNew(expectedValues.length);
+            for (int row = 0; row < expectedValues.length; row++) {
+                values.set(row, expectedValues[row]);
+            }
+            root.setRowCount(expectedValues.length);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"value\":\"4.9E-324,2.8421709430404007E-14,"
+                            + "5.7722107746645115E18\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterNonFiniteDoubleDoesNotTouchOutput() throws Exception {
+        for (double value :
+                new double[] {
+                    Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY
+                }) {
+            Schema schema =
+                    new Schema(
+                            Arrays.asList(
+                                    Field.notNullable(
+                                            "value",
+                                            new ArrowType.FloatingPoint(
+                                                    FloatingPointPrecision.DOUBLE))));
+
+            byte[] data;
+            try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+                Float8Vector values = (Float8Vector) root.getVector("value");
+                values.allocateNew(1);
+                values.set(0, value);
+                root.setRowCount(1);
+                data = writeToBytes(schema, writer -> writer.write(root));
+            }
+
+            try (MosaicReader reader = readerFromBytes(data);
+                    MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+                ByteArrayOutputStream output = new ByteArrayOutputStream();
+                output.write(9);
+                assertEquals(
+                        ColumnarTextJsonWriter.Status.UNSUPPORTED,
+                        ColumnarTextJsonWriter.write(rowGroup, output));
+                assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+            }
+        }
+    }
+
+    private static String renderDecimalColumnarJson(VectorSchemaRoot root) {
+        StringBuilder expected = new StringBuilder("{");
+        for (int column = 0; column < root.getFieldVectors().size(); column++) {
+            if (column > 0) {
+                expected.append(',');
+            }
+            DecimalVector vector = (DecimalVector) root.getVector(column);
+            expected.append('"').append(vector.getName()).append("\":\"");
+            for (int row = 0; row < root.getRowCount(); row++) {
+                if (row > 0) {
+                    expected.append(',');
+                }
+                if (!vector.isNull(row)) {
+                    expected.append(vector.getObject(row).toPlainString());
+                }
+            }
+            expected.append('"');
+        }
+        return expected.append('}').toString();
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterStreamsRowGroupAboveFormerRowBudget()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable(
+                                        "value", new ArrowType.Int(8, true))));
+        int rowCount = 1_000_001;
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            TinyIntVector values = (TinyIntVector) root.getVector("value");
+            values.allocateNew(rowCount);
+            root.setRowCount(rowCount);
+            data =
+                    writeToBytes(
+                            schema,
+                            new WriterOptions().rowGroupMaxSize(512L * 1024 * 1024),
+                            writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            byte[] bytes = output.toByteArray();
+            assertEquals(rowCount + 11, bytes.length);
+            assertEquals('{', bytes[0]);
+            assertEquals('}', bytes[bytes.length - 1]);
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterStreamsWhenWorstCaseEstimateExceedsFormerBudget()
+            throws Exception {
+        int rowCount = 1_000_000;
+        List<Field> fields = new ArrayList<>();
+        for (int column = 0; column < 4; column++) {
+            fields.add(
+                    Field.notNullable(
+                            "value_" + column,
+                            new ArrowType.Decimal(38, -128, 128)));
+        }
+        Schema schema = new Schema(fields);
+        BigDecimal zero = new BigDecimal(BigInteger.ZERO, -128);
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            for (FieldVector fieldVector : root.getFieldVectors()) {
+                DecimalVector vector = (DecimalVector) fieldVector;
+                vector.allocateNew(rowCount);
+                for (int row = 0; row < rowCount; row++) {
+                    vector.set(row, zero);
+                }
+            }
+            root.setRowCount(rowCount);
+            data =
+                    writeToBytes(
+                            schema,
+                            new WriterOptions().rowGroupMaxSize(512L * 1024 * 1024),
+                            writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(8_000_049, output.size());
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterWritesDictionaryAndAllNullColumns() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.nullable("all_null", ArrowType.Utf8.INSTANCE),
+                                Field.nullable("dict", ArrowType.Utf8.INSTANCE)));
+        int rowCount = 128;
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            VarCharVector allNull = (VarCharVector) root.getVector("all_null");
+            VarCharVector dict = (VarCharVector) root.getVector("dict");
+            allNull.allocateNew();
+            dict.allocateNew();
+            for (int row = 0; row < rowCount; row++) {
+                if (row % 5 != 0) {
+                    dict.setSafe(
+                            row,
+                            (row % 2 == 0 ? "alpha" : "beta")
+                                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        StringBuilder allNull = new StringBuilder();
+        StringBuilder dict = new StringBuilder();
+        for (int row = 0; row < rowCount; row++) {
+            if (row > 0) {
+                allNull.append(',');
+                dict.append(',');
+            }
+            if (row % 5 != 0) {
+                dict.append(row % 2 == 0 ? "alpha" : "beta");
+            }
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"all_null\":\""
+                            + allNull
+                            + "\",\"dict\":\""
+                            + dict
+                            + "\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterBatchesNullableConstantsAcrossSupportedTypes()
+            throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.nullable("i16", new ArrowType.Int(16, true)),
+                Field.nullable("i64", new ArrowType.Int(64, true)),
+                Field.nullable("text", ArrowType.Utf8.INSTANCE)
+        ));
+        int rowCount = 26;
+
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            SmallIntVector i16 = (SmallIntVector) root.getVector("i16");
+            BigIntVector i64 = (BigIntVector) root.getVector("i64");
+            VarCharVector text = (VarCharVector) root.getVector("text");
+            i16.allocateNew(rowCount);
+            i64.allocateNew(rowCount);
+            text.allocateNew();
+            for (int row = 0; row < rowCount; row++) {
+                int bit = row & 7;
+                if (bit == 1 || bit == 3 || bit == 4 || bit == 7) {
+                    i16.set(row, 0);
+                    i64.set(row, -7);
+                    text.setSafe(
+                            row,
+                            "x".getBytes(
+                                    java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        StringBuilder zero = new StringBuilder();
+        StringBuilder minusSeven = new StringBuilder();
+        StringBuilder text = new StringBuilder();
+        for (int row = 0; row < rowCount; row++) {
+            if (row > 0) {
+                zero.append(',');
+                minusSeven.append(',');
+                text.append(',');
+            }
+            int bit = row & 7;
+            if (bit == 1 || bit == 3 || bit == 4 || bit == 7) {
+                zero.append('0');
+                minusSeven.append("-7");
+                text.append('x');
+            }
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals(
+                    "{\"i16\":\""
+                            + zero
+                            + "\",\"i64\":\""
+                            + minusSeven
+                            + "\",\"text\":\""
+                            + text
+                            + "\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterPreservesOutputException() throws Exception {
+        Schema schema = new Schema(Arrays.asList(
+                Field.notNullable("id", new ArrowType.Int(32, true))
+        ));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            FailOnceOutputStream output =
+                    new FailOnceOutputStream(
+                            FailurePoint.WRITE,
+                            "sentinel-columnar-text-json");
+            IOException error =
+                    assertThrows(
+                            IOException.class,
+                            () -> ColumnarTextJsonWriter.write(rowGroup, output));
+            assertSame(output.failure, error);
+            assertEquals("sentinel-columnar-text-json", error.getMessage());
+            assertEquals(1, output.writeCalls);
+            assertEquals(0, output.flushCalls);
+
+            try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
+                assertEquals(7, ((IntVector) fallback.getVector("id")).get(0));
+            }
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterPreservesMidStreamOutputException() throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        int rowCount = ROW_COUNT_FOR_MULTIPLE_OUTPUT_WRITES;
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(rowCount);
+            for (int row = 0; row < rowCount; row++) {
+                values.set(row, row);
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            FailOnceOutputStream output =
+                    new FailOnceOutputStream(
+                            FailurePoint.WRITE,
+                            2,
+                            "sentinel-columnar-text-json-mid-stream");
+            IOException error =
+                    assertThrows(
+                            IOException.class,
+                            () -> ColumnarTextJsonWriter.write(rowGroup, output));
+            assertSame(output.failure, error);
+            assertEquals("sentinel-columnar-text-json-mid-stream", error.getMessage());
+            assertEquals(2, output.writeCalls);
+            assertTrue(output.size() > 0);
+            assertEquals(0, output.flushCalls);
+
+            try (VectorSchemaRoot fallback = rowGroup.readColumns(allocator)) {
+                assertEquals(rowCount, fallback.getRowCount());
+                assertEquals(0, ((IntVector) fallback.getVector("value")).get(0));
+                assertEquals(
+                        rowCount - 1,
+                        ((IntVector) fallback.getVector("value")).get(rowCount - 1));
+            }
+        }
+    }
+
+    @Test
+    public void testColumnarTextJsonWriterNeverFlushesOrClosesCallerOutput()
+            throws Exception {
+        Schema supportedSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        byte[] supportedData;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(supportedSchema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 7);
+            root.setRowCount(1);
+            supportedData = writeToBytes(supportedSchema, writer -> writer.write(root));
+        }
+        try (MosaicReader reader = readerFromBytes(supportedData);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            OwnershipTrackingOutputStream output = new OwnershipTrackingOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertEquals("{\"value\":\"7\"}", output.toString("UTF-8"));
+            assertEquals(0, output.flushCalls);
+            assertEquals(0, output.closeCalls);
+        }
+
+        Schema unsupportedSchema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable("value", ArrowType.Bool.INSTANCE)));
+        byte[] unsupportedData;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(unsupportedSchema, allocator)) {
+            BitVector values = (BitVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 1);
+            root.setRowCount(1);
+            unsupportedData =
+                    writeToBytes(unsupportedSchema, writer -> writer.write(root));
+        }
+        try (MosaicReader reader = readerFromBytes(unsupportedData);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            OwnershipTrackingOutputStream output = new OwnershipTrackingOutputStream();
+            output.write(9);
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.UNSUPPORTED,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertArrayEquals(new byte[] {9}, output.toByteArray());
+            assertEquals(0, output.flushCalls);
+            assertEquals(0, output.closeCalls);
+        }
+    }
+
+    @Test
+    public void testMosaicRowGroupReaderRejectsReentrantUseFromOutputCallback()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            ReentrantWriteOutputStream output = new ReentrantWriteOutputStream(rowGroup);
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertTrue(output.reentrantFailure instanceof IllegalStateException);
+            assertEquals(
+                    "row group reader is already in use",
+                    output.reentrantFailure.getMessage());
+        }
+    }
+
+    @Test
+    public void testMosaicRowGroupReaderDefersReentrantCloseUntilWriteCompletes()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        int rowCount = ROW_COUNT_FOR_MULTIPLE_OUTPUT_WRITES;
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(rowCount);
+            for (int row = 0; row < rowCount; row++) {
+                values.set(row, row);
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            long nativeHandle = nativeHandle(rowGroup);
+            assertTrue(nativeHandle != 0);
+            CloseOnFirstWriteOutputStream output =
+                    new CloseOnFirstWriteOutputStream(rowGroup);
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(rowGroup, output));
+            assertTrue(output.closeRequested);
+            assertEquals(nativeHandle, output.nativeHandleAfterClose);
+            assertTrue(output.writeCalls > 1);
+            assertTrue(output.size() > output.firstWriteBytes);
+            assertEquals(0, nativeHandle(rowGroup));
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> rowGroup.readColumns(allocator));
+        }
+    }
+
+    @Test
+    public void testMosaicRowGroupReaderDefersConcurrentCloseUntilWriteCompletes()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        int rowCount = 500_000;
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(rowCount);
+            for (int row = 0; row < rowCount; row++) {
+                values.set(row, row);
+            }
+            root.setRowCount(rowCount);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        try (MosaicReader reader = readerFromBytes(data);
+                MosaicRowGroupReader rowGroup = reader.openRowGroup(0)) {
+            long nativeHandle = nativeHandle(rowGroup);
+            assertTrue(nativeHandle != 0);
+            BlockingWriteOutputStream output = new BlockingWriteOutputStream();
+            AtomicReference<Throwable> writeFailure = new AtomicReference<>();
+            AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+            CountDownLatch closeReturned = new CountDownLatch(1);
+            Thread writer =
+                    new Thread(
+                            () -> {
+                                try {
+                                    assertEquals(
+                                            ColumnarTextJsonWriter.Status.WRITTEN,
+                                            ColumnarTextJsonWriter.write(rowGroup, output));
+                                } catch (Throwable failure) {
+                                    writeFailure.set(failure);
+                                }
+                            },
+                            "mosaic-row-group-writer");
+            Thread closer =
+                    new Thread(
+                            () -> {
+                                try {
+                                    rowGroup.close();
+                                } catch (Throwable failure) {
+                                    closeFailure.set(failure);
+                                } finally {
+                                    closeReturned.countDown();
+                                }
+                            },
+                            "mosaic-row-group-closer");
+            writer.setDaemon(true);
+            closer.setDaemon(true);
+
+            writer.start();
+            try {
+                assertTrue(
+                        output.enteredWrite.await(
+                                5, java.util.concurrent.TimeUnit.SECONDS));
+                closer.start();
+                assertTrue(
+                        closeReturned.await(
+                                5, java.util.concurrent.TimeUnit.SECONDS));
+                assertNull(closeFailure.get());
+                assertEquals(nativeHandle, nativeHandle(rowGroup));
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> rowGroup.readColumns(allocator));
+            } finally {
+                output.releaseWrite.countDown();
+                writer.join(5_000L);
+                closer.join(5_000L);
+                if (writer.isAlive()) {
+                    writer.interrupt();
+                    writer.join(1_000L);
+                }
+                if (closer.isAlive()) {
+                    closer.interrupt();
+                    closer.join(1_000L);
+                }
+            }
+
+            assertFalse(writer.isAlive());
+            assertFalse(closer.isAlive());
+            assertNull(writeFailure.get());
+            assertTrue(output.writeCalls > 1);
+            assertTrue(output.size() > output.firstWriteBytes);
+            assertEquals(0, nativeHandle(rowGroup));
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> rowGroup.readColumns(allocator));
+        }
+    }
+
+    @Test
+    public void testMosaicRowGroupReaderCloseIsIdempotentAndRejectsFurtherUse()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector values = (IntVector) root.getVector("value");
+            values.allocateNew(1);
+            values.set(0, 7);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        MosaicReader reader = readerFromBytes(data);
+        MosaicRowGroupReader rowGroup = reader.openRowGroup(0);
+        rowGroup.close();
+        rowGroup.close();
+
+        assertThrows(IllegalStateException.class, () -> rowGroup.readColumns(allocator));
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        output.write(9);
+        assertThrows(
+                IllegalStateException.class,
+                () -> ColumnarTextJsonWriter.write(rowGroup, output));
+        assertArrayEquals(new byte[] {9}, output.toByteArray());
+
+        reader.close();
+        assertThrows(IllegalStateException.class, () -> reader.openRowGroup(0));
+    }
+
+    @Test
+    public void testMosaicRowGroupReaderOutlivesReaderAndFreezesProjection()
+            throws Exception {
+        Schema schema =
+                new Schema(
+                        Arrays.asList(
+                                Field.notNullable(
+                                        "id", new ArrowType.Int(32, true)),
+                                Field.notNullable(
+                                        "value", new ArrowType.Int(32, true))));
+        byte[] data;
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+            IntVector ids = (IntVector) root.getVector("id");
+            IntVector values = (IntVector) root.getVector("value");
+            ids.allocateNew(1);
+            values.allocateNew(1);
+            ids.set(0, 7);
+            values.set(0, 11);
+            root.setRowCount(1);
+            data = writeToBytes(schema, writer -> writer.write(root));
+        }
+
+        MosaicReader reader = readerFromBytes(data);
+        MosaicRowGroupReader rowGroup = reader.openRowGroup(0);
+        reader.project(new String[] {"id"});
+        reader.close();
+
+        try (MosaicRowGroupReader ownedRowGroup = rowGroup) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            assertEquals(
+                    ColumnarTextJsonWriter.Status.WRITTEN,
+                    ColumnarTextJsonWriter.write(ownedRowGroup, output));
+            assertEquals(
+                    "{\"id\":\"7\",\"value\":\"11\"}",
+                    new String(
+                            output.toByteArray(),
+                            java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    public void testSingleRow() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("v", new ArrowType.Int(32, true))
         ));
@@ -707,7 +3031,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testZeroRows() {
+    public void testZeroRows() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("v", new ArrowType.Int(32, true))
         ));
@@ -725,7 +3049,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testStatsWithNulls() {
+    public void testStatsWithNulls() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("a", new ArrowType.Int(32, true)),
                 Field.nullable("b", new ArrowType.Int(64, true))
@@ -777,7 +3101,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testStatsAllNull() {
+    public void testStatsAllNull() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true))
         ));
@@ -831,7 +3155,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testSchemaRoundtrip() {
+    public void testSchemaRoundtrip() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("name", ArrowType.Utf8.INSTANCE),
                 Field.notNullable("id", new ArrowType.Int(32, true)),
@@ -994,7 +3318,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testWriterStatsMatchesReaderStats() {
+    public void testWriterStatsMatchesReaderStats() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("value", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))
@@ -1038,7 +3362,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testRowGroupNumRows() {
+    public void testRowGroupNumRows() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("id", new ArrowType.Int(32, true)),
                 Field.nullable("data", new ArrowType.Int(64, true))
@@ -1081,7 +3405,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testStatsEmptyStringMin() {
+    public void testStatsEmptyStringMin() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("s", ArrowType.Utf8.INSTANCE)
         ));
@@ -1124,7 +3448,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testRowGroupNumRowsSingleRowGroup() {
+    public void testRowGroupNumRowsSingleRowGroup() throws IOException {
         Schema arrowSchema = new Schema(Arrays.asList(
                 Field.nullable("x", new ArrowType.Int(32, true))
         ));
@@ -1147,7 +3471,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testArrayType() {
+    public void testArrayType() throws IOException {
         Field elementField = new Field("item", FieldType.nullable(new ArrowType.Int(32, true)), null);
         Field listField = new Field("tags", FieldType.nullable(ArrowType.List.INSTANCE), Arrays.asList(elementField));
         Schema arrowSchema = new Schema(Arrays.asList(
@@ -1235,7 +3559,7 @@ public class MosaicRoundtripTest {
     }
 
     @Test
-    public void testMapType() {
+    public void testMapType() throws IOException {
         // Use MapVector's writer to avoid schema mismatch with UnionMapWriter
         Field keyField = new Field("keys", FieldType.notNullable(new ArrowType.Int(32, true)), null);
         Field valueField = new Field("values", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);

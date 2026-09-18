@@ -16,7 +16,7 @@
 # under the License.
 
 [workspace]
-members = ["core", "ffi", "jni"]
+members = ["core", "ffi", "jni", "cli"]
 resolver = "2"
 
 [profile.release]

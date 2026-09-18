@@ -26,6 +26,12 @@
 
 A columnar-bucket hybrid format optimized for wide tables of Apache Paimon. 
 
+## Column-oriented text export
+
+The Java API can stream a row group as JSON containing comma-separated text columns,
+directly from Mosaic encodings without intermediate Arrow arrays.
+See the [format and API contract](docs/columnar-text-json.md).
+
 ## Java Linux compatibility
 
 Published Java artifacts include JNI libraries for Linux. The Linux GNU
@@ -48,4 +54,3 @@ Submit [issues](https://github.com/apache/paimon-mosaic/issues/new/choose) for b
 ## License
 
 Licensed under <a href="./LICENSE">Apache License, Version 2.0</a>.
-
