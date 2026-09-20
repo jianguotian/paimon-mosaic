@@ -1865,6 +1865,53 @@ mod tests {
     }
 
     #[test]
+    fn test_dictionary_tracking_disables_after_entry_limit() {
+        let types = [DataType::Int32, DataType::Utf8];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        let mut writer = BucketWriter::new(&type_refs, 32768, 255);
+
+        let ints = Int32Array::from_iter_values((0..255).chain(0..255));
+        let string_values: Vec<String> = (0..255)
+            .chain(0..255)
+            .map(|i| format!("value-{i:03}"))
+            .collect();
+        let strings = StringArray::from_iter_values(string_values.iter().map(String::as_str));
+        writer
+            .write_columns(&[&ints, &strings], &[&types[0], &types[1]])
+            .unwrap();
+
+        assert_eq!(writer.dict_tracking, vec![DictTracking::Active; 2]);
+        assert_eq!(writer.long_dict_maps[0].as_ref().unwrap().len(), 255);
+        assert_eq!(writer.byte_dict_maps[1].as_ref().unwrap().len(), 255);
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+        assert_eq!((data[0] >> 2) & 0x03, ENCODING_DICT);
+
+        let next_int = Int32Array::from(vec![255]);
+        let next_string = StringArray::from(vec!["value-255"]);
+        writer
+            .write_columns(&[&next_int, &next_string], &[&types[0], &types[1]])
+            .unwrap();
+
+        assert_eq!(writer.dict_tracking, vec![DictTracking::Disabled; 2]);
+        assert!(writer.long_dict_maps.iter().all(Option::is_none));
+        assert!(writer.byte_dict_maps.iter().all(Option::is_none));
+
+        let later_ints = Int32Array::from(vec![0, 256]);
+        let later_strings = StringArray::from(vec!["value-000", "value-256"]);
+        writer
+            .write_columns(&[&later_ints, &later_strings], &[&types[0], &types[1]])
+            .unwrap();
+
+        assert_eq!(writer.dict_tracking, vec![DictTracking::Disabled; 2]);
+        assert!(writer.long_dict_maps.iter().all(Option::is_none));
+        assert!(writer.byte_dict_maps.iter().all(Option::is_none));
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_PLAIN);
+        assert_eq!((data[0] >> 2) & 0x03, ENCODING_PLAIN);
+    }
+
+    #[test]
     fn test_append_null_bitmap_handles_source_and_destination_offsets() {
         let validity = BooleanBuffer::from(vec![
             true, false, true, false, false, true, true, false, true, false, true,
@@ -1921,10 +1968,12 @@ mod tests {
             None,
         ]);
         let first = source.slice(1, 4);
-        writer.write_columns(&[&first], &[&data_type]).unwrap();
+        let first_size = writer.write_columns(&[&first], &[&data_type]).unwrap();
+        assert_eq!(first_size, 28);
 
         let second = TimestampMillisecondArray::from(vec![None, Some(20), None]);
-        writer.write_columns(&[&second], &[&data_type]).unwrap();
+        let second_size = writer.write_columns(&[&second], &[&data_type]).unwrap();
+        assert_eq!(second_size, 11);
 
         assert_eq!(writer.num_rows, 7);
         assert_eq!(writer.non_null_counts[0], 4);
