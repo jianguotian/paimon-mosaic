@@ -291,6 +291,7 @@ mod tests {
         assert!(encoded.iter().flatten().any(|&token| token == 0xff));
         for (original, encoded_name) in names.iter().zip(&encoded) {
             assert_eq!(legacy_decode(encoded_name, &rules), *original);
+            assert_eq!(decode(encoded_name, &rules), *original);
         }
     }
 
