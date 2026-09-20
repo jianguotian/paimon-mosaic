@@ -1912,6 +1912,41 @@ mod tests {
     }
 
     #[test]
+    fn test_dictionary_tracking_disables_after_byte_limit() {
+        let types = [DataType::Utf8];
+        let type_refs: Vec<&DataType> = types.iter().collect();
+        // Encoded dictionary keys include the one-byte string length prefix:
+        // "a" is 2 bytes and "bb" is 3 bytes, exactly filling this budget.
+        let mut writer = BucketWriter::new(&type_refs, 5, 255);
+
+        // Repeat enough rows so DICT is smaller than PLAIN and the encoding assertion is stable.
+        let mut within_budget: Vec<Option<&str>> = (0..64)
+            .map(|i| Some(if i % 2 == 0 { "a" } else { "bb" }))
+            .collect();
+        within_budget.push(None);
+        let within_budget = StringArray::from(within_budget);
+        writer
+            .write_columns(&[&within_budget], &[&DataType::Utf8])
+            .unwrap();
+
+        assert_eq!(writer.dict_tracking[0], DictTracking::Active);
+        assert_eq!(writer.byte_dict_maps[0].as_ref().unwrap().len(), 2);
+        assert_eq!(writer.dict_total_bytes[0], 5);
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_DICT);
+
+        let beyond_budget = StringArray::from(vec![Some("a"), Some("ccc"), None]);
+        writer
+            .write_columns(&[&beyond_budget], &[&DataType::Utf8])
+            .unwrap();
+
+        assert_eq!(writer.dict_tracking[0], DictTracking::Disabled);
+        assert!(writer.byte_dict_maps[0].is_none());
+        let data = writer.finish();
+        assert_eq!(data[0] & 0x03, ENCODING_PLAIN);
+    }
+
+    #[test]
     fn test_append_null_bitmap_handles_source_and_destination_offsets() {
         let validity = BooleanBuffer::from(vec![
             true, false, true, false, false, true, true, false, true, false, true,
