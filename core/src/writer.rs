@@ -166,6 +166,19 @@ impl<S: OutputFile> MosaicWriter<S> {
         schema: MosaicSchema,
         options: WriterOptions,
     ) -> io::Result<Self> {
+        let columns = schema
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>();
+        MosaicSchema::validate(&columns)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let batch_col_map: Vec<usize> = (0..schema.columns.len()).collect();
         Self::from_mosaic_schema_with_map(out, schema, options, batch_col_map)
     }
@@ -723,6 +736,20 @@ mod tests {
         fn pos(&self) -> u64 {
             self.buf.len() as u64
         }
+    }
+
+    #[test]
+    fn test_from_mosaic_schema_rejects_empty_column_name() {
+        let schema = MosaicSchema::new(vec![("".to_string(), DataType::Int32, true)], 1);
+        let result =
+            MosaicWriter::from_mosaic_schema(MemOutputFile::new(), schema, Default::default());
+
+        let error = match result {
+            Ok(_) => panic!("empty column name must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "empty column name");
     }
 
     #[derive(Default)]
