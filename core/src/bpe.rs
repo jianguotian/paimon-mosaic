@@ -160,6 +160,9 @@ fn expand(token: usize, rules: &[[u8; 2]], out: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    const LEGACY_TOKEN_BASE: u8 = 0x80;
+    const LEGACY_MAX_RULES: usize = 128;
+
     fn reference_replace_pair(seq: &mut Vec<u16>, left: u16, right: u16, new_token: u16) {
         let mut i = 0;
         let mut out = 0;
@@ -183,7 +186,7 @@ mod tests {
             .collect();
         let mut rules = Vec::new();
 
-        for _ in 0..MAX_RULES {
+        for _ in 0..LEGACY_MAX_RULES {
             let mut pair_counts: HashMap<u32, u32> = HashMap::new();
             for seq in &tokens {
                 for pair in seq.windows(2) {
@@ -199,7 +202,7 @@ mod tests {
                 Some((&pair, &count)) if count > 1 => {
                     let left = (pair >> 16) as u16;
                     let right = pair as u16;
-                    let new_token = TOKEN_BASE as u16 + rules.len() as u16;
+                    let new_token = LEGACY_TOKEN_BASE as u16 + rules.len() as u16;
                     rules.push([left as u8, right as u8]);
                     for seq in &mut tokens {
                         reference_replace_pair(seq, left, right, new_token);
@@ -210,6 +213,26 @@ mod tests {
         }
 
         rules
+    }
+
+    fn legacy_decode(encoded: &[u8], rules: &[[u8; 2]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(encoded.len() * 2);
+        for &token in encoded {
+            legacy_expand(token as usize, rules, &mut out);
+        }
+        out
+    }
+
+    fn legacy_expand(token: usize, rules: &[[u8; 2]], out: &mut Vec<u8>) {
+        if token < LEGACY_TOKEN_BASE as usize {
+            out.push(token as u8);
+        } else {
+            let rule = rules
+                .get(token - LEGACY_TOKEN_BASE as usize)
+                .expect("encoded token must reference a frozen legacy rule");
+            legacy_expand(rule[0] as usize, rules, out);
+            legacy_expand(rule[1] as usize, rules, out);
+        }
     }
 
     #[test]
@@ -250,6 +273,25 @@ mod tests {
                 .map(|name| encode(name, &rules))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_full_legacy_token_space_round_trips() {
+        let owned_names: Vec<Vec<u8>> = (0..4096)
+            .map(|i| {
+                format!("prefix_{:04}_{}_{}_{}_suffix", i % 257, i, i % 97, i % 31).into_bytes()
+            })
+            .collect();
+        let names: Vec<&[u8]> = owned_names.iter().map(Vec::as_slice).collect();
+
+        let (rules, encoded) = build_vocabulary_and_encode(&names);
+
+        assert_eq!(rules.len(), LEGACY_MAX_RULES);
+        assert_eq!(rules, reference_build_vocabulary(&names));
+        assert!(encoded.iter().flatten().any(|&token| token == 0xff));
+        for (original, encoded_name) in names.iter().zip(&encoded) {
+            assert_eq!(legacy_decode(encoded_name, &rules), *original);
+        }
     }
 
     #[test]
