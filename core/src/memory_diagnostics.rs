@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bounded, opt-in sampling of writer buffer metadata and process RSS.
+//! Bounded, default-on sampling of writer buffer metadata and process RSS.
 //! Buffer capacities are requested storage, not allocator usable size or RSS.
 
 use std::fmt::{self, Write as _};
@@ -50,7 +50,11 @@ pub(crate) struct MemoryDiagnostics {
 
 impl MemoryDiagnostics {
     pub fn from_env() -> Option<Box<Self>> {
-        let every = parse_interval(&std::env::var(ENV).ok()?)?;
+        let every = match std::env::var(ENV) {
+            Ok(value) => parse_interval(Some(&value)),
+            Err(std::env::VarError::NotPresent) => parse_interval(None),
+            Err(std::env::VarError::NotUnicode(_)) => None,
+        }?;
         Some(Box::new(Self::new(every)))
     }
 
@@ -104,8 +108,8 @@ impl MemoryDiagnostics {
     }
 }
 
-fn parse_interval(value: &str) -> Option<u64> {
-    value.parse::<u64>().ok().filter(|&n| n > 0)
+fn parse_interval(value: Option<&str>) -> Option<u64> {
+    value.unwrap_or("1").parse::<u64>().ok().filter(|&n| n > 0)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -226,12 +230,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interval_is_explicit_and_counters_include_unsampled_appends() {
-        for value in ["", "0", "-1", "true", "999999999999999999999999999999"] {
-            assert_eq!(parse_interval(value), None);
+    fn interval_defaults_to_every_append_and_allows_overrides() {
+        let mut default = MemoryDiagnostics::new(parse_interval(None).unwrap());
+        for _ in 0..3 {
+            assert!(default.on_append(10));
         }
-        assert_eq!(parse_interval("1"), Some(1));
-        let mut d = MemoryDiagnostics::new(3);
+        for value in ["", "0", "-1", "true", "999999999999999999999999999999"] {
+            assert_eq!(parse_interval(Some(value)), None);
+        }
+        assert_eq!(parse_interval(Some("1")), Some(1));
+        let mut d = MemoryDiagnostics::new(parse_interval(Some("3")).unwrap());
         assert!(d.on_append(10));
         assert!(!d.on_append(20));
         assert!(d.on_append(30));

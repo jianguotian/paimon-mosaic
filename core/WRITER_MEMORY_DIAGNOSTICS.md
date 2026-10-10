@@ -19,25 +19,33 @@
 
 # Writer memory diagnostics
 
-To investigate an append-time memory peak without a native heap profiler, enable
-one diagnostic line per append and capture the process's standard error:
+Writer memory diagnostics are enabled by default: every append emits one line
+to the process's standard error. Rebuild and integrate this branch using the
+application's usual process, then capture standard error when launching it:
 
 ```sh
-MOSAIC_MEMORY_DIAGNOSTICS=1 ./your-collector 2>mosaic-memory.log
+./your-collector 2>mosaic-memory.log
 ```
 
 Run the usual workload and return `mosaic-memory.log` together with the process
 peak reported by the existing monitoring tool. No changes to schemas, batch
 sizes, row-group sizes, collection intervals or allocator reclamation are needed.
-For an Android native service, set this environment variable in its launch
-environment **before creating writers** and route standard error to a file or
-the service's existing log collector; standard error is not necessarily logcat.
+After the first append, check for a line starting with `[mosaic-memory]` to
+confirm collection. No environment variable is needed. For an Android native
+service, route standard error to a file or the service's existing log collector
+in its actual launch configuration, then restart it; these lines do not
+automatically enter Android logcat or the application's logging framework.
 
-The environment variable is read once per writer construction. Unset, `0`, or
-invalid values disable diagnostics. A positive integer N samples the first
-append and then every Nth append of each writer. For example, `100` reduces log
-volume for workloads with frequent writes. All bindings use the same Rust
-implementation; no C struct layout or function signature changes are required.
+The optional `MOSAIC_MEMORY_DIAGNOSTICS` environment variable is read once per
+writer construction. Unset means every append (`1`); `0` or invalid values
+disable diagnostics. A positive integer N samples the first append and then
+every Nth append of each writer. For example, `MOSAIC_MEMORY_DIAGNOSTICS=100`
+reduces log volume for workloads with frequent writes, and
+`MOSAIC_MEMORY_DIAGNOSTICS=0` explicitly disables diagnostics. Apply overrides
+in the process's launch environment before creating writers; exporting a
+variable in an unrelated shell does not change an already running service.
+All bindings use the same Rust implementation; no C struct layout or function
+signature changes are required.
 This switch controls diagnostics only, not integer cache compaction.
 
 ## Reading the log
@@ -105,15 +113,18 @@ buffer. A slow or blocked stderr destination can delay the append; log errors
 are ignored and never change writer success/failure or encoded bytes.
 
 For the existing synthetic example, compare separate processes with the variable
-unset, set to `1`, and optionally set to a larger interval. Capture stderr to a
-regular file, use the same data and binary, alternate run order, and compare
+set to `0`, unset (the default, equivalent to `1`), and optionally set to a larger
+interval. Capture stderr to a regular file, use the same data and binary,
+alternate run order, and compare
 append timing, CPU time, peak RSS and output hashes. Figures from this experiment
 describe the test workload, not a guaranteed overhead on an Android application.
 
 ### ARM64 Linux measurement
 
-Measured against the same diagnostic binary with the environment variable unset
-or set to `1`; regular-file stderr, three integer columns, Zstd level 1, dictionary
+Measured at revision `40b03fb`, before diagnostics became enabled by default,
+with the environment variable unset (off at that revision) or set to `1`.
+For current builds, use `0` to reproduce the off path; the sampled work is
+unchanged. Regular-file stderr, three integer columns, Zstd level 1, dictionary
 disabled, one large row group. Every case contains 5,000,000 rows. Medians of
 seven repetitions for the first case and five for the others:
 
