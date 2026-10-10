@@ -21,6 +21,7 @@ use arrow_array::*;
 use arrow_schema::Schema;
 
 use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
+use crate::memory_diagnostics::{BufferMemory, MemoryDiagnostics};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
 use crate::stats::{self, ColumnStats, StatsCollector};
@@ -147,6 +148,7 @@ pub struct MosaicWriter<S: OutputFile> {
     total_compressed: u64,
     stats_collector: Option<StatsCollector>,
     state: WriterState,
+    memory_diagnostics: Option<Box<MemoryDiagnostics>>,
 }
 
 impl<S: OutputFile> MosaicWriter<S> {
@@ -259,6 +261,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             total_compressed: 0,
             stats_collector,
             state: WriterState::Open,
+            memory_diagnostics: MemoryDiagnostics::from_env(),
         })
     }
 
@@ -380,6 +383,24 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         self.current_row_group_rows += batch.num_rows();
         self.current_buffered_size += size;
+
+        if let Some(diagnostics) = &mut self.memory_diagnostics {
+            if diagnostics.on_append(batch.num_rows()) {
+                let mut memory = BufferMemory::default();
+                for &b in &self.active_buckets {
+                    self.bucket_writers[b]
+                        .as_ref()
+                        .unwrap()
+                        .add_memory_usage(&mut memory);
+                }
+                // Sample before an automatic flush resets the just-filled caches.
+                diagnostics.emit(
+                    self.row_group_metas.len(),
+                    self.current_row_group_rows,
+                    memory,
+                );
+            }
+        }
 
         if self.current_buffered_size >= self.row_group_max_size {
             self.flush_row_group()?;
@@ -1282,3 +1303,7 @@ mod tests {
 #[cfg(test)]
 #[path = "writer_integer_tests.rs"]
 mod integer_tests;
+
+#[cfg(test)]
+#[path = "writer_memory_tests.rs"]
+mod memory_tests;

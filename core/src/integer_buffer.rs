@@ -17,6 +17,8 @@
 
 use std::io::{self, Write};
 
+use crate::memory_diagnostics::BufferMemory;
+
 // A late outlier may widen this block, never the entire buffered column.
 const BLOCK_VALUES: usize = 4096;
 const OUTPUT_BYTES: usize = 16 * 1024;
@@ -155,6 +157,19 @@ impl IntegerBuffer {
         self.len = 0;
     }
 
+    pub(crate) fn add_memory_usage(&self, memory: &mut BufferMemory) {
+        memory.integer_logical_bytes += self.logical_len();
+        // Includes the Box<IntegerBuffer> and its allocated block descriptors.
+        memory.integer_metadata_bytes +=
+            std::mem::size_of::<Self>() + self.blocks.capacity() * std::mem::size_of::<Block>();
+        for block in &self.blocks {
+            memory.integer_payload_bytes += block.bytes.len();
+            memory.integer_capacity_bytes += block.bytes.capacity();
+            memory.integer_width_values[block.width.trailing_zeros() as usize] +=
+                block.bytes.len() / block.width;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn allocated_bytes(&self) -> usize {
         self.blocks.capacity() * std::mem::size_of::<Block>()
@@ -197,6 +212,39 @@ fn widen<const SRC: usize, const DST: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_capacities_and_widths_follow_promotion_and_reset() {
+        let mut buffer = IntegerBuffer::new(4);
+        buffer.extend_from_slice(&vec![255i32; BLOCK_VALUES]);
+        buffer.extend_from_slice(&vec![65535i32; BLOCK_VALUES]);
+        buffer.extend_from_slice(&[1i32, 2, 3]);
+        buffer.extend_from_slice(&[-1i32, i32::MIN]);
+        let mut memory = BufferMemory::default();
+        buffer.add_memory_usage(&mut memory);
+        assert_eq!(memory.integer_logical_bytes, (2 * BLOCK_VALUES + 5) * 4);
+        assert_eq!(memory.integer_payload_bytes, BLOCK_VALUES * 3 + 5 * 4);
+        assert_eq!(
+            memory.integer_width_values,
+            [BLOCK_VALUES, BLOCK_VALUES, 5, 0]
+        );
+        assert!(memory.integer_capacity_bytes >= memory.integer_payload_bytes);
+        assert_eq!(
+            memory.integer_capacity_bytes + memory.integer_metadata_bytes,
+            buffer.allocated_bytes() + std::mem::size_of::<IntegerBuffer>()
+        );
+        buffer.clear();
+        let mut cleared = BufferMemory::default();
+        buffer.add_memory_usage(&mut cleared);
+        assert_eq!(cleared.integer_logical_bytes, 0);
+        assert_eq!(cleared.integer_payload_bytes, 0);
+        assert_eq!(cleared.integer_capacity_bytes, 0);
+        assert_eq!(cleared.integer_width_values, [0; 4]);
+        assert_eq!(
+            cleared.integer_metadata_bytes,
+            memory.integer_metadata_bytes
+        );
+    }
 
     #[test]
     fn unsigned_ranges_negative_values_and_late_outliers() {

@@ -107,3 +107,6 @@ files across the baseline/candidate runs. Figures are medians of synthetic runs,
 not measured savings for a particular Android application. Source Arrow arrays
 are still widened by the caller; avoiding those arrays requires a separate input
 API/client integration change.
+
+For opt-in append-time buffer capacities and Linux/Android RSS logs, see
+[Writer memory diagnostics](WRITER_MEMORY_DIAGNOSTICS.md).

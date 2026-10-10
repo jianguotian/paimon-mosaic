@@ -87,6 +87,18 @@ pub struct BucketWriter {
 }
 
 impl BucketWriter {
+    pub(crate) fn add_memory_usage(&self, memory: &mut crate::memory_diagnostics::BufferMemory) {
+        for col in 0..self.total_columns {
+            if let Some(buffer) = &self.integer_buffers[col] {
+                buffer.add_memory_usage(memory);
+            }
+            memory.other_value_capacity_bytes += self.value_buffers[col].capacity();
+            memory.null_capacity_bytes += self.null_bitmaps[col].capacity();
+            memory.dictionary_entries += self.long_dict_maps[col].as_ref().map_or(0, HashMap::len)
+                + self.byte_dict_maps[col].as_ref().map_or(0, HashMap::len);
+        }
+    }
+
     pub fn new(
         col_types: &[&DataType],
         max_dict_total_bytes: usize,
