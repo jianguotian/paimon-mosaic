@@ -19,9 +19,43 @@
 
 # Writer memory diagnostics
 
-Writer memory diagnostics are enabled by default: every append emits one line
-to the process's standard error. Rebuild and integrate this branch using the
-application's usual process, then capture standard error when launching it:
+Writer memory diagnostics are enabled by default: every append emits one line.
+On Android, it goes directly to **logcat at INFO level with tag
+`mosaic-memory`**, through the NDK's `liblog`. No logger initialization, stderr
+redirection, C/JNI callback, or business-code change is needed. Other platforms
+write to standard error.
+
+## Android customer collection
+
+1. Rebuild and integrate this branch using the application's usual process.
+   Keep input data, append intervals, row-group sizes, close intervals and
+   allocator reclamation unchanged.
+2. On the computer connected to the device, start collection before restarting
+   the business process and running the workload:
+
+   ```sh
+   adb logcat -v threadtime -T 1 'mosaic-memory:I' '*:S' | tee mosaic-memory.log
+   ```
+
+   After the first append, verify a **new** `[mosaic-memory]` line with the
+   business process's PID appears on screen. This verifies collection before
+   investing in a full run. Keep collection running through at least one normal
+   ten-minute write/close cycle, then press Ctrl-C. Do not clear the device's
+   existing logs. With multiple connected devices, add `adb -s SERIAL`.
+3. Return `mosaic-memory.log` and the overall process peak from the same existing
+   monitoring tool used for the existing old/new comparison. No heap profile is needed.
+
+The command reads the Android main log buffer; it does not depend on the business
+application's logger. As with other Android INFO logs, device log filtering and
+access must allow collection. If no new record appears after a confirmed append,
+check the loaded build and diagnostic override, then the device's tag filtering
+and logcat access **before continuing the run**. This library does not modify
+process-wide loggers, device properties or log priorities. The API is described
+in the [Android NDK logging reference](https://developer.android.com/ndk/reference/group/logging).
+
+## Other platforms
+
+Capture standard error when launching the process:
 
 ```sh
 ./your-collector 2>mosaic-memory.log
@@ -31,10 +65,9 @@ Run the usual workload and return `mosaic-memory.log` together with the process
 peak reported by the existing monitoring tool. No changes to schemas, batch
 sizes, row-group sizes, collection intervals or allocator reclamation are needed.
 After the first append, check for a line starting with `[mosaic-memory]` to
-confirm collection. No environment variable is needed. For an Android native
-service, route standard error to a file or the service's existing log collector
-in its actual launch configuration, then restart it; these lines do not
-automatically enter Android logcat or the application's logging framework.
+confirm collection. No environment variable is needed.
+
+## Optional sampling override
 
 The optional `MOSAIC_MEMORY_DIAGNOSTICS` environment variable is read once per
 writer construction. Unset means every append (`1`); `0` or invalid values
@@ -47,6 +80,27 @@ variable in an unrelated shell does not change an already running service.
 All bindings use the same Rust implementation; no C struct layout or function
 signature changes are required.
 This switch controls diagnostics only, not integer cache compaction.
+
+## Evaluating the optimization
+
+Use two separate measurements:
+
+| Question | Evidence |
+| --- | --- |
+| How much did the customer's overall peak improve? | Compare the old and optimized builds with the same input/configuration, process restart policy and existing peak monitor. Report both peaks and `(old_peak - new_peak) / old_peak`. For repeatability, use three matching runs per build and retain the individual peaks. |
+| Is integer compaction working, and on how much data? | For the same writer and append position, compare `integer_logical_bytes` with `integer_payload_bytes`; check `integer_capacity_bytes + integer_metadata_bytes` for the explicitly counted integer storage. |
+
+If the logical and compacted payloads are close, the data in that sample has
+little compaction benefit; the width counters show the resulting storage widths.
+If payload reduction is large but the overall peak reduction is small, the
+integer optimization is working but does not explain the process peak by itself.
+Use the log's timestamps and row counts to choose the next investigation; do not
+assign unmeasured bytes to the business application by subtraction.
+
+An additional run with diagnostics enabled explains the earlier comparison;
+it is not a replacement for the original old/new peak measurement. When making
+a new precise performance comparison, disable diagnostics on the optimized
+build with `MOSAIC_MEMORY_DIAGNOSTICS=0` to avoid charging it for logging only.
 
 ## Reading the log
 
@@ -105,11 +159,13 @@ reads or log writes in this path. The environment is checked only at constructio
 When enabled, each writer owns four u64 counters/settings (32 bytes on ARM64,
 excluding allocator overhead). A sampled append walks column/block metadata,
 without scanning values or dictionary entries, reads up to 4 KiB of proc status,
-formats at most 2 KiB of log data in stack storage, and writes one line. It keeps
+formats a line in 2 KiB of stack storage (including a reserved NUL terminator),
+and writes it once to Android liblog or stderr. It keeps
 no sample history and starts no thread. This is O(columns + integer blocks) per
 sample, not a constant-time operation; choose a larger sampling interval if
-necessary. Log storage grows on the output device, not in a retained Rust log
-buffer. A slow or blocked stderr destination can delay the append; log errors
+necessary. Mosaic retains no log history; Android's system log buffers and the
+collection file are managed separately. A slow logging destination can delay
+the append; log errors
 are ignored and never change writer success/failure or encoded bytes.
 
 For the existing synthetic example, compare separate processes with the variable
@@ -123,8 +179,8 @@ describe the test workload, not a guaranteed overhead on an Android application.
 
 Measured at revision `40b03fb`, before diagnostics became enabled by default,
 with the environment variable unset (off at that revision) or set to `1`.
-For current builds, use `0` to reproduce the off path; the sampled work is
-unchanged. Regular-file stderr, three integer columns, Zstd level 1, dictionary
+For current Linux builds, use `0` to reproduce the off path; the sampled
+work is unchanged. These measurements do not measure Android liblog overhead. Regular-file stderr, three integer columns, Zstd level 1, dictionary
 disabled, one large row group. Every case contains 5,000,000 rows. Medians of
 seven repetitions for the first case and five for the others:
 

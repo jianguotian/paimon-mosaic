@@ -19,7 +19,9 @@
 //! Buffer capacities are requested storage, not allocator usable size or RSS.
 
 use std::fmt::{self, Write as _};
-use std::io::{self, Write};
+use std::io;
+#[cfg(any(not(target_os = "android"), test))]
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -97,8 +99,8 @@ impl MemoryDiagnostics {
         {
             self.last_sample = Some(sample);
         }
-        // A closed/full logging destination must never fail a data write.
-        let _ = sample.write_to(&mut io::stderr().lock());
+        // A logging failure must never fail a data write.
+        let _ = sample.emit();
     }
 
     #[cfg(test)]
@@ -179,13 +181,30 @@ pub(crate) struct Sample {
 }
 
 impl Sample {
+    fn emit(&self) -> io::Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            self.format_line()?.write_android()
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            self.write_to(&mut io::stderr().lock())
+        }
+    }
+
+    #[cfg(any(not(target_os = "android"), test))]
     fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
+        let line = self.format_line()?;
+        output.write_all(&line.bytes[..line.len])
+    }
+
+    fn format_line(&self) -> io::Result<LogLine> {
         let mut line = LogLine {
             bytes: [0; 2048],
             len: 0,
         };
         let b = self.buffers;
-        // One bounded line, one write_all call; no retained log history.
+        // One bounded line; no retained log history.
         writeln!(
             line,
             "[mosaic-memory] v=1 unix_ms={} pid={} writer={} stage=append_buffered append={} total_rows={} row_group={} row_group_rows={} integer_logical_bytes={} integer_payload_bytes={} integer_capacity_bytes={} integer_metadata_bytes={} width1_values={} width2_values={} width4_values={} width8_values={} other_value_capacity_bytes={} null_capacity_bytes={} dictionary_entries={} rss_bytes={} rss_hwm_bytes={}",
@@ -197,7 +216,7 @@ impl Sample {
             b.other_value_capacity_bytes, b.null_capacity_bytes, b.dictionary_entries,
             OptionalBytes(self.rss.current), OptionalBytes(self.rss.high_watermark),
         ).map_err(|_| io::Error::other("memory diagnostic line too long"))?;
-        output.write_all(&line.bytes[..line.len])
+        Ok(line)
     }
 }
 
@@ -215,10 +234,47 @@ struct LogLine {
     bytes: [u8; 2048],
     len: usize,
 }
+impl LogLine {
+    #[cfg(any(target_os = "android", test))]
+    fn as_c_str(&self) -> io::Result<&std::ffi::CStr> {
+        std::ffi::CStr::from_bytes_with_nul(&self.bytes[..=self.len]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid diagnostic log string")
+        })
+    }
+
+    #[cfg(target_os = "android")]
+    fn write_android(&self) -> io::Result<()> {
+        use std::ffi::{c_char, c_int};
+
+        #[link(name = "log")]
+        unsafe extern "C" {
+            fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+        }
+
+        const ANDROID_LOG_INFO: c_int = 4;
+        let message = self.as_c_str()?;
+        // SAFETY: Both strings are NUL-terminated and remain alive for the call.
+        // liblog copies the message. Do not install a process-wide logger or
+        // change the application's log filtering; collection uses this tag.
+        unsafe {
+            __android_log_write(
+                ANDROID_LOG_INFO,
+                c"mosaic-memory".as_ptr(),
+                message.as_ptr(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Write for LogLine {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let end = self.len.checked_add(s.len()).ok_or(fmt::Error)?;
-        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        // Keep the final byte zero for Android's C logging API.
+        let capacity = self.bytes.len() - 1;
+        let destination = self.bytes[..capacity]
+            .get_mut(self.len..end)
+            .ok_or(fmt::Error)?;
         destination.copy_from_slice(s.as_bytes());
         self.len = end;
         Ok(())
@@ -294,6 +350,8 @@ mod tests {
         assert!(bytes.len() < 2048);
         let line = std::str::from_utf8(&bytes).unwrap();
         assert!(line.ends_with("rss_bytes=na rss_hwm_bytes=na\n"));
+        let formatted = sample.format_line().unwrap();
+        assert_eq!(formatted.as_c_str().unwrap().to_bytes(), bytes);
         struct Failing;
         impl Write for Failing {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
@@ -304,5 +362,19 @@ mod tests {
             }
         }
         assert!(sample.write_to(&mut Failing).is_err());
+    }
+
+    #[test]
+    fn log_line_reserves_terminator_and_rejects_embedded_nul() {
+        let mut line = LogLine {
+            bytes: [0; 2048],
+            len: 0,
+        };
+        line.write_str(&"x".repeat(2047)).unwrap();
+        assert_eq!(line.as_c_str().unwrap().to_bytes().len(), 2047);
+        assert!(line.write_str("x").is_err());
+        assert_eq!(line.as_c_str().unwrap().to_bytes().len(), 2047);
+        line.bytes[10] = 0;
+        assert!(line.as_c_str().is_err());
     }
 }
