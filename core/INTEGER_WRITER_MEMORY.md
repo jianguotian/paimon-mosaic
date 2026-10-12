@@ -49,6 +49,10 @@ Integer values are expanded into a reusable 16 KiB scratch buffer at encoding
 time. Nullable append gathers at most 4,096 i64 values (32 KiB). Dictionary indices
 are also emitted incrementally. Buckets containing compact integer columns use
 this sink-based encoder rather than assembling the full bucket/page first.
+Uncompressed integer buckets use an additional 16 KiB output buffer to coalesce
+small writes before invoking file or C/JNI output callbacks. Pending bytes are
+drained explicitly at the end of the bucket; errors or unwinding discard them
+without retrying a potentially partial sink write.
 
 Encoded units up to 1 MiB use bounded staging and the original one-shot Zstd
 compressor to avoid streaming overhead on small pages. Larger units stream to

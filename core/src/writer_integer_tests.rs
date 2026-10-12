@@ -18,7 +18,7 @@
 use super::*;
 use crate::reader::{InputFile, MosaicReader, ReaderAccess};
 use arrow_schema::{DataType, Field, Schema};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 impl InputFile for Bytes {
     fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
@@ -40,6 +40,146 @@ impl OutputFile for Bytes {
     }
     fn pos(&self) -> u64 {
         self.0.len() as u64
+    }
+}
+
+#[derive(Default)]
+struct OutputCalls {
+    bytes: Vec<u8>,
+    writes: Vec<usize>,
+    flushes: usize,
+}
+
+struct RecordingOutput {
+    calls: Arc<Mutex<OutputCalls>>,
+    fail_on_write: Option<usize>,
+}
+
+impl OutputFile for RecordingOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.writes.push(bytes.len());
+        if self.fail_on_write == Some(calls.writes.len()) {
+            // OutputFile callbacks can fail after writing a prefix. Retrying
+            // the buffered bytes would duplicate that prefix in the file.
+            calls.bytes.extend_from_slice(&bytes[..bytes.len() / 2]);
+            return Err(io::Error::other("buffered output failure"));
+        }
+        calls.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.calls.lock().unwrap().flushes += 1;
+        Ok(())
+    }
+
+    fn pos(&self) -> u64 {
+        self.calls.lock().unwrap().bytes.len() as u64
+    }
+}
+
+fn dictionary_input(rows: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(
+        (0..100)
+            .map(|col| Field::new(format!("c{col:03}"), DataType::Int32, false))
+            .collect::<Vec<_>>(),
+    ));
+    let values: ArrayRef = Arc::new(Int32Array::from(
+        (0..rows).map(|row| (row % 200) as i32).collect::<Vec<_>>(),
+    ));
+    RecordBatch::try_new(schema, vec![values; 100]).unwrap()
+}
+
+#[test]
+fn uncompressed_integer_output_coalesces_dictionary_writes() {
+    let input = dictionary_input(10_000);
+    let options = || WriterOptions {
+        compression: COMPRESSION_NONE,
+        num_buckets: 1,
+        row_group_max_size: 1,
+        ..Default::default()
+    };
+    let calls = Arc::new(Mutex::new(OutputCalls::default()));
+    let mut compact = MosaicWriter::new(
+        RecordingOutput {
+            calls: calls.clone(),
+            fail_on_write: None,
+        },
+        &input.schema(),
+        options(),
+    )
+    .unwrap();
+    let mut wide = MosaicWriter::new(Bytes::default(), &input.schema(), options()).unwrap();
+    for bucket in wide.bucket_writers.iter_mut().flatten() {
+        bucket.use_wide_integer_buffers();
+    }
+    compact.write_batch(&input).unwrap();
+    wide.write_batch(&input).unwrap();
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.bytes, wide.output().0);
+        assert!(calls.writes.len() <= calls.bytes.len().div_ceil(INTEGER_OUTPUT_BUFFER_SIZE / 2));
+        assert!(calls
+            .writes
+            .iter()
+            .all(|&len| len <= INTEGER_OUTPUT_BUFFER_SIZE));
+        assert_eq!(
+            calls.flushes, 0,
+            "bucket completion must not flush the sink"
+        );
+    }
+    compact.close().unwrap();
+    wide.close().unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.bytes, wide.output().0);
+    assert_eq!(calls.flushes, 1);
+}
+
+#[test]
+fn uncompressed_integer_output_failure_does_not_retry_buffered_bytes() {
+    // A small constant bucket fails at the final drain; the dictionary bucket
+    // fails while encoding. Exercise both automatic row-group flush and close.
+    for (rows, fail_on_write) in [(1, 1), (10_000, 2)] {
+        let input = dictionary_input(rows);
+        for row_group_max_size in [1, u64::MAX] {
+            let calls = Arc::new(Mutex::new(OutputCalls::default()));
+            let mut writer = MosaicWriter::new(
+                RecordingOutput {
+                    calls: calls.clone(),
+                    fail_on_write: Some(fail_on_write),
+                },
+                &input.schema(),
+                WriterOptions {
+                    compression: COMPRESSION_NONE,
+                    num_buckets: 1,
+                    row_group_max_size,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let result = writer.write_batch(&input);
+            let error = if row_group_max_size == 1 {
+                result.unwrap_err()
+            } else {
+                result.unwrap();
+                writer.close().unwrap_err()
+            };
+            assert_eq!(error.to_string(), "buffered output failure");
+            assert_eq!(calls.lock().unwrap().writes.len(), fail_on_write);
+            let bytes_after_failure = calls.lock().unwrap().bytes.clone();
+            assert!(writer
+                .write_batch(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("aborted"));
+            assert!(writer.close().unwrap_err().to_string().contains("aborted"));
+            drop(writer);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.writes.len(), fail_on_write);
+            assert_eq!(calls.bytes, bytes_after_failure);
+            assert_eq!(calls.flushes, 0);
+        }
     }
 }
 

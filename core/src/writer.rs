@@ -715,6 +715,57 @@ impl<S: OutputFile> io::Write for OutputWriter<'_, S> {
     }
 }
 
+const INTEGER_OUTPUT_BUFFER_SIZE: usize = 16 * 1024;
+
+// Coalesce flags, dictionary entries and value chunks before calling the sink.
+// Unlike BufWriter, this has no flushing Drop: a failed callback may already
+// have written a prefix, so neither errors nor unwinding may retry its bytes.
+struct BufferedOutputWriter<'a, S> {
+    out: &'a mut S,
+    buffer: Vec<u8>,
+}
+
+impl<'a, S: OutputFile> BufferedOutputWriter<'a, S> {
+    fn new(out: &'a mut S) -> Self {
+        Self {
+            out,
+            buffer: Vec::with_capacity(INTEGER_OUTPUT_BUFFER_SIZE),
+        }
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            self.out.write(&self.buffer)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        // Drain the encoding buffer only; the sink is flushed when the file closes.
+        self.drain()
+    }
+}
+
+impl<S: OutputFile> io::Write for BufferedOutputWriter<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > INTEGER_OUTPUT_BUFFER_SIZE - self.buffer.len() {
+            self.drain()?;
+        }
+        if bytes.len() >= INTEGER_OUTPUT_BUFFER_SIZE {
+            self.out.write(bytes)?;
+        } else {
+            self.buffer.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain()?;
+        self.out.flush()
+    }
+}
+
 // Small encoded units use the existing one-shot compressor. This bounds the
 // materialized input while avoiding streaming context overhead for tiny pages.
 const INTEGER_ENCODING_BUFFER_LIMIT: usize = 1024 * 1024;
@@ -765,7 +816,11 @@ fn write_integer_bucket<S: OutputFile>(
     let start = out.pos();
     if !paged {
         match compression {
-            COMPRESSION_NONE => bucket.write_encoded(&mut OutputWriter(out))?,
+            COMPRESSION_NONE => {
+                let mut buffered = BufferedOutputWriter::new(out);
+                bucket.write_encoded(&mut buffered)?;
+                buffered.finish()?;
+            }
             COMPRESSION_ZSTD => {
                 check_zstd_block_size(raw_size, "bucket uncompressed size")?;
                 compress_integer_unit(OutputWriter(out), level, raw_size, |mut sink| {
