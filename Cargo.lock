@@ -898,6 +898,7 @@ version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-data",
  "arrow-schema",
  "libc",
  "zstd",
