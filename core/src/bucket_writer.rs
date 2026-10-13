@@ -95,6 +95,94 @@ pub struct BucketWriter {
 }
 
 impl BucketWriter {
+    /// Inspect metadata only. Never scan values or allocate a second dictionary.
+    pub(crate) fn add_memory_usage(&self, memory: &mut crate::memory_diagnostics::BufferMemory) {
+        use crate::memory_diagnostics::ColumnMemory;
+        for col in 0..self.total_columns {
+            let before_capacity = memory.integer_capacity_bytes;
+            let before_metadata = memory.integer_metadata_bytes;
+            let before_payload = memory.integer_payload_bytes;
+            if let Some(buffer) = &self.integer_buffers[col] {
+                buffer.add_memory_usage(memory);
+            }
+            let integer_capacity = memory.integer_capacity_bytes - before_capacity;
+            let metadata = memory.integer_metadata_bytes - before_metadata;
+            let payload =
+                memory.integer_payload_bytes - before_payload + self.value_buffers[col].len();
+            let other_capacity = self.value_buffers[col].capacity();
+            let null_capacity = self.null_bitmaps[col].capacity();
+            memory.other_value_capacity_bytes += other_capacity;
+            memory.null_capacity_bytes += null_capacity;
+            // After reset these are empty caches, not newly observed ALL_NULL columns.
+            let state = if self.col_num_rows(col) == 0 {
+                3
+            } else if self.non_null_counts[col] == 0 {
+                0
+            } else if self.const_tracking[col] {
+                1
+            } else {
+                2
+            };
+            memory.columns[state].add(ColumnMemory {
+                columns: 1,
+                payload_bytes: payload,
+                integer_capacity_bytes: integer_capacity,
+                other_capacity_bytes: other_capacity,
+                integer_metadata_bytes: metadata,
+                null_capacity_bytes: null_capacity,
+            });
+
+            let d = &mut memory.dictionary;
+            match self.dict_tracking[col] {
+                DictTracking::Pending => d.pending_columns += 1,
+                DictTracking::Active => d.active_columns += 1,
+                DictTracking::Disabled => d.disabled_columns += 1,
+            }
+            let mut table_bytes = 0;
+            if let Some(dict) = &self.long_dict_maps[col] {
+                memory.dictionary_entries += dict.len();
+                d.fixed_entries += dict.len();
+                d.fixed_capacity += dict.capacity();
+                table_bytes += dict.capacity() * std::mem::size_of::<(u64, usize)>();
+            }
+            if let Some(dict) = &self.byte_dict_maps[col] {
+                memory.dictionary_entries += dict.len();
+                d.variable_entries += dict.len();
+                d.variable_capacity += dict.capacity();
+                table_bytes += dict.capacity() * std::mem::size_of::<(Vec<u8>, usize)>();
+                // Keys are allocated with value.to_vec(); the existing incremental
+                // counter tracks requested key bytes and resets with the map.
+                d.key_bytes += self.dict_total_bytes[col];
+            }
+            d.table_payload_capacity_lower_bound += table_bytes;
+            if self.dict_tracking[col] != DictTracking::Active {
+                d.inactive_table_payload_capacity_lower_bound += table_bytes;
+            }
+        }
+    }
+
+    pub(crate) fn add_current_encoding_usage(
+        &self,
+        memory: &mut crate::memory_diagnostics::FlushMemory,
+    ) {
+        self.add_encoding_usage(&self.compute_encodings().0, memory);
+    }
+
+    pub(crate) fn add_encoding_usage(
+        &self,
+        encodings: &[u8],
+        memory: &mut crate::memory_diagnostics::FlushMemory,
+    ) {
+        for (col, &encoding) in encodings.iter().enumerate() {
+            let bytes = self.logical_value_size(col);
+            memory.encoding_columns[encoding as usize] += 1;
+            memory.logical_value_bytes += bytes;
+            if encoding == ENCODING_DICT {
+                memory.dict_logical_value_bytes += bytes;
+            }
+        }
+    }
+
     pub fn new(
         col_types: &[&DataType],
         max_dict_total_bytes: usize,

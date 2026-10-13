@@ -19,6 +19,7 @@ pub mod bpe;
 pub mod bucket_reader;
 pub mod bucket_writer;
 mod integer_buffer;
+mod memory_diagnostics;
 pub mod reader;
 pub mod schema;
 pub mod spec;
