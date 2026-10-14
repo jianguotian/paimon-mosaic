@@ -19,10 +19,14 @@
 
 # Writer memory diagnostics
 
-This diagnostic patch builds on main's integer buffer/encoding optimization and
-lazy dictionaries. It changes observation only: schema, encoding choices, file
-bytes, row-group thresholds, input ownership, and the public C/JNI/Rust APIs stay
-the same. No application logger registration or memory profiler is required.
+This patch builds on main's integer buffer/encoding optimization. Dictionary
+hash tables are now built from buffered values only when a bucket is encoded,
+then released before the next bucket. Appending and resetting retain no dictionary
+tables. The schema, dictionary limits/first-occurrence ordering, encoding selection,
+row-group thresholds, input ownership, and public C/JNI/Rust APIs stay the same.
+Diagnostics are default-on; no application logger registration or memory profiler
+is required. Moving dictionary work into flush can change flush latency; compare
+whole-write CPU time as well as append and close time.
 
 ## Collect one useful run
 
@@ -33,7 +37,7 @@ the same. No application logger registration or memory profiler is required.
    ```sh
    adb logcat -v threadtime -T 1 'mosaic-memory:I' '*:S' | tee mosaic-memory.log
    ```
-   Check that NEW lines contain `[mosaic-memory] v=2`, `stage=append_begin`, and
+   Check that NEW lines contain `[mosaic-memory] v=3`, `stage=create_begin`, and
    the application's PID. Device log filtering still applies. On Linux, capture
    the application's stderr instead, for example `./app 2>mosaic-memory.log`.
 3. Keep the same data, 30-second append interval, large row groups, and normal
@@ -52,8 +56,8 @@ stderr. No device properties or process-wide logging configuration are changed.
 
 | Value | Behavior |
 |---|---|
-| Unset or `1` | Both boundaries of every append, plus every flush/close |
-| Positive `N` | Both boundaries of the first and every Nth append; all flush/close records |
+| Unset or `1` | Both boundaries of every append, plus creation and every flush/close |
+| Positive `N` | Both boundaries of the first and every Nth append; all creation/flush/close records |
 | `0`, invalid, or non-Unicode | Disabled: no metadata walks, RSS reads, or log output |
 
 Use the default for the diagnostic run. Logging is synchronous and has a cost;
@@ -63,10 +67,11 @@ keep an equivalent diagnostics-disabled run for precise performance comparisons.
 
 | Investigation order | Evidence | Result/action supported |
 |---|---|---|
-| P1: constant-column cache | `component=columns state=constant`, value payload/capacity split between compact integers and other types | Rank repeated-value caching by bytes actually retained; high constant field counts alone do not prove large savings. `all_null` isolates bitmap/metadata overhead. |
-| P2: dictionaries | Table capacity lower bound, allocated variable key bytes, inactive retained tables; actual DICT column and logical-byte counts at flush | Separate dictionary-building/retention costs from the fraction actually encoded as DICT. Consider retention or tracking changes only if measured costs warrant them. |
-| P3: application input | Arrow buffers at entry; `append_begin` vs previous boundary vs `append_buffered` RSS/HWM | Check whether a large input coexists with the writer cache and whether growth occurs before entry or during append. A pre-entry rise is a clue, not proof of which application allocation caused it. |
-| P4: flush | `flush_begin` → `flush_encoded` → `flush_reset`, RSS/HWM, actual bulk/stream unit counts, tracked temporary capacities | Confirm the optimized path used; distinguish raw staging, retained compressed slots, and cache retention after reset. A new HWM inside this interval narrows the time window. |
+| P0: memory before appending | `create_begin` → `create_end` → first `append_begin`, process RSS/HWM | Separate core writer construction from the interval before the first append. The input schema and caller-side FFI/Arrow setup can already exist at `create_begin`; this is not a pure business baseline. |
+| P1: dictionary lifetime | Zero resident dictionary capacities at append/reset; `dictionary_flush` reports the largest prepared bucket | Verify that dictionary allocations are limited to one bucket rather than every bucket concurrently. Actual DICT column/byte shares still appear in `flush`. |
+| P2: flush | `flush_begin` → `flush_encoded` → `flush_reset`, RSS/HWM and raw/compressed temporary counters | Locate the remaining peak interval. Zstd contexts, allocator retention and output buffers are not individually attributed. |
+| P3: application input | Arrow buffers at entry and `append_begin` RSS | Measure the batch coexisting with writer caches; unexplained process memory is not automatically application memory. |
+| P4: constant-column cache | `component=columns state=constant` and `all_null` | Rank these by measured bytes rather than historical field proportions. |
 
 Compare these byte totals at the same stage near the peak. This is a prioritization
 order, not a predetermined ranking of savings. If the measured components stay
@@ -75,13 +80,16 @@ not explain the growth; it must not label all remaining RSS as business memory.
 
 ## Record identity and stages
 
-Every line carries `v=2`, `unix_ms`, `pid`, `writer`, `sample`, `stage`, `component`,
+Every line carries `v=3`, `unix_ms`, `pid`, `writer`, `sample`, `stage`, `component`,
 `append`, `total_rows`, `row_group`, and `row_group_rows`. Join components by
 process-run + PID + writer + sample, not timestamp alone. Writers share process
 RSS; never sum their RSS values. Sample numbers also expose missing records.
 
 | Stage | Exact observation point |
 |---|---|
+| `create_begin` | Entry to the core writer constructor, before schema conversion/validation and bucket allocation. Buffer counters are zero because the writer does not exist yet. |
+| `create_end` | Successful construction, before returning the empty writer. Same writer ID as `create_begin`. |
+| `create_error` | Construction failed; no writer is returned. Buffer counters are unavailable/zero; process RSS remains measured. |
 | `append_begin` | Schema/nullability validation succeeded; input is alive, before bucket/statistics mutation. `append` identifies the incoming call; row totals exclude it. |
 | `append_buffered` | Bucket caches and statistics updated, before any automatic row-group flush. Row totals now include this batch. |
 | `flush_begin` | Nonempty row group is about to encode/write; logged even for unsampled appends. |
@@ -93,7 +101,7 @@ RSS; never sum their RSS values. Sample numbers also expose missing records.
 Validation failures do not advance append counters or emit records. Empty flushes
 and repeated successful close calls do not emit flush/close records. Logs do not
 instrument writer destruction. Ordinary snapshots have six lines; append
-snapshots and `flush_encoded` have seven. Each line is below 2 KiB, including its
+snapshots have seven; `flush_encoded` has eight (including `dictionary_flush`). Each line is below 2 KiB, including its
 terminator; the diagnostic state retains no history in production.
 
 ## Counter definitions and limits
@@ -112,14 +120,21 @@ of top-level business signals.
   bitmaps/metadata. Capacity fields expose allocation slack and retained empty
   buffers. These are subdivisions of `buffers`, not additional memory. A column
   can change from constant to varying within a row group; no value scan is added.
-- **`dictionary`**: fixed/variable entries and capacities come from existing maps.
-  `table_payload_capacity_lower_bound_bytes` is capacity × size of a key/index
-  pair. It excludes extra hash buckets/control bytes, allocator overhead, and
-  allocation-size rounding, so it is explicitly a lower bound, not exact heap
-  usage. `key_bytes` adds separately allocated variable-length key contents.
-  `inactive_table_payload_capacity_lower_bound_bytes` is a subset of table bytes
-  retained outside active tracking. Pending/active/disabled are tracking states,
-  not on-disk encodings. Append snapshots do not iterate keys.
+- **`dictionary`**: resident tables in writer caches. With deferred construction,
+  entries/capacities/key bytes are zero at these snapshots; `pending_columns`
+  counts columns whose dictionaries are not prepared. It does **not** mean that
+  the output uses PLAIN or that dictionary encoding is disabled.
+- **`dictionary_flush`**: `prepared_buckets` counts buckets prepared during this
+  flush; `peak_bucket_lower_bound_bytes` is the maximum per-bucket sum of table
+  payload capacity and allocated variable key bytes. Entry/capacity/state fields
+  all describe that same bucket, not the sum over buckets or independent maxima.
+  Table payload is HashMap capacity × key/index pair size, excluding extra hash
+  buckets/control bytes, allocator overhead and rounding. Counts exclude tables
+  discarded after exceeding the dictionary limit, temporary reallocation copies,
+  view metadata and ordering vectors. This is a lower bound at the prepared
+  boundary, **not** a complete transient heap peak. Tables have already been
+  released when the flush summary is logged. Compare this against the old
+  all-bucket resident dictionary count, without equating the difference to RSS.
 - **`input`**: recursively sums the lengths of buffers exposed by the current
   RecordBatch and separately sums Arrow-reported capacities. Shared buffers may
   be counted more than once; sliced arrays can retain larger backing allocations
@@ -157,7 +172,7 @@ cannot guarantee an exact call-stack cause for every unexplained process peak.
 Enabled append sampling performs O(physical columns + integer blocks + input
 buffer descriptors) metadata work twice, with one input metadata traversal, and
 reads `/proc/self/status` once per snapshot. It does not scan column values or
-retain a second batch/dictionary. Flush maintains fixed-size counters and makes
+retain a second batch/dictionary. Creation adds two snapshots (or an error snapshot). Flush maintains fixed-size counters and makes
 one extra encoding selection for legacy buckets (variable dictionary key-length
 scans can occur there). Formatting uses bounded stack buffers; log writes are
 synchronous. Costs depend on schema width, append frequency and the log sink.
@@ -166,6 +181,6 @@ sampling allocations or log operations. It is not claimed to have zero cost.
 
 Tests cover stage ordering, sampling intervals, invalid input, failure/retry and
 idempotent close behavior, constant/all-null/varying/reset classification,
-dictionary retention, shared/sliced/foreign/nested Arrow input, bounded Android
+per-bucket dictionary lifetime, shared/sliced/foreign/nested Arrow input, bounded Android
 log strings, and byte-for-byte files with diagnostics on vs off across integer
 bulk/stream and legacy paged/monolithic compression paths.

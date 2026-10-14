@@ -139,9 +139,23 @@ pub(crate) struct FlushMemory {
     pub encoding_capacity_peak_bytes: usize,
     pub compressed_capacity_peak_bytes: usize,
     pub tracked_temporary_peak_bytes: usize,
+    pub dictionary_buckets: usize,
+    pub dictionary_peak_bytes: usize,
+    pub dictionary_peak: DictionaryMemory,
 }
 
 impl FlushMemory {
+    pub fn observe_dictionary(&mut self, dictionary: DictionaryMemory) {
+        self.dictionary_buckets += 1;
+        let bytes = dictionary
+            .table_payload_capacity_lower_bound
+            .saturating_add(dictionary.key_bytes);
+        if bytes >= self.dictionary_peak_bytes {
+            self.dictionary_peak_bytes = bytes;
+            self.dictionary_peak = dictionary;
+        }
+    }
+
     pub fn observe(&mut self, encoding: usize, compressed: usize) {
         self.encoding_capacity_peak_bytes = self.encoding_capacity_peak_bytes.max(encoding);
         self.compressed_capacity_peak_bytes = self.compressed_capacity_peak_bytes.max(compressed);
@@ -360,6 +374,10 @@ impl Sample {
             let mut line = self.prefix("flush")?;
             writeln!(line, " integer_buckets={} legacy_buckets={} bulk_units={} stream_units={} uncompressed_units={} max_unit_bytes={} all_null_columns={} constant_columns={} dict_columns={} plain_columns={} logical_value_bytes={} dict_logical_value_bytes={} encoding_capacity_peak_bytes={} compressed_capacity_peak_bytes={} tracked_temporary_peak_bytes={}", f.integer_buckets, f.legacy_buckets, f.bulk_units, f.stream_units, f.uncompressed_units, f.max_unit_bytes, f.encoding_columns[ENCODING_ALL_NULL as usize], f.encoding_columns[ENCODING_CONST as usize], f.encoding_columns[ENCODING_DICT as usize], f.encoding_columns[ENCODING_PLAIN as usize], f.logical_value_bytes, f.dict_logical_value_bytes, f.encoding_capacity_peak_bytes, f.compressed_capacity_peak_bytes, f.tracked_temporary_peak_bytes).map_err(log_overflow)?;
             write(&line)?;
+            let d = f.dictionary_peak;
+            let mut line = self.prefix("dictionary_flush")?;
+            writeln!(line, " prepared_buckets={} peak_bucket_lower_bound_bytes={} fixed_entries={} fixed_capacity={} variable_entries={} variable_capacity={} key_bytes={} pending_columns={} active_columns={} disabled_columns={}", f.dictionary_buckets, f.dictionary_peak_bytes, d.fixed_entries, d.fixed_capacity, d.variable_entries, d.variable_capacity, d.key_bytes, d.pending_columns, d.active_columns, d.disabled_columns).map_err(log_overflow)?;
+            write(&line)?;
         }
         Ok(())
     }
@@ -369,7 +387,7 @@ impl Sample {
             bytes: [0; 2048],
             len: 0,
         };
-        write!(line, "[mosaic-memory] v=2 unix_ms={} pid={} writer={} sample={} stage={} component={} append={} total_rows={} row_group={} row_group_rows={}", self.unix_ms, self.pid, self.writer_id, self.sequence, self.stage, component, self.append, self.total_rows, self.row_group, self.row_group_rows).map_err(log_overflow)?;
+        write!(line, "[mosaic-memory] v=3 unix_ms={} pid={} writer={} sample={} stage={} component={} append={} total_rows={} row_group={} row_group_rows={}", self.unix_ms, self.pid, self.writer_id, self.sequence, self.stage, component, self.append, self.total_rows, self.row_group, self.row_group_rows).map_err(log_overflow)?;
         Ok(line)
     }
 
@@ -565,6 +583,9 @@ mod tests {
                 encoding_capacity_peak_bytes: usize::MAX,
                 compressed_capacity_peak_bytes: usize::MAX,
                 tracked_temporary_peak_bytes: usize::MAX,
+                dictionary_buckets: usize::MAX,
+                dictionary_peak_bytes: usize::MAX,
+                dictionary_peak: b.dictionary,
             }),
             rss: ProcessRss::default(),
         };
@@ -572,7 +593,7 @@ mod tests {
         sample.write_to(&mut bytes).unwrap();
         let line = std::str::from_utf8(&bytes).unwrap();
         assert!(line.contains("rss_bytes=na rss_hwm_bytes=na\n"));
-        assert_eq!(line.lines().count(), 8);
+        assert_eq!(line.lines().count(), 9);
         assert!(line.lines().all(|line| line.len() < 2047));
         sample
             .write_records(|line| {

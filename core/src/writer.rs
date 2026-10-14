@@ -20,7 +20,7 @@ use std::io;
 use arrow_array::*;
 use arrow_schema::Schema;
 
-use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
+use crate::bucket_writer::{BucketWriter, PagedBucketOutput, PreparedBucket};
 use crate::memory_diagnostics::{BufferMemory, FlushMemory, InputMemory, MemoryDiagnostics};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
@@ -161,10 +161,20 @@ fn batch_column_map(schema: &MosaicSchema) -> Vec<usize> {
 
 impl<S: OutputFile> MosaicWriter<S> {
     pub fn new(out: S, schema: &Schema, options: WriterOptions) -> io::Result<Self> {
-        let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let batch_col_map = batch_column_map(&mosaic_schema);
-        Self::from_mosaic_schema_with_map(out, mosaic_schema, options, batch_col_map)
+        let mut diagnostics = Self::begin_creation();
+        let result = (|| {
+            let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let batch_col_map = batch_column_map(&mosaic_schema);
+            Self::from_mosaic_schema_with_map(
+                out,
+                mosaic_schema,
+                options,
+                batch_col_map,
+                &mut diagnostics,
+            )
+        })();
+        Self::finish_creation(result, diagnostics)
     }
 
     pub fn from_mosaic_schema(
@@ -172,21 +182,25 @@ impl<S: OutputFile> MosaicWriter<S> {
         schema: MosaicSchema,
         options: WriterOptions,
     ) -> io::Result<Self> {
-        let columns = schema
-            .columns
-            .iter()
-            .map(|column| {
-                (
-                    column.name.clone(),
-                    column.data_type.clone(),
-                    column.nullable,
-                )
-            })
-            .collect::<Vec<_>>();
-        MosaicSchema::validate(&columns)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let batch_col_map: Vec<usize> = (0..schema.columns.len()).collect();
-        Self::from_mosaic_schema_with_map(out, schema, options, batch_col_map)
+        let mut diagnostics = Self::begin_creation();
+        let result = (|| {
+            let columns = schema
+                .columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.name.clone(),
+                        column.data_type.clone(),
+                        column.nullable,
+                    )
+                })
+                .collect::<Vec<_>>();
+            MosaicSchema::validate(&columns)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let batch_col_map: Vec<usize> = (0..schema.columns.len()).collect();
+            Self::from_mosaic_schema_with_map(out, schema, options, batch_col_map, &mut diagnostics)
+        })();
+        Self::finish_creation(result, diagnostics)
     }
 
     fn from_mosaic_schema_with_map(
@@ -194,6 +208,7 @@ impl<S: OutputFile> MosaicWriter<S> {
         schema: MosaicSchema,
         options: WriterOptions,
         batch_col_map: Vec<usize>,
+        diagnostics: &mut Option<Box<MemoryDiagnostics>>,
     ) -> io::Result<Self> {
         let num_buckets = schema.num_buckets;
         let mut bucket_writers = Vec::with_capacity(num_buckets);
@@ -278,8 +293,34 @@ impl<S: OutputFile> MosaicWriter<S> {
             total_compressed: 0,
             stats_collector,
             state: WriterState::Open,
-            memory_diagnostics: MemoryDiagnostics::from_env(),
+            memory_diagnostics: diagnostics.take(),
         })
+    }
+
+    fn begin_creation() -> Option<Box<MemoryDiagnostics>> {
+        let mut diagnostics = MemoryDiagnostics::from_env();
+        if let Some(d) = &mut diagnostics {
+            d.emit("create_begin", 0, 0, BufferMemory::default(), None, None);
+        }
+        diagnostics
+    }
+
+    fn finish_creation(
+        result: io::Result<Self>,
+        mut diagnostics: Option<Box<MemoryDiagnostics>>,
+    ) -> io::Result<Self> {
+        match result {
+            Ok(mut writer) => {
+                writer.sample_memory("create_end", None, None);
+                Ok(writer)
+            }
+            Err(error) => {
+                if let Some(d) = &mut diagnostics {
+                    d.emit("create_error", 0, 0, BufferMemory::default(), None, None);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn schema(&self) -> &MosaicSchema {
@@ -494,11 +535,17 @@ impl<S: OutputFile> MosaicWriter<S> {
             if bw.is_empty() {
                 continue;
             }
+            // The view owns only this bucket's dictionaries. Every exit (including
+            // output errors) drops it before any other bucket is prepared.
+            let bw = bw.prepare();
+            if let Some(memory) = &mut flush_memory {
+                memory.observe_dictionary(bw.dictionary_memory());
+            }
             if bw.has_integer_buffers() {
                 let offset = self.out.pos();
                 let (layout, uncompressed_size) = write_integer_bucket(
                     &mut self.out,
-                    bw,
+                    &bw,
                     self.compression,
                     self.zstd_level,
                     self.page_size_threshold,
@@ -548,12 +595,14 @@ impl<S: OutputFile> MosaicWriter<S> {
                     .filter_map(|p| p.as_ref())
                     .map(|p| p.len())
                     .sum();
+                drop(bw);
                 let total_size = self.write_paged_bucket(&paged, &mut flush_memory)?;
                 bucket_layouts[b] = BucketLayout::Paged { total_size };
                 actual_uncompressed_sizes[b] = paged_raw_size;
                 bucket_offsets[b] = self.out.pos() - total_size as u64;
             } else {
-                let raw = self.bucket_writers[b].as_ref().unwrap().finish();
+                let raw = bw.finish();
+                drop(bw);
                 let comp_size = self.write_compressed(&raw, raw.capacity(), &mut flush_memory)?;
                 bucket_layouts[b] = BucketLayout::Monolithic {
                     compressed_size: comp_size,
@@ -996,7 +1045,7 @@ fn compress_integer_unit<W: DiagnosticOutput>(
 
 fn write_integer_bucket<S: OutputFile>(
     out: &mut S,
-    bucket: &BucketWriter,
+    bucket: &PreparedBucket<'_>,
     compression: u8,
     level: i32,
     page_threshold: usize,
