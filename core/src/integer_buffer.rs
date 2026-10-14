@@ -155,6 +155,18 @@ impl IntegerBuffer {
         self.len = 0;
     }
 
+    pub(crate) fn add_memory_usage(&self, memory: &mut crate::memory_diagnostics::BufferMemory) {
+        memory.integer_logical_bytes += self.logical_len();
+        memory.integer_metadata_bytes +=
+            std::mem::size_of::<Self>() + self.blocks.capacity() * std::mem::size_of::<Block>();
+        for block in &self.blocks {
+            memory.integer_payload_bytes += block.bytes.len();
+            memory.integer_capacity_bytes += block.bytes.capacity();
+            memory.integer_width_values[block.width.trailing_zeros() as usize] +=
+                block.bytes.len() / block.width;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn allocated_bytes(&self) -> usize {
         self.blocks.capacity() * std::mem::size_of::<Block>()
