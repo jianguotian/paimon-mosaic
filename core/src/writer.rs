@@ -513,6 +513,12 @@ impl<S: OutputFile> MosaicWriter<S> {
         }
     }
 
+    /// Correlates binding diagnostics with core writer records, when enabled.
+    #[doc(hidden)]
+    pub fn memory_diagnostics_id(&self) -> Option<u64> {
+        self.memory_diagnostics.as_ref().map(|d| d.writer_id())
+    }
+
     fn flush_row_group(&mut self) -> io::Result<()> {
         if self.current_row_group_rows == 0 {
             return Ok(());
@@ -671,8 +677,7 @@ impl<S: OutputFile> MosaicWriter<S> {
             }
             COMPRESSION_ZSTD => {
                 check_zstd_block_size(raw.len(), "bucket uncompressed size")?;
-                let compressed =
-                    zstd::bulk::compress(raw, self.zstd_level).map_err(io::Error::other)?;
+                let compressed = compress_bulk(raw, self.zstd_level, raw_capacity, memory)?;
                 if let Some(m) = memory {
                     m.bulk_units += 1;
                     m.max_unit_bytes = m.max_unit_bytes.max(raw.len());
@@ -736,8 +741,12 @@ impl<S: OutputFile> MosaicWriter<S> {
             // Compress and build on-disk slot: uncompressed_size varint + compressed data
             let uncompressed_size = page_content.len();
             check_zstd_block_size(uncompressed_size, "page uncompressed size")?;
-            let compressed =
-                zstd::bulk::compress(&page_content, self.zstd_level).map_err(io::Error::other)?;
+            let compressed = compress_bulk(
+                &page_content,
+                self.zstd_level,
+                raw_capacity + page_content.capacity() + retained,
+                memory,
+            )?;
             let mut slot = Vec::new();
             varint::encode(
                 &mut slot,
@@ -999,6 +1008,29 @@ impl<S: OutputFile> DiagnosticOutput for OutputWriter<'_, S> {
     }
 }
 
+// Same one-shot compressor and output allocation as zstd::bulk::compress.
+// Capture the context size while it is alive; it is dropped before sink writes.
+fn compress_bulk(
+    raw: &[u8],
+    level: i32,
+    other_capacity: usize,
+    memory: &mut Option<FlushMemory>,
+) -> io::Result<Vec<u8>> {
+    let mut compressor = zstd::bulk::Compressor::new(level)?;
+    let compressed = compressor.compress(raw)?;
+    if let Some(m) = memory {
+        let context = compressor.context_mut().sizeof();
+        m.bulk_contexts += 1;
+        m.bulk_context_peak_bytes = m.bulk_context_peak_bytes.max(context);
+        m.bulk_live_capacity_peak_bytes = m.bulk_live_capacity_peak_bytes.max(
+            context
+                .saturating_add(other_capacity)
+                .saturating_add(compressed.capacity()),
+        );
+    }
+    Ok(compressed)
+}
+
 fn compress_integer_unit<W: DiagnosticOutput>(
     mut output: W,
     level: i32,
@@ -1020,7 +1052,12 @@ fn compress_integer_unit<W: DiagnosticOutput>(
                 "integer encoded size mismatch",
             ));
         }
-        let compressed = zstd::bulk::compress(&raw, level).map_err(io::Error::other)?;
+        let compressed = compress_bulk(
+            &raw,
+            level,
+            raw.capacity() + retained_slots + output.diagnostic_capacity(),
+            memory,
+        )?;
         output.write_all(&compressed)?;
         if let Some(m) = memory {
             m.bulk_units += 1;

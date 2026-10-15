@@ -28,6 +28,7 @@ use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{RecordBatch, StructArray};
 use arrow_schema::{Field, Schema};
 
+use mosaic_core::memory_diagnostics::{BoundaryDiagnostics, OutputDiagnostics};
 use mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
 use mosaic_core::spec::*;
 use mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
@@ -68,12 +69,17 @@ pub struct MosaicOutputFile {
 struct FfiOutputFile {
     raw: MosaicOutputFile,
     pos: u64,
+    diagnostics: Option<OutputDiagnostics>,
 }
 
 impl OutputFile for FfiOutputFile {
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         if let Some(write_fn) = self.raw.write_fn {
-            let result = unsafe { write_fn(self.raw.ctx, data.as_ptr(), data.len()) };
+            let call = || unsafe { write_fn(self.raw.ctx, data.as_ptr(), data.len()) };
+            let result = match &mut self.diagnostics {
+                Some(d) => d.measure(data.len(), false, call),
+                None => call(),
+            };
             if result != 0 {
                 return Err(io::Error::other("write callback failed"));
             }
@@ -86,7 +92,11 @@ impl OutputFile for FfiOutputFile {
 
     fn flush(&mut self) -> io::Result<()> {
         if let Some(flush_fn) = self.raw.flush_fn {
-            let result = unsafe { flush_fn(self.raw.ctx) };
+            let call = || unsafe { flush_fn(self.raw.ctx) };
+            let result = match &mut self.diagnostics {
+                Some(d) => d.measure(0, true, call),
+                None => call(),
+            };
             if result != 0 {
                 return Err(io::Error::other("flush callback failed"));
             }
@@ -142,6 +152,7 @@ pub extern "C" fn mosaic_writer_options_default() -> MosaicWriterOptions {
 
 pub struct MosaicWriterHandle {
     inner: MosaicWriter<FfiOutputFile>,
+    diagnostics: Option<BoundaryDiagnostics>,
     stat_name_cache: Option<Vec<Vec<CString>>>,
     stat_value_cache: Option<MinMaxCache>,
 }
@@ -154,6 +165,10 @@ pub unsafe extern "C" fn mosaic_writer_open(
     ffi_schema: *mut FFI_ArrowSchema,
     options: MosaicWriterOptions,
 ) -> *mut MosaicWriterHandle {
+    let mut diagnostics = BoundaryDiagnostics::from_env();
+    if let Some(d) = &mut diagnostics {
+        d.emit("ffi_open_begin");
+    }
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         if ffi_schema.is_null() {
             set_error("null schema".into());
@@ -168,9 +183,13 @@ pub unsafe extern "C" fn mosaic_writer_open(
                 return ptr::null_mut();
             }
         };
+        if let Some(d) = &mut diagnostics {
+            d.emit("ffi_schema_imported");
+        }
         let ffi_stream = FfiOutputFile {
             raw: stream,
             pos: 0,
+            diagnostics: diagnostics.as_ref().map(OutputDiagnostics::new),
         };
         let stats_cols = if options.stats_columns.is_null() || options.num_stats_columns == 0 {
             Vec::new()
@@ -211,9 +230,16 @@ pub unsafe extern "C" fn mosaic_writer_open(
             stats_columns: stats_cols,
             page_size_threshold: options.page_size_threshold as usize,
         };
+        // Both the imported schema and option strings now own their metadata.
+        // Copy options first: stats_columns may point into the foreign schema.
+        drop(ffi_owned);
+        if let Some(d) = &mut diagnostics {
+            d.emit("ffi_schema_released");
+        }
         match MosaicWriter::new(ffi_stream, &arrow_schema, opts) {
             Ok(writer) => Box::into_raw(Box::new(MosaicWriterHandle {
                 inner: writer,
+                diagnostics: None,
                 stat_name_cache: None,
                 stat_value_cache: None,
             })),
@@ -223,18 +249,39 @@ pub unsafe extern "C" fn mosaic_writer_open(
             }
         }
     }));
-    match result {
+    let handle = match result {
         Ok(val) => val,
         Err(e) => {
             set_error(panic_message(&e));
             ptr::null_mut()
         }
+    };
+    if let Some(d) = &mut diagnostics {
+        if handle.is_null() {
+            d.emit("ffi_open_error");
+        } else {
+            d.set_writer((&*handle).inner.memory_diagnostics_id());
+            d.emit("ffi_open_end");
+        }
     }
+    if !handle.is_null() {
+        let h = &mut *handle;
+        h.diagnostics = diagnostics;
+        if let Some(d) = &h.inner.output().diagnostics {
+            d.emit("ffi_open_output");
+        }
+    }
+    handle
 }
 
 /// Close the writer (flush all data and write footer).
 #[no_mangle]
 pub unsafe extern "C" fn mosaic_writer_close(handle: *mut MosaicWriterHandle) -> c_int {
+    if let Some(h) = handle.as_mut() {
+        if let Some(d) = &mut h.diagnostics {
+            d.emit("ffi_close_begin");
+        }
+    }
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         if handle.is_null() {
             return -1;
@@ -248,20 +295,41 @@ pub unsafe extern "C" fn mosaic_writer_close(handle: *mut MosaicWriterHandle) ->
             }
         }
     }));
-    match result {
+    let status = match result {
         Ok(val) => val,
         Err(e) => {
             set_error(panic_message(&e));
             -1
         }
+    };
+    if let Some(h) = handle.as_mut() {
+        if let Some(d) = &mut h.diagnostics {
+            d.emit(if status == 0 {
+                "ffi_close_end"
+            } else {
+                "ffi_close_error"
+            });
+        }
+        if let Some(d) = &h.inner.output().diagnostics {
+            d.emit("ffi_close_output");
+        }
     }
+    status
 }
 
 /// Free the writer handle.
 #[no_mangle]
 pub unsafe extern "C" fn mosaic_writer_free(handle: *mut MosaicWriterHandle) {
     if !handle.is_null() {
-        drop(Box::from_raw(handle));
+        let mut h = Box::from_raw(handle);
+        let mut diagnostics = h.diagnostics.take();
+        if let Some(d) = &mut diagnostics {
+            d.emit("ffi_free_begin");
+        }
+        drop(h);
+        if let Some(d) = &mut diagnostics {
+            d.emit("ffi_free_end");
+        }
     }
 }
 
@@ -432,6 +500,17 @@ pub unsafe extern "C" fn mosaic_writer_write_batch(
     ffi_array: *mut FFI_ArrowArray,
     ffi_schema: *mut FFI_ArrowSchema,
 ) -> c_int {
+    let sampled = if let Some(h) = handle.as_mut() {
+        h.diagnostics.as_mut().is_some_and(|d| {
+            let sampled = d.begin_append();
+            if sampled {
+                d.emit("ffi_append_begin");
+            }
+            sampled
+        })
+    } else {
+        false
+    };
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         if handle.is_null() || ffi_array.is_null() || ffi_schema.is_null() {
             set_error("null pointer".into());
@@ -449,20 +528,52 @@ pub unsafe extern "C" fn mosaic_writer_write_batch(
                 return -1;
             }
         };
+        // from_ffi owns the imported DataType and array; it no longer borrows
+        // the exported schema. Keep ArrowArray ownership until buffering ends.
+        drop(schema_owned);
         let struct_array = StructArray::from(arr_data);
         let batch = RecordBatch::from(struct_array);
+        if sampled {
+            h.diagnostics.as_mut().unwrap().emit("ffi_input_imported");
+        }
         match h.inner.write_batch(&batch) {
-            Ok(()) => 0,
+            Ok(()) => {
+                if sampled {
+                    h.diagnostics.as_mut().unwrap().emit("ffi_append_written");
+                }
+                0
+            }
             Err(e) => {
                 set_error(format!("write_batch failed: {}", e));
                 -1
             }
         }
     }));
-    result.unwrap_or_else(|e| {
+    let status = result.unwrap_or_else(|e| {
         set_error(panic_message(&e));
         -1
-    })
+    });
+    if sampled {
+        let h = &mut *handle;
+        h.diagnostics.as_mut().unwrap().emit(if status == 0 {
+            "ffi_input_released"
+        } else {
+            "ffi_append_error"
+        });
+        if let Some(d) = &h.inner.output().diagnostics {
+            d.emit("ffi_append_output");
+        }
+    }
+    status
+}
+
+/// Optional process-memory checkpoint; no data values are logged.
+/// stage: 0=startup, 1=before input conversion, 2=after conversion,
+/// 3=after append and caller temporary release, 4=before Arrow C Data export.
+/// Controlled by MOSAIC_MEMORY_DIAGNOSTICS (default on). No writer is required.
+#[no_mangle]
+pub extern "C" fn mosaic_memory_checkpoint(stage: u32) {
+    let _ = panic::catch_unwind(|| mosaic_core::memory_diagnostics::memory_checkpoint(stage));
 }
 
 // ======================== Reader ========================
@@ -992,3 +1103,7 @@ pub extern "C" fn mosaic_last_error() -> *const c_char {
         }
     })
 }
+
+#[cfg(test)]
+#[path = "writer_memory_tests.rs"]
+mod writer_memory_tests;

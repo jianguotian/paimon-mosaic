@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const ENV: &str = "MOSAIC_MEMORY_DIAGNOSTICS";
 static NEXT_WRITER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_BOUNDARY_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BufferMemory {
@@ -131,6 +132,9 @@ pub(crate) struct FlushMemory {
     pub legacy_buckets: usize,
     pub bulk_units: usize,
     pub stream_units: usize,
+    pub bulk_contexts: usize,
+    pub bulk_context_peak_bytes: usize,
+    pub bulk_live_capacity_peak_bytes: usize,
     pub uncompressed_units: usize,
     pub max_unit_bytes: usize,
     pub encoding_columns: [usize; 4],
@@ -179,11 +183,7 @@ pub(crate) struct MemoryDiagnostics {
 
 impl MemoryDiagnostics {
     pub fn from_env() -> Option<Box<Self>> {
-        let every = match std::env::var(ENV) {
-            Ok(value) => parse_interval(Some(&value)),
-            Err(std::env::VarError::NotPresent) => parse_interval(None),
-            Err(std::env::VarError::NotUnicode(_)) => None,
-        }?;
+        let every = diagnostic_interval()?;
         Some(Box::new(Self::new(every)))
     }
 
@@ -199,6 +199,10 @@ impl MemoryDiagnostics {
             #[cfg(test)]
             events: Vec::new(),
         }
+    }
+
+    pub fn writer_id(&self) -> u64 {
+        self.writer_id
     }
 
     /// Always sample the first append, then every Nth append. No value scan.
@@ -256,6 +260,168 @@ impl MemoryDiagnostics {
     pub fn for_test(every: u64) -> Box<Self> {
         assert!(every > 0);
         Box::new(Self::new(every))
+    }
+}
+
+fn diagnostic_interval() -> Option<u64> {
+    match std::env::var(ENV) {
+        Ok(value) => parse_interval(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_interval(None),
+        Err(std::env::VarError::NotUnicode(_)) => None,
+    }
+}
+
+/// Lightweight RSS boundaries for language bindings. No input/buffer traversal.
+/// The binding ID is separate from core writer IDs; `writer=0` means not yet known.
+#[doc(hidden)]
+pub struct BoundaryDiagnostics {
+    id: u64,
+    writer: u64,
+    sequence: u64,
+    appends: u64,
+    every: u64,
+}
+
+impl BoundaryDiagnostics {
+    pub fn from_env() -> Option<Self> {
+        let every = diagnostic_interval()?;
+        Some(Self {
+            id: NEXT_BOUNDARY_ID.fetch_add(1, Ordering::Relaxed),
+            writer: 0,
+            sequence: 0,
+            appends: 0,
+            every,
+        })
+    }
+
+    pub fn set_writer(&mut self, writer: Option<u64>) {
+        self.writer = writer.unwrap_or(0);
+    }
+
+    pub fn begin_append(&mut self) -> bool {
+        self.appends = self.appends.saturating_add(1);
+        self.appends == 1 || self.appends.is_multiple_of(self.every)
+    }
+
+    pub fn emit(&mut self, stage: &'static str) {
+        self.sequence = self.sequence.saturating_add(1);
+        let _ = self.write_boundary(stage).and_then(|line| line.emit());
+    }
+
+    fn write_boundary(&self, stage: &'static str) -> io::Result<LogLine> {
+        let rss = ProcessRss::read();
+        let mut line = LogLine {
+            bytes: [0; 2048],
+            len: 0,
+        };
+        writeln!(line, "[mosaic-memory] v=4 unix_ms={} pid={} component=boundary binding={} writer={} boundary_sample={} append={} stage={} rss_bytes={} rss_hwm_bytes={}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+            std::process::id(), self.id, self.writer, self.sequence, self.appends, stage,
+            OptionalBytes(rss.current), OptionalBytes(rss.high_watermark)).map_err(log_overflow)?;
+        Ok(line)
+    }
+}
+
+/// Aggregate synchronous output-callback boundaries, without retaining events.
+/// RSS differences include concurrent threads and are not allocation ownership.
+#[doc(hidden)]
+pub struct OutputDiagnostics {
+    binding: u64,
+    samples: std::cell::Cell<u64>,
+    writes: u64,
+    bytes: u64,
+    flushes: u64,
+    errors: u64,
+    rss_observations: u64,
+    rss_growth: u64,
+    rss_drop: u64,
+    max_rss_growth: u64,
+    callback_hwm: Option<u64>,
+    hwm_observations: u64,
+    hwm_growth: u64,
+}
+
+impl OutputDiagnostics {
+    pub fn new(boundary: &BoundaryDiagnostics) -> Self {
+        Self {
+            binding: boundary.id,
+            samples: std::cell::Cell::new(0),
+            writes: 0,
+            bytes: 0,
+            flushes: 0,
+            errors: 0,
+            rss_observations: 0,
+            rss_growth: 0,
+            rss_drop: 0,
+            max_rss_growth: 0,
+            callback_hwm: None,
+            hwm_observations: 0,
+            hwm_growth: 0,
+        }
+    }
+
+    pub fn measure(&mut self, bytes: usize, flush: bool, callback: impl FnOnce() -> i32) -> i32 {
+        let before = ProcessRss::read();
+        let result = callback();
+        let after = ProcessRss::read();
+        if flush {
+            self.flushes = self.flushes.saturating_add(1);
+        } else {
+            self.writes = self.writes.saturating_add(1);
+        }
+        if result == 0 {
+            self.bytes = self.bytes.saturating_add(bytes as u64);
+        } else {
+            self.errors = self.errors.saturating_add(1);
+        }
+        if let (Some(before), Some(after)) = (before.current, after.current) {
+            self.rss_observations = self.rss_observations.saturating_add(1);
+            let growth = after.saturating_sub(before);
+            self.rss_growth = self.rss_growth.saturating_add(growth);
+            self.rss_drop = self.rss_drop.saturating_add(before.saturating_sub(after));
+            self.max_rss_growth = self.max_rss_growth.max(growth);
+        }
+        if let (Some(before), Some(after)) = (before.high_watermark, after.high_watermark) {
+            self.hwm_observations = self.hwm_observations.saturating_add(1);
+            self.hwm_growth = self.hwm_growth.saturating_add(after.saturating_sub(before));
+        }
+        self.callback_hwm = self.callback_hwm.max(after.high_watermark);
+        result
+    }
+
+    pub fn emit(&self, stage: &'static str) {
+        self.samples.set(self.samples.get().saturating_add(1));
+        let _ = self.write_summary(stage).and_then(|line| line.emit());
+    }
+
+    fn write_summary(&self, stage: &'static str) -> io::Result<LogLine> {
+        let mut line = LogLine {
+            bytes: [0; 2048],
+            len: 0,
+        };
+        writeln!(line, "[mosaic-memory] v=4 unix_ms={} pid={} component=output binding={} output_sample={} stage={} write_calls={} successful_write_bytes={} flush_calls={} callback_errors={} rss_observations={} callback_rss_growth_bytes_sum={} callback_rss_drop_bytes_sum={} callback_rss_max_growth_bytes={} callback_hwm_bytes={} hwm_observations={} callback_hwm_growth_bytes_sum={}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+            std::process::id(), self.binding, self.samples.get(), stage, self.writes, self.bytes,
+            self.flushes, self.errors, self.rss_observations, self.rss_growth, self.rss_drop,
+            self.max_rss_growth, OptionalBytes(self.callback_hwm), self.hwm_observations, self.hwm_growth).map_err(log_overflow)?;
+        Ok(line)
+    }
+}
+
+/// Optional caller checkpoints for allocations before entering Mosaic. Stages:
+/// 0=startup, 1=before input conversion, 2=after conversion,
+/// 3=after append and caller temporary release, 4=before Arrow C Data export.
+/// No input values, caller strings or memory addresses are logged.
+pub fn memory_checkpoint(stage: u32) {
+    if let Some(mut probe) = BoundaryDiagnostics::from_env() {
+        probe.emit(match stage {
+            0 => "caller_startup",
+            1 => "caller_before_convert",
+            2 => "caller_after_convert",
+            3 => "caller_after_release",
+            4 => "caller_before_export",
+            _ => "caller_unknown",
+        });
     }
 }
 
@@ -374,6 +540,14 @@ impl Sample {
             let mut line = self.prefix("flush")?;
             writeln!(line, " integer_buckets={} legacy_buckets={} bulk_units={} stream_units={} uncompressed_units={} max_unit_bytes={} all_null_columns={} constant_columns={} dict_columns={} plain_columns={} logical_value_bytes={} dict_logical_value_bytes={} encoding_capacity_peak_bytes={} compressed_capacity_peak_bytes={} tracked_temporary_peak_bytes={}", f.integer_buckets, f.legacy_buckets, f.bulk_units, f.stream_units, f.uncompressed_units, f.max_unit_bytes, f.encoding_columns[ENCODING_ALL_NULL as usize], f.encoding_columns[ENCODING_CONST as usize], f.encoding_columns[ENCODING_DICT as usize], f.encoding_columns[ENCODING_PLAIN as usize], f.logical_value_bytes, f.dict_logical_value_bytes, f.encoding_capacity_peak_bytes, f.compressed_capacity_peak_bytes, f.tracked_temporary_peak_bytes).map_err(log_overflow)?;
             write(&line)?;
+            let mut line = self.prefix("compression")?;
+            writeln!(
+                line,
+                " bulk_contexts={} bulk_context_peak_bytes={} bulk_live_capacity_peak_bytes={}",
+                f.bulk_contexts, f.bulk_context_peak_bytes, f.bulk_live_capacity_peak_bytes
+            )
+            .map_err(log_overflow)?;
+            write(&line)?;
             let d = f.dictionary_peak;
             let mut line = self.prefix("dictionary_flush")?;
             writeln!(line, " prepared_buckets={} peak_bucket_lower_bound_bytes={} fixed_entries={} fixed_capacity={} variable_entries={} variable_capacity={} key_bytes={} pending_columns={} active_columns={} disabled_columns={}", f.dictionary_buckets, f.dictionary_peak_bytes, d.fixed_entries, d.fixed_capacity, d.variable_entries, d.variable_capacity, d.key_bytes, d.pending_columns, d.active_columns, d.disabled_columns).map_err(log_overflow)?;
@@ -387,7 +561,7 @@ impl Sample {
             bytes: [0; 2048],
             len: 0,
         };
-        write!(line, "[mosaic-memory] v=3 unix_ms={} pid={} writer={} sample={} stage={} component={} append={} total_rows={} row_group={} row_group_rows={}", self.unix_ms, self.pid, self.writer_id, self.sequence, self.stage, component, self.append, self.total_rows, self.row_group, self.row_group_rows).map_err(log_overflow)?;
+        write!(line, "[mosaic-memory] v=4 unix_ms={} pid={} writer={} sample={} stage={} component={} append={} total_rows={} row_group={} row_group_rows={}", self.unix_ms, self.pid, self.writer_id, self.sequence, self.stage, component, self.append, self.total_rows, self.row_group, self.row_group_rows).map_err(log_overflow)?;
         Ok(line)
     }
 
@@ -428,6 +602,17 @@ struct LogLine {
     len: usize,
 }
 impl LogLine {
+    fn emit(&self) -> io::Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            self.write_android()
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            io::stderr().lock().write_all(&self.bytes[..self.len])
+        }
+    }
+
     #[cfg(any(target_os = "android", test))]
     fn as_c_str(&self) -> io::Result<&std::ffi::CStr> {
         std::ffi::CStr::from_bytes_with_nul(&self.bytes[..=self.len]).map_err(|_| {
@@ -498,6 +683,65 @@ mod tests {
         d.on_buffered(30);
         assert_eq!(d.total_rows, 60);
         assert_eq!(d.appends, 3);
+    }
+
+    #[test]
+    fn boundary_and_output_records_are_bounded_and_callbacks_keep_results() {
+        let mut boundary = BoundaryDiagnostics {
+            id: u64::MAX,
+            writer: u64::MAX,
+            sequence: u64::MAX,
+            appends: 0,
+            every: 3,
+        };
+        assert!(boundary.begin_append());
+        assert!(!boundary.begin_append());
+        assert!(boundary.begin_append());
+        let line = boundary.write_boundary("ffi_append_begin").unwrap();
+        assert!(line.len < 2048);
+        line.as_c_str().unwrap();
+        let mut output = OutputDiagnostics::new(&boundary);
+        let mut calls = 0;
+        assert_eq!(
+            output.measure(42, false, || {
+                calls += 1;
+                0
+            }),
+            0
+        );
+        assert_eq!(
+            output.measure(99, false, || {
+                calls += 1;
+                -7
+            }),
+            -7
+        );
+        assert_eq!(
+            output.measure(0, true, || {
+                calls += 1;
+                0
+            }),
+            0
+        );
+        assert_eq!(calls, 3);
+        assert_eq!(
+            (output.writes, output.bytes, output.flushes, output.errors),
+            (2, 42, 1, 1)
+        );
+        output.writes = u64::MAX;
+        output.bytes = u64::MAX;
+        output.flushes = u64::MAX;
+        output.errors = u64::MAX;
+        output.rss_observations = u64::MAX;
+        output.rss_growth = u64::MAX;
+        output.rss_drop = u64::MAX;
+        output.max_rss_growth = u64::MAX;
+        output.callback_hwm = Some(u64::MAX);
+        output.hwm_observations = u64::MAX;
+        output.hwm_growth = u64::MAX;
+        let line = output.write_summary("ffi_append_output").unwrap();
+        assert!(line.len < 2048);
+        line.as_c_str().unwrap();
     }
 
     #[test]
@@ -575,6 +819,9 @@ mod tests {
                 legacy_buckets: usize::MAX,
                 bulk_units: usize::MAX,
                 stream_units: usize::MAX,
+                bulk_contexts: usize::MAX,
+                bulk_context_peak_bytes: usize::MAX,
+                bulk_live_capacity_peak_bytes: usize::MAX,
                 uncompressed_units: usize::MAX,
                 max_unit_bytes: usize::MAX,
                 encoding_columns: [usize::MAX; 4],
@@ -593,7 +840,7 @@ mod tests {
         sample.write_to(&mut bytes).unwrap();
         let line = std::str::from_utf8(&bytes).unwrap();
         assert!(line.contains("rss_bytes=na rss_hwm_bytes=na\n"));
-        assert_eq!(line.lines().count(), 9);
+        assert_eq!(line.lines().count(), 10);
         assert!(line.lines().all(|line| line.len() < 2047));
         sample
             .write_records(|line| {

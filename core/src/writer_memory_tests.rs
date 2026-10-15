@@ -347,6 +347,9 @@ fn flush_records_actual_bulk_stream_and_legacy_paths_with_file_parity() {
                 assert_eq!(f.legacy_buckets, usize::from(!integer));
                 assert_eq!(f.stream_units, usize::from(integer && rows == 300_000));
                 assert_eq!(f.bulk_units, usize::from(!(integer && rows == 300_000)));
+                assert_eq!(f.bulk_contexts, f.bulk_units);
+                assert_eq!(f.bulk_context_peak_bytes > 0, f.bulk_units > 0);
+                assert!(f.bulk_live_capacity_peak_bytes >= f.bulk_context_peak_bytes);
                 assert!(f.tracked_temporary_peak_bytes >= f.encoding_capacity_peak_bytes);
                 assert!(f.tracked_temporary_peak_bytes >= f.compressed_capacity_peak_bytes);
                 if integer && rows == 300_000 {
