@@ -20,7 +20,8 @@ use std::io;
 use arrow_array::*;
 use arrow_schema::Schema;
 
-use crate::bucket_writer::{BucketWriter, PagedBucketOutput};
+use crate::bucket_writer::{BucketWriter, PagedBucketOutput, PreparedBucket};
+use crate::memory_diagnostics::{BufferMemory, FlushMemory, InputMemory, MemoryDiagnostics};
 use crate::schema::MosaicSchema;
 use crate::spec::*;
 use crate::stats::{self, ColumnStats, StatsCollector};
@@ -147,6 +148,7 @@ pub struct MosaicWriter<S: OutputFile> {
     total_compressed: u64,
     stats_collector: Option<StatsCollector>,
     state: WriterState,
+    memory_diagnostics: Option<Box<MemoryDiagnostics>>,
 }
 
 fn batch_column_map(schema: &MosaicSchema) -> Vec<usize> {
@@ -159,10 +161,20 @@ fn batch_column_map(schema: &MosaicSchema) -> Vec<usize> {
 
 impl<S: OutputFile> MosaicWriter<S> {
     pub fn new(out: S, schema: &Schema, options: WriterOptions) -> io::Result<Self> {
-        let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let batch_col_map = batch_column_map(&mosaic_schema);
-        Self::from_mosaic_schema_with_map(out, mosaic_schema, options, batch_col_map)
+        let mut diagnostics = Self::begin_creation();
+        let result = (|| {
+            let mosaic_schema = MosaicSchema::from_arrow(schema, options.num_buckets)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let batch_col_map = batch_column_map(&mosaic_schema);
+            Self::from_mosaic_schema_with_map(
+                out,
+                mosaic_schema,
+                options,
+                batch_col_map,
+                &mut diagnostics,
+            )
+        })();
+        Self::finish_creation(result, diagnostics)
     }
 
     pub fn from_mosaic_schema(
@@ -170,21 +182,25 @@ impl<S: OutputFile> MosaicWriter<S> {
         schema: MosaicSchema,
         options: WriterOptions,
     ) -> io::Result<Self> {
-        let columns = schema
-            .columns
-            .iter()
-            .map(|column| {
-                (
-                    column.name.clone(),
-                    column.data_type.clone(),
-                    column.nullable,
-                )
-            })
-            .collect::<Vec<_>>();
-        MosaicSchema::validate(&columns)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let batch_col_map: Vec<usize> = (0..schema.columns.len()).collect();
-        Self::from_mosaic_schema_with_map(out, schema, options, batch_col_map)
+        let mut diagnostics = Self::begin_creation();
+        let result = (|| {
+            let columns = schema
+                .columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.name.clone(),
+                        column.data_type.clone(),
+                        column.nullable,
+                    )
+                })
+                .collect::<Vec<_>>();
+            MosaicSchema::validate(&columns)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let batch_col_map: Vec<usize> = (0..schema.columns.len()).collect();
+            Self::from_mosaic_schema_with_map(out, schema, options, batch_col_map, &mut diagnostics)
+        })();
+        Self::finish_creation(result, diagnostics)
     }
 
     fn from_mosaic_schema_with_map(
@@ -192,6 +208,7 @@ impl<S: OutputFile> MosaicWriter<S> {
         schema: MosaicSchema,
         options: WriterOptions,
         batch_col_map: Vec<usize>,
+        diagnostics: &mut Option<Box<MemoryDiagnostics>>,
     ) -> io::Result<Self> {
         let num_buckets = schema.num_buckets;
         let mut bucket_writers = Vec::with_capacity(num_buckets);
@@ -276,7 +293,34 @@ impl<S: OutputFile> MosaicWriter<S> {
             total_compressed: 0,
             stats_collector,
             state: WriterState::Open,
+            memory_diagnostics: diagnostics.take(),
         })
+    }
+
+    fn begin_creation() -> Option<Box<MemoryDiagnostics>> {
+        let mut diagnostics = MemoryDiagnostics::from_env();
+        if let Some(d) = &mut diagnostics {
+            d.emit("create_begin", 0, 0, BufferMemory::default(), None, None);
+        }
+        diagnostics
+    }
+
+    fn finish_creation(
+        result: io::Result<Self>,
+        mut diagnostics: Option<Box<MemoryDiagnostics>>,
+    ) -> io::Result<Self> {
+        match result {
+            Ok(mut writer) => {
+                writer.sample_memory("create_end", None, None);
+                Ok(writer)
+            }
+            Err(error) => {
+                if let Some(d) = &mut diagnostics {
+                    d.emit("create_error", 0, 0, BufferMemory::default(), None, None);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn schema(&self) -> &MosaicSchema {
@@ -328,9 +372,18 @@ impl<S: OutputFile> MosaicWriter<S> {
         // partially advanced. Keep the writer aborted until the whole operation succeeds so
         // retry, close, and Drop cannot flush a batch whose write was reported as failed.
         self.state = WriterState::Aborted;
-        let result = self.write_batch_mutating(batch);
+        let input_memory = self
+            .memory_diagnostics
+            .as_mut()
+            .and_then(|d| d.begin_append().then(|| InputMemory::from_batch(batch)));
+        if input_memory.is_some() {
+            self.sample_memory("append_begin", input_memory, None);
+        }
+        let result = self.write_batch_mutating(batch, input_memory);
         if result.is_ok() {
             self.state = WriterState::Open;
+        } else {
+            self.sample_memory("append_error", input_memory, None);
         }
         result
     }
@@ -376,7 +429,11 @@ impl<S: OutputFile> MosaicWriter<S> {
         Ok(())
     }
 
-    fn write_batch_mutating(&mut self, batch: &RecordBatch) -> io::Result<()> {
+    fn write_batch_mutating(
+        &mut self,
+        batch: &RecordBatch,
+        input_memory: Option<InputMemory>,
+    ) -> io::Result<()> {
         let mut size = 0u64;
         for &b in &self.active_buckets {
             let global_indices = &self.schema.bucket_to_global[b];
@@ -398,6 +455,13 @@ impl<S: OutputFile> MosaicWriter<S> {
 
         self.current_row_group_rows += batch.num_rows();
         self.current_buffered_size += size;
+
+        if let Some(d) = &mut self.memory_diagnostics {
+            d.on_buffered(batch.num_rows());
+        }
+        if input_memory.is_some() {
+            self.sample_memory("append_buffered", input_memory, None);
+        }
 
         if self.current_buffered_size >= self.row_group_max_size {
             self.flush_row_group()?;
@@ -424,10 +488,47 @@ impl<S: OutputFile> MosaicWriter<S> {
         Ok(())
     }
 
+    fn sample_memory(
+        &mut self,
+        stage: &'static str,
+        input: Option<InputMemory>,
+        flush: Option<FlushMemory>,
+    ) {
+        if let Some(diagnostics) = &mut self.memory_diagnostics {
+            let mut memory = BufferMemory::default();
+            for &b in &self.active_buckets {
+                self.bucket_writers[b]
+                    .as_ref()
+                    .unwrap()
+                    .add_memory_usage(&mut memory);
+            }
+            diagnostics.emit(
+                stage,
+                self.row_group_metas.len(),
+                self.current_row_group_rows,
+                memory,
+                input,
+                flush,
+            );
+        }
+    }
+
+    /// Correlates binding diagnostics with core writer records, when enabled.
+    #[doc(hidden)]
+    pub fn memory_diagnostics_id(&self) -> Option<u64> {
+        self.memory_diagnostics.as_ref().map(|d| d.writer_id())
+    }
+
     fn flush_row_group(&mut self) -> io::Result<()> {
         if self.current_row_group_rows == 0 {
             return Ok(());
         }
+
+        self.sample_memory("flush_begin", None, None);
+        let mut flush_memory = self
+            .memory_diagnostics
+            .as_ref()
+            .map(|_| FlushMemory::default());
 
         let mut bucket_offsets = vec![0u64; self.num_buckets];
         let mut bucket_layouts = vec![BucketLayout::Empty; self.num_buckets];
@@ -440,19 +541,30 @@ impl<S: OutputFile> MosaicWriter<S> {
             if bw.is_empty() {
                 continue;
             }
+            // The view owns only this bucket's dictionaries. Every exit (including
+            // output errors) drops it before any other bucket is prepared.
+            let bw = bw.prepare();
+            if let Some(memory) = &mut flush_memory {
+                memory.observe_dictionary(bw.dictionary_memory());
+            }
             if bw.has_integer_buffers() {
                 let offset = self.out.pos();
                 let (layout, uncompressed_size) = write_integer_bucket(
                     &mut self.out,
-                    bw,
+                    &bw,
                     self.compression,
                     self.zstd_level,
                     self.page_size_threshold,
+                    &mut flush_memory,
                 )?;
                 bucket_offsets[b] = offset;
                 bucket_layouts[b] = layout;
                 actual_uncompressed_sizes[b] = uncompressed_size;
                 continue;
+            }
+            if let Some(memory) = &mut flush_memory {
+                memory.legacy_buckets += 1;
+                bw.add_current_encoding_usage(memory);
             }
             let est_size = bw.estimated_raw_size();
             let try_paged =
@@ -460,6 +572,9 @@ impl<S: OutputFile> MosaicWriter<S> {
 
             let paged_output = if try_paged {
                 let paged = bw.finish_paged();
+                if let Some(memory) = &mut flush_memory {
+                    memory.observe(paged_buffer_capacity(&paged), 0);
+                }
                 let num_pages = paged.column_pages.iter().filter(|p| p.is_some()).count();
                 let total: usize = paged
                     .column_pages
@@ -486,13 +601,15 @@ impl<S: OutputFile> MosaicWriter<S> {
                     .filter_map(|p| p.as_ref())
                     .map(|p| p.len())
                     .sum();
-                let total_size = self.write_paged_bucket(&paged)?;
+                drop(bw);
+                let total_size = self.write_paged_bucket(&paged, &mut flush_memory)?;
                 bucket_layouts[b] = BucketLayout::Paged { total_size };
                 actual_uncompressed_sizes[b] = paged_raw_size;
                 bucket_offsets[b] = self.out.pos() - total_size as u64;
             } else {
-                let raw = self.bucket_writers[b].as_ref().unwrap().finish();
-                let comp_size = self.write_compressed(&raw)?;
+                let raw = bw.finish();
+                drop(bw);
+                let comp_size = self.write_compressed(&raw, raw.capacity(), &mut flush_memory)?;
                 bucket_layouts[b] = BucketLayout::Monolithic {
                     compressed_size: comp_size,
                     uncompressed_size: raw.len(),
@@ -516,10 +633,14 @@ impl<S: OutputFile> MosaicWriter<S> {
             self.compression_ratio = self.total_compressed as f64 / self.total_uncompressed as f64;
         }
 
+        self.sample_memory("flush_encoded", None, flush_memory);
         for ai in 0..num_active {
             let b = self.active_buckets[ai];
             self.bucket_writers[b].as_mut().unwrap().reset();
         }
+
+        // Keep the completed row-group identity/row count for this reset sample.
+        self.sample_memory("flush_reset", None, None);
 
         let row_stats = match &mut self.stats_collector {
             Some(collector) => collector.finish(),
@@ -538,16 +659,30 @@ impl<S: OutputFile> MosaicWriter<S> {
         Ok(())
     }
 
-    fn write_compressed(&mut self, raw: &[u8]) -> io::Result<usize> {
+    fn write_compressed(
+        &mut self,
+        raw: &[u8],
+        raw_capacity: usize,
+        memory: &mut Option<FlushMemory>,
+    ) -> io::Result<usize> {
         match self.compression {
             COMPRESSION_NONE => {
                 self.out.write(raw)?;
+                if let Some(m) = memory {
+                    m.uncompressed_units += 1;
+                    m.max_unit_bytes = m.max_unit_bytes.max(raw.len());
+                    m.observe(raw_capacity, 0);
+                }
                 Ok(raw.len())
             }
             COMPRESSION_ZSTD => {
                 check_zstd_block_size(raw.len(), "bucket uncompressed size")?;
-                let compressed =
-                    zstd::bulk::compress(raw, self.zstd_level).map_err(io::Error::other)?;
+                let compressed = compress_bulk(raw, self.zstd_level, raw_capacity, memory)?;
+                if let Some(m) = memory {
+                    m.bulk_units += 1;
+                    m.max_unit_bytes = m.max_unit_bytes.max(raw.len());
+                    m.observe(raw_capacity, compressed.capacity());
+                }
                 self.out.write(&compressed)?;
                 Ok(compressed.len())
             }
@@ -558,7 +693,11 @@ impl<S: OutputFile> MosaicWriter<S> {
         }
     }
 
-    fn write_paged_bucket(&mut self, paged: &PagedBucketOutput) -> io::Result<usize> {
+    fn write_paged_bucket(
+        &mut self,
+        paged: &PagedBucketOutput,
+        memory: &mut Option<FlushMemory>,
+    ) -> io::Result<usize> {
         let num_columns = paged.encodings.len();
 
         // Build and compress each column's page_content independently.
@@ -566,6 +705,12 @@ impl<S: OutputFile> MosaicWriter<S> {
         // On-disk slot = [uncompressed_size (varint) | zstd(page_content)]
         // ALL_NULL columns have no slot (directory entry = 0).
         let mut column_slots: Vec<Vec<u8>> = Vec::with_capacity(num_columns);
+        let mut retained = column_slots.capacity() * std::mem::size_of::<Vec<u8>>();
+        let raw_capacity = if memory.is_some() {
+            paged_buffer_capacity(paged)
+        } else {
+            0
+        };
         for i in 0..num_columns {
             if paged.encodings[i] == ENCODING_ALL_NULL {
                 column_slots.push(Vec::new());
@@ -596,14 +741,27 @@ impl<S: OutputFile> MosaicWriter<S> {
             // Compress and build on-disk slot: uncompressed_size varint + compressed data
             let uncompressed_size = page_content.len();
             check_zstd_block_size(uncompressed_size, "page uncompressed size")?;
-            let compressed =
-                zstd::bulk::compress(&page_content, self.zstd_level).map_err(io::Error::other)?;
+            let compressed = compress_bulk(
+                &page_content,
+                self.zstd_level,
+                raw_capacity + page_content.capacity() + retained,
+                memory,
+            )?;
             let mut slot = Vec::new();
             varint::encode(
                 &mut slot,
                 to_u32(uncompressed_size, "page uncompressed size")?,
             );
             slot.extend_from_slice(&compressed);
+            retained += slot.capacity();
+            if let Some(m) = memory {
+                m.bulk_units += 1;
+                m.max_unit_bytes = m.max_unit_bytes.max(uncompressed_size);
+                m.observe(
+                    raw_capacity + page_content.capacity(),
+                    retained + compressed.capacity(),
+                );
+            }
             column_slots.push(slot);
         }
 
@@ -652,9 +810,13 @@ impl<S: OutputFile> MosaicWriter<S> {
         // Closing mutates row-group metadata and the output stream. Keep failures sticky so a
         // retry cannot report success for a file whose footer or final flush was not completed.
         self.state = WriterState::Aborted;
+        self.sample_memory("close_begin", None, None);
         let result = self.close_inner();
         if result.is_ok() {
             self.state = WriterState::Closed;
+            self.sample_memory("close_end", None, None);
+        } else {
+            self.sample_memory("close_error", None, None);
         }
         result
     }
@@ -819,13 +981,68 @@ impl<S: OutputFile> io::Write for BufferedOutputWriter<'_, S> {
 // materialized input while avoiding streaming context overhead for tiny pages.
 const INTEGER_ENCODING_BUFFER_LIMIT: usize = 1024 * 1024;
 
-fn compress_integer_unit<W: io::Write>(
+fn paged_buffer_capacity(paged: &PagedBucketOutput) -> usize {
+    paged.const_data.iter().map(Vec::capacity).sum::<usize>()
+        + paged
+            .column_pages
+            .iter()
+            .flatten()
+            .map(Vec::capacity)
+            .sum::<usize>()
+}
+
+trait DiagnosticOutput: io::Write {
+    fn diagnostic_capacity(&self) -> usize;
+}
+
+impl DiagnosticOutput for Vec<u8> {
+    fn diagnostic_capacity(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl<S: OutputFile> DiagnosticOutput for OutputWriter<'_, S> {
+    // Application/file output allocation is outside the writer's ownership.
+    fn diagnostic_capacity(&self) -> usize {
+        0
+    }
+}
+
+// Same one-shot compressor and output allocation as zstd::bulk::compress.
+// Capture the context size while it is alive; it is dropped before sink writes.
+fn compress_bulk(
+    raw: &[u8],
+    level: i32,
+    other_capacity: usize,
+    memory: &mut Option<FlushMemory>,
+) -> io::Result<Vec<u8>> {
+    let mut compressor = zstd::bulk::Compressor::new(level)?;
+    let compressed = compressor.compress(raw)?;
+    if let Some(m) = memory {
+        let context = compressor.context_mut().sizeof();
+        m.bulk_contexts += 1;
+        m.bulk_context_peak_bytes = m.bulk_context_peak_bytes.max(context);
+        m.bulk_live_capacity_peak_bytes = m.bulk_live_capacity_peak_bytes.max(
+            context
+                .saturating_add(other_capacity)
+                .saturating_add(compressed.capacity()),
+        );
+    }
+    Ok(compressed)
+}
+
+fn compress_integer_unit<W: DiagnosticOutput>(
     mut output: W,
     level: i32,
     size: usize,
+    memory: &mut Option<FlushMemory>,
+    retained_slots: usize,
     encode: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
 ) -> io::Result<W> {
     check_zstd_block_size(size, "integer encoded unit size")?;
+    if let Some(m) = memory {
+        m.max_unit_bytes = m.max_unit_bytes.max(size);
+    }
     if size <= INTEGER_ENCODING_BUFFER_LIMIT {
         let mut raw = Vec::with_capacity(size);
         encode(&mut raw)?;
@@ -835,26 +1052,48 @@ fn compress_integer_unit<W: io::Write>(
                 "integer encoded size mismatch",
             ));
         }
-        let compressed = zstd::bulk::compress(&raw, level).map_err(io::Error::other)?;
+        let compressed = compress_bulk(
+            &raw,
+            level,
+            raw.capacity() + retained_slots + output.diagnostic_capacity(),
+            memory,
+        )?;
         output.write_all(&compressed)?;
+        if let Some(m) = memory {
+            m.bulk_units += 1;
+            m.observe(
+                raw.capacity(),
+                retained_slots + compressed.capacity() + output.diagnostic_capacity(),
+            );
+        }
         Ok(output)
     } else {
         let mut encoder = zstd::stream::write::Encoder::new(output, level)?;
         encoder.set_pledged_src_size(Some(size as u64))?;
         encode(&mut encoder)?;
-        encoder.finish()
+        let output = encoder.finish()?;
+        if let Some(m) = memory {
+            m.stream_units += 1;
+            m.observe(0, retained_slots + output.diagnostic_capacity());
+        }
+        Ok(output)
     }
 }
 
 fn write_integer_bucket<S: OutputFile>(
     out: &mut S,
-    bucket: &BucketWriter,
+    bucket: &PreparedBucket<'_>,
     compression: u8,
     level: i32,
     page_threshold: usize,
+    memory: &mut Option<FlushMemory>,
 ) -> io::Result<(BucketLayout, usize)> {
     let raw_size = bucket.estimated_raw_size();
     let plan = bucket.encoding_plan();
+    if let Some(m) = memory {
+        m.integer_buckets += 1;
+        bucket.add_encoding_usage(&plan.encodings, m);
+    }
     let page_count = plan.page_sizes.iter().filter(|p| p.is_some()).count();
     let page_bytes: usize = plan.page_sizes.iter().flatten().sum();
     let paged = compression == COMPRESSION_ZSTD
@@ -868,13 +1107,23 @@ fn write_integer_bucket<S: OutputFile>(
             COMPRESSION_NONE => {
                 let mut buffered = BufferedOutputWriter::new(out);
                 bucket.write_encoded(&mut buffered)?;
+                if let Some(m) = memory {
+                    m.uncompressed_units += 1;
+                    m.max_unit_bytes = m.max_unit_bytes.max(raw_size);
+                    m.observe(buffered.buffer.capacity(), 0);
+                }
                 buffered.finish()?;
             }
             COMPRESSION_ZSTD => {
                 check_zstd_block_size(raw_size, "bucket uncompressed size")?;
-                compress_integer_unit(OutputWriter(out), level, raw_size, |mut sink| {
-                    bucket.write_encoded(&mut sink)
-                })?;
+                compress_integer_unit(
+                    OutputWriter(out),
+                    level,
+                    raw_size,
+                    memory,
+                    0,
+                    |mut sink| bucket.write_encoded(&mut sink),
+                )?;
             }
             _ => {
                 return Err(io::Error::new(
@@ -895,16 +1144,18 @@ fn write_integer_bucket<S: OutputFile>(
     // The format puts compressed slot lengths before the slots. Retain only
     // compressed slots here, not full-width values or uncompressed pages.
     let mut slots = Vec::with_capacity(plan.encodings.len());
+    let mut retained_slots = slots.capacity() * std::mem::size_of::<Vec<u8>>();
     for col in 0..plan.encodings.len() {
         let size = bucket.page_size(&plan, col);
         let mut slot = Vec::new();
         if size != 0 {
             check_zstd_block_size(size, "page uncompressed size")?;
             varint::encode(&mut slot, to_u32(size, "page uncompressed size")?);
-            slot = compress_integer_unit(slot, level, size, |mut sink| {
+            slot = compress_integer_unit(slot, level, size, memory, retained_slots, |mut sink| {
                 bucket.write_page(&plan, col, &mut sink)
             })?;
         }
+        retained_slots += slot.capacity();
         slots.push(slot);
     }
     if !bucket.children().is_empty() {
@@ -1530,3 +1781,7 @@ mod tests {
 #[cfg(test)]
 #[path = "writer_integer_tests.rs"]
 mod integer_tests;
+
+#[cfg(test)]
+#[path = "writer_memory_tests.rs"]
+mod memory_tests;
