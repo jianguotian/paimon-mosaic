@@ -43,6 +43,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: e4f4930f1c22dd4021092bf0ea9e7e00e67dbd79
 
       - name: Setup Rust toolchain
         run: |

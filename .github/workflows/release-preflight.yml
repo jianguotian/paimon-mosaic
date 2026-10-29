@@ -32,6 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: e4f4930f1c22dd4021092bf0ea9e7e00e67dbd79
           fetch-depth: 0
 
       - name: Set up Python
@@ -74,3 +75,12 @@ jobs:
             --commit "${commit}" \
             --prefix "${prefix}" \
             --archive "${archive}"
+
+      - name: Verify rehearsal candidate versions and archive
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "e4f4930f1c22dd4021092bf0ea9e7e00e67dbd79"
+          python3 tools/verify_release_versions.py v0.3.0-rc3
+          archive="${RUNNER_TEMP}/apache-paimon-mosaic-0.3.0-src.tgz"
+          python3 tools/verify_source_archive.py create --repository "$PWD" --commit HEAD --prefix paimon-mosaic-0.3.0/ --output "$archive"
+          python3 tools/verify_source_archive.py verify --repository "$PWD" --commit HEAD --prefix paimon-mosaic-0.3.0/ --archive "$archive"
