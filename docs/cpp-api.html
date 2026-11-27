@@ -147,6 +147,14 @@ g++ -std=c++17 -I include/ example.cpp \
     <span class="kw">return</span> <span class="num">0</span>;
 }</code></pre>
 
+            <h3>Example: writing unsigned Arrow input</h3>
+            <p>For a source batch that fits the application's conversion budget, cast its
+                unsigned columns to the wider signed types in the file schema and submit it
+                with one <code>Writer::write</code> call. For larger batches, the caller-side
+                example in <code>cpp/examples/write_unsigned_batch.hpp</code> shows how to
+                slice before casting. Each slice is a separate append, so row group boundaries
+                can differ. Discard a partial file before retrying a failed write.</p>
+
             <h3>Writing ARRAY Columns</h3>
             <p>
                 ARRAY types use Arrow&rsquo;s <code>ListBuilder</code>. Element values are
