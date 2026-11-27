@@ -1060,41 +1060,56 @@ static void test_map_type() {
     printf("  PASS test_map_type\n");
 }
 
-static void test_bounded_uint8_widening() {
-    const auto source = arrow::schema({arrow::field("z", arrow::uint8()),
-                                       arrow::field("id", arrow::int32()),
-                                       arrow::field("a", arrow::uint8())});
-    const auto target = arrow::schema({arrow::field("z", arrow::int16()),
-                                       source->field(1), arrow::field("a", arrow::int16())});
-    arrow::UInt8Builder values;
-    ASSERT_TRUE(values.AppendValues({42, 0, 127, 128}).ok());
-    ASSERT_TRUE(values.AppendNull().ok());
-    ASSERT_TRUE(values.AppendValues({255, 1}).ok());
-    auto data = values.Finish().ValueOrDie();
+static void test_bounded_unsigned_widening() {
+    arrow::UInt8Builder u8;
+    ASSERT_TRUE(u8.AppendValues({42, 0, 127, 128}).ok());
+    ASSERT_TRUE(u8.AppendNull().ok());
+    ASSERT_TRUE(u8.Append(255).ok());
+    arrow::UInt16Builder u16;
+    ASSERT_TRUE(u16.AppendValues({42, 0, 32767, 32768, 65535}).ok());
+    ASSERT_TRUE(u16.AppendNull().ok());
+    arrow::UInt32Builder u32;
+    ASSERT_TRUE(u32.AppendValues({42, 0, 2147483647U, 2147483648U}).ok());
+    ASSERT_TRUE(u32.AppendNull().ok());
+    ASSERT_TRUE(u32.Append(4294967295U).ok());
     arrow::Int32Builder ids;
     ASSERT_TRUE(ids.AppendValues({90, 91, 92, 93, 94, 95}).ok());
+    auto small = u8.Finish().ValueOrDie();
+    auto medium = u16.Finish().ValueOrDie();
+    auto large = u32.Finish().ValueOrDie();
+    const auto source = arrow::schema({
+        arrow::field("small", arrow::uint8()), arrow::field("medium", arrow::uint16()),
+        arrow::field("large", arrow::uint32()), arrow::field("id", arrow::int32()),
+        arrow::field("small_as_int", arrow::uint8()), arrow::field("small_as_big", arrow::uint8()),
+        arrow::field("medium_as_big", arrow::uint16())});
+    const auto target = arrow::schema({
+        arrow::field("small", arrow::int16()), arrow::field("medium", arrow::int32()),
+        arrow::field("large", arrow::int64()), source->field(3),
+        arrow::field("small_as_int", arrow::int32()), arrow::field("small_as_big", arrow::int64()),
+        arrow::field("medium_as_big", arrow::int64())});
     auto input = arrow::RecordBatch::Make(source, 6, {
-        data->Slice(0, 6), ids.Finish().ValueOrDie(), data->Slice(1, 6)})->Slice(1, 5);
-    auto expected = arrow::RecordBatch::Make(target, 5, {
-        arrow::compute::Cast(*input->column(0), arrow::int16()).ValueOrDie(),
-        input->column(1),
-        arrow::compute::Cast(*input->column(2), arrow::int16()).ValueOrDie()});
+        small, medium, large, ids.Finish().ValueOrDie(), small, small, medium})->Slice(1, 5);
+    auto expected_columns = input->columns();
+    for (int i = 0; i < target->num_fields(); ++i) {
+        expected_columns[i] = arrow::compute::Cast(*input->column(i), target->field(i)->type()).ValueOrDie();
+    }
+    auto expected = arrow::RecordBatch::Make(target, 5, std::move(expected_columns));
 
-    // Two widened fields cost four value bytes per row. With an eight-byte
-    // budget, making every append flush exposes slice lengths of 2, 2, 1.
+    // The six widened columns use 2+4+8+4+8+8 = 34 bytes per row.
+    // With 68 bytes, flushing each append exposes slice lengths of 2, 2, 1.
     for (bool flush_each_slice : {false, true}) {
         MemBuffer buf;
         ArrowSchema file_schema{};
         ASSERT_TRUE(arrow::ExportSchema(*target, &file_schema).ok());
         mosaic::WriterOptions opts;
         if (flush_each_slice) opts.row_group_max_size = 1;
-        const char* stats_columns[] = {"z"};
+        const char* stats_columns[] = {"large"};
         opts.stats_columns = stats_columns;
         opts.num_stats_columns = 1;
         mosaic::Writer writer(make_output(buf), &file_schema, opts);
         ArrowSchemaRelease(&file_schema);
-        mosaic::write_uint8_as_int16(writer, *input->Slice(0, 0), target, 8);
-        mosaic::write_uint8_as_int16(writer, *input, target, 8);
+        mosaic::write_with_unsigned_widening(writer, *input->Slice(0, 0), target, 68);
+        mosaic::write_with_unsigned_widening(writer, *input, target, 68);
         writer.close();
 
         auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
@@ -1111,14 +1126,14 @@ static void test_bounded_uint8_widening() {
             const auto stats = reader.get_row_group_statistics(0);
             ASSERT_EQ(stats.size(), 1u);
             ASSERT_EQ(stats[0].null_count, 1u);
-            ASSERT_EQ(stats[0].min_value, (std::vector<uint8_t>{0, 0}));
-            ASSERT_EQ(stats[0].max_value, (std::vector<uint8_t>{0, 255}));
+            ASSERT_EQ(stats[0].min_value, (std::vector<uint8_t>(8, 0)));
+            ASSERT_EQ(stats[0].max_value, (std::vector<uint8_t>{0, 0, 0, 0, 255, 255, 255, 255}));
         }
     }
-    printf("  PASS test_bounded_uint8_widening\n");
+    printf("  PASS test_bounded_unsigned_widening\n");
 }
 
-static void test_uint8_widening_validates_before_append() {
+static void test_unsigned_widening_validates_before_append() {
     const auto target = arrow::schema({arrow::field("signal", arrow::int16(), false)});
     MemBuffer buf;
     ArrowSchema file_schema{};
@@ -1133,7 +1148,7 @@ static void test_uint8_widening_validates_before_append() {
                                           4, {data});
     auto expect_error = [&](const arrow::RecordBatch& batch, int64_t budget) {
         try {
-            mosaic::write_uint8_as_int16(writer, batch, target, budget);
+            mosaic::write_with_unsigned_widening(writer, batch, target, budget);
         } catch (const mosaic::Error&) {
             return;
         }
@@ -1143,18 +1158,48 @@ static void test_uint8_widening_validates_before_append() {
     expect_error(*input, 2);
     expect_error(*input->Slice(0, 3), 1);
     expect_error(*input->Slice(0, 3), 0);
-    auto wrong_type = arrow::compute::Cast(*data->Slice(0, 3), arrow::int32()).ValueOrDie();
-    expect_error(*arrow::RecordBatch::Make(arrow::schema({arrow::field("signal", arrow::int32())}),
-                                          3, {wrong_type}), 8);
+    // All these particular values fit in Int16, but their source types do not.
+    for (const auto& type : {arrow::uint32(), arrow::int32()}) {
+        auto incompatible = arrow::compute::Cast(*data->Slice(0, 3), type).ValueOrDie();
+        expect_error(*arrow::RecordBatch::Make(arrow::schema({arrow::field("signal", type)}),
+                                              3, {incompatible}), 8);
+    }
     // Already matching columns require no conversion budget per row.
     auto valid = arrow::compute::Cast(*data->Slice(0, 3), arrow::int16()).ValueOrDie();
     auto expected = arrow::RecordBatch::Make(target, 3, {valid});
-    mosaic::write_uint8_as_int16(writer, *expected, target, 1);
+    mosaic::write_with_unsigned_widening(writer, *expected, target, 1);
     writer.close();
     auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
     ASSERT_EQ(reader.num_row_groups(), 1u);
     ASSERT_TRUE(read_row_group(reader, 0)->Equals(*expected));
-    printf("  PASS test_uint8_widening_validates_before_append\n");
+    printf("  PASS test_unsigned_widening_validates_before_append\n");
+}
+
+static void test_equal_width_unsigned_input_is_rejected() {
+    const std::vector<std::pair<std::shared_ptr<arrow::DataType>, std::shared_ptr<arrow::DataType>>>
+        types = {{arrow::uint8(), arrow::int8()}, {arrow::uint16(), arrow::int16()},
+                 {arrow::uint32(), arrow::int32()}, {arrow::uint64(), arrow::int64()}};
+    for (const auto& [from, to] : types) {
+        auto target = arrow::schema({arrow::field("value", to)});
+        MemBuffer buf;
+        ArrowSchema file_schema{};
+        ASSERT_TRUE(arrow::ExportSchema(*target, &file_schema).ok());
+        mosaic::Writer writer(make_output(buf), &file_schema);
+        ArrowSchemaRelease(&file_schema);
+        // Even an all-null input cannot make an incompatible schema eligible.
+        auto array = arrow::MakeArrayOfNull(from, 1).ValueOrDie();
+        auto batch = arrow::RecordBatch::Make(arrow::schema({arrow::field("value", from)}), 1, {array});
+        bool rejected = false;
+        try {
+            mosaic::write_with_unsigned_widening(writer, *batch, target, 64);
+        } catch (const mosaic::Error& e) {
+            rejected = std::string(e.what()).find("unsupported conversion") != std::string::npos;
+        }
+        ASSERT_TRUE(rejected);
+        writer.close();
+        ASSERT_EQ(writer.num_row_groups(), 0u);
+    }
+    printf("  PASS test_equal_width_unsigned_input_is_rejected\n");
 }
 
 int main() {
@@ -1178,8 +1223,9 @@ int main() {
     test_array_with_null_elements();
     test_array_string_elements();
     test_map_type();
-    test_bounded_uint8_widening();
-    test_uint8_widening_validates_before_append();
-    printf("All %d tests passed.\n", 21);
+    test_bounded_unsigned_widening();
+    test_unsigned_widening_validates_before_append();
+    test_equal_width_unsigned_input_is_rejected();
+    printf("All %d tests passed.\n", 22);
     return 0;
 }

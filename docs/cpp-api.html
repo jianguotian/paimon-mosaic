@@ -147,16 +147,19 @@ g++ -std=c++17 -I include/ example.cpp \
     <span class="kw">return</span> <span class="num">0</span>;
 }</code></pre>
 
-            <h3>Writing UInt8 inputs to SMALLINT fields</h3>
-            <p>C++ callers using Arrow can open a writer with an Int16 file field and pass
-                their original UInt8 batches to the optional helper in <code>mosaic_arrow.hpp</code>.
-                Supply the same file schema used to open the writer:</p>
+            <h3>Writing unsigned Arrow integers</h3>
+            <p>Use the optional helper in <code>mosaic_arrow.hpp</code> with the original batch and
+                the schema used to open the writer. A top-level unsigned input can be written
+                to any signed integer field with a strictly greater bit width. The smallest
+                targets for UInt8, UInt16, and UInt32 are SMALLINT, INT, and BIGINT respectively.
+                UInt64 has no wider signed integer target.</p>
 <pre><code>#include "mosaic_arrow.hpp"
 
-// file_schema declares signal as Int16; input contains signal as UInt8.
-mosaic::write_uint8_as_int16(writer, *input, file_schema, 64 * 1024);</code></pre>
+// Input fields: UInt8, UInt16, UInt32. File fields: Int16, Int32, Int64.
+mosaic::write_with_unsigned_widening(writer, *input, file_schema, 64 * 1024);</code></pre>
             <p>The byte budget covers the widened value buffers across all converted columns
-                in one slice. For two UInt8 columns, 64 KiB fits 16,384 rows per slice.
+                in one slice. In the example each row costs 2 + 4 + 8 = 14 bytes,
+                so 64 KiB fits 4,681 rows per slice.
                 Matching columns share their input buffers. The helper submits the slices to the
                 same writer; its usual row group size policy applies. If an append fails after
                 earlier slices were written, discard the partial file before retrying.</p>

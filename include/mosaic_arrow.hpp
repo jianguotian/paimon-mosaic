@@ -25,6 +25,7 @@
 #include <arrow/c/bridge.h>
 #include <arrow/c/helpers.h>
 #include <arrow/compute/cast.h>
+#include <arrow/type_traits.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -43,14 +44,14 @@ struct ExportedBatch {
 };
 }  // namespace detail
 
-/// Write an Arrow batch to an existing Writer, widening top-level UInt8 inputs
-/// for Int16 fields. Pass the same file schema used to open the Writer.
+/// Write top-level unsigned Arrow integers as wider signed integers. The file
+/// schema passed here must be the same schema used to open the Writer.
 /// max_value_bytes bounds the total widened value bytes per submitted slice;
 /// validity bitmaps, allocator padding and the Writer's own buffers are separate.
 /// If a write fails after earlier slices were appended, discard the partial file.
-inline void write_uint8_as_int16(Writer& writer, const arrow::RecordBatch& input,
-                                 const std::shared_ptr<arrow::Schema>& file_schema,
-                                 int64_t max_value_bytes) {
+inline void write_with_unsigned_widening(Writer& writer, const arrow::RecordBatch& input,
+                                         const std::shared_ptr<arrow::Schema>& file_schema,
+                                         int64_t max_value_bytes) {
     if (max_value_bytes <= 0) throw Error("max_value_bytes must be positive");
     if (!file_schema || file_schema->num_fields() != input.num_columns()) {
         throw Error("file schema must have one field per input column");
@@ -60,6 +61,7 @@ inline void write_uint8_as_int16(Writer& writer, const arrow::RecordBatch& input
 
     // Check all columns before submitting the first slice.
     std::vector<int> widen;
+    int64_t widened_bytes_per_row = 0;
     for (int i = 0; i < input.num_columns(); ++i) {
         const auto& field = file_schema->field(i);
         const auto& column = input.column(i);
@@ -69,18 +71,21 @@ inline void write_uint8_as_int16(Writer& writer, const arrow::RecordBatch& input
         if (!field->nullable() && column->null_count() > 0) {
             throw Error("null in non-nullable file field " + field->name());
         }
-        if (column->type()->Equals(field->type())) continue;
-        if (column->type_id() != arrow::Type::UINT8 || field->type()->id() != arrow::Type::INT16) {
+        const auto& from = *column->type();
+        const auto& to = *field->type();
+        if (from.Equals(to)) continue;
+        if (!(arrow::is_unsigned_integer(from) && arrow::is_signed_integer(to) &&
+              from.bit_width() < to.bit_width())) {
             throw Error("unsupported conversion for " + field->name() + ": " +
-                        column->type()->ToString() + " to " + field->type()->ToString());
+                        from.ToString() + " to " + to.ToString());
         }
         widen.push_back(i);
+        widened_bytes_per_row += to.byte_width();
     }
     if (input.num_rows() == 0) return;
     int64_t rows_per_slice = input.num_rows();
-    if (!widen.empty()) {
-        const int64_t bytes_per_row = static_cast<int64_t>(widen.size()) * sizeof(int16_t);
-        rows_per_slice = max_value_bytes / bytes_per_row;
+    if (widened_bytes_per_row > 0) {
+        rows_per_slice = max_value_bytes / widened_bytes_per_row;
         if (rows_per_slice == 0) throw Error("max_value_bytes cannot fit one widened row");
     }
 
@@ -88,7 +93,7 @@ inline void write_uint8_as_int16(Writer& writer, const arrow::RecordBatch& input
         const int64_t count = std::min(rows_per_slice, input.num_rows() - offset);
         auto columns = input.Slice(offset, count)->columns();
         for (const int i : widen) {
-            auto converted = arrow::compute::Cast(*columns[i], arrow::int16());
+            auto converted = arrow::compute::Cast(*columns[i], file_schema->field(i)->type());
             if (!converted.ok()) throw Error(converted.status().ToString());
             columns[i] = std::move(converted).ValueOrDie();
         }
