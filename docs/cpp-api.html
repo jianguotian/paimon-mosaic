@@ -147,6 +147,20 @@ g++ -std=c++17 -I include/ example.cpp \
     <span class="kw">return</span> <span class="num">0</span>;
 }</code></pre>
 
+            <h3>Writing UInt8 inputs to SMALLINT fields</h3>
+            <p>C++ callers using Arrow can open a writer with an Int16 file field and pass
+                their original UInt8 batches to the optional helper in <code>mosaic_arrow.hpp</code>.
+                Supply the same file schema used to open the writer:</p>
+<pre><code>#include "mosaic_arrow.hpp"
+
+// file_schema declares signal as Int16; input contains signal as UInt8.
+mosaic::write_uint8_as_int16(writer, *input, file_schema, 64 * 1024);</code></pre>
+            <p>The byte budget covers the widened value buffers across all converted columns
+                in one slice. For two UInt8 columns, 64 KiB fits 16,384 rows per slice.
+                Matching columns share their input buffers. The helper submits the slices to the
+                same writer; its usual row group size policy applies. If an append fails after
+                earlier slices were written, discard the partial file before retrying.</p>
+
             <h3>Writing ARRAY Columns</h3>
             <p>
                 ARRAY types use Arrow&rsquo;s <code>ListBuilder</code>. Element values are

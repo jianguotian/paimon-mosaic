@@ -18,6 +18,7 @@
  */
 
 #include "mosaic.hpp"
+#include "mosaic_arrow.hpp"
 
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>
@@ -1059,6 +1060,103 @@ static void test_map_type() {
     printf("  PASS test_map_type\n");
 }
 
+static void test_bounded_uint8_widening() {
+    const auto source = arrow::schema({arrow::field("z", arrow::uint8()),
+                                       arrow::field("id", arrow::int32()),
+                                       arrow::field("a", arrow::uint8())});
+    const auto target = arrow::schema({arrow::field("z", arrow::int16()),
+                                       source->field(1), arrow::field("a", arrow::int16())});
+    arrow::UInt8Builder values;
+    ASSERT_TRUE(values.AppendValues({42, 0, 127, 128}).ok());
+    ASSERT_TRUE(values.AppendNull().ok());
+    ASSERT_TRUE(values.AppendValues({255, 1}).ok());
+    auto data = values.Finish().ValueOrDie();
+    arrow::Int32Builder ids;
+    ASSERT_TRUE(ids.AppendValues({90, 91, 92, 93, 94, 95}).ok());
+    auto input = arrow::RecordBatch::Make(source, 6, {
+        data->Slice(0, 6), ids.Finish().ValueOrDie(), data->Slice(1, 6)})->Slice(1, 5);
+    auto expected = arrow::RecordBatch::Make(target, 5, {
+        arrow::compute::Cast(*input->column(0), arrow::int16()).ValueOrDie(),
+        input->column(1),
+        arrow::compute::Cast(*input->column(2), arrow::int16()).ValueOrDie()});
+
+    // Two widened fields cost four value bytes per row. With an eight-byte
+    // budget, making every append flush exposes slice lengths of 2, 2, 1.
+    for (bool flush_each_slice : {false, true}) {
+        MemBuffer buf;
+        ArrowSchema file_schema{};
+        ASSERT_TRUE(arrow::ExportSchema(*target, &file_schema).ok());
+        mosaic::WriterOptions opts;
+        if (flush_each_slice) opts.row_group_max_size = 1;
+        const char* stats_columns[] = {"z"};
+        opts.stats_columns = stats_columns;
+        opts.num_stats_columns = 1;
+        mosaic::Writer writer(make_output(buf), &file_schema, opts);
+        ArrowSchemaRelease(&file_schema);
+        mosaic::write_uint8_as_int16(writer, *input->Slice(0, 0), target, 8);
+        mosaic::write_uint8_as_int16(writer, *input, target, 8);
+        writer.close();
+
+        auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+        ASSERT_EQ(reader.num_row_groups(), flush_each_slice ? 3u : 1u);
+        int64_t offset = 0;
+        for (uint32_t rg = 0; rg < reader.num_row_groups(); ++rg) {
+            auto actual = read_row_group(reader, rg);
+            auto count = flush_each_slice ? std::min<int64_t>(2, 5 - offset) : 5;
+            ASSERT_TRUE(actual->Equals(*expected->Slice(offset, count)));
+            offset += count;
+        }
+        ASSERT_EQ(offset, 5);
+        if (!flush_each_slice) {
+            const auto stats = reader.get_row_group_statistics(0);
+            ASSERT_EQ(stats.size(), 1u);
+            ASSERT_EQ(stats[0].null_count, 1u);
+            ASSERT_EQ(stats[0].min_value, (std::vector<uint8_t>{0, 0}));
+            ASSERT_EQ(stats[0].max_value, (std::vector<uint8_t>{0, 255}));
+        }
+    }
+    printf("  PASS test_bounded_uint8_widening\n");
+}
+
+static void test_uint8_widening_validates_before_append() {
+    const auto target = arrow::schema({arrow::field("signal", arrow::int16(), false)});
+    MemBuffer buf;
+    ArrowSchema file_schema{};
+    ASSERT_TRUE(arrow::ExportSchema(*target, &file_schema).ok());
+    mosaic::Writer writer(make_output(buf), &file_schema);
+    ArrowSchemaRelease(&file_schema);
+    arrow::UInt8Builder values;
+    ASSERT_TRUE(values.AppendValues({0, 128, 255}).ok());
+    ASSERT_TRUE(values.AppendNull().ok());
+    auto data = values.Finish().ValueOrDie();
+    auto input = arrow::RecordBatch::Make(arrow::schema({arrow::field("signal", arrow::uint8())}),
+                                          4, {data});
+    auto expect_error = [&](const arrow::RecordBatch& batch, int64_t budget) {
+        try {
+            mosaic::write_uint8_as_int16(writer, batch, target, budget);
+        } catch (const mosaic::Error&) {
+            return;
+        }
+        ASSERT_TRUE(false);
+    };
+    // The null would be in the fourth slice. Earlier slices must not be appended.
+    expect_error(*input, 2);
+    expect_error(*input->Slice(0, 3), 1);
+    expect_error(*input->Slice(0, 3), 0);
+    auto wrong_type = arrow::compute::Cast(*data->Slice(0, 3), arrow::int32()).ValueOrDie();
+    expect_error(*arrow::RecordBatch::Make(arrow::schema({arrow::field("signal", arrow::int32())}),
+                                          3, {wrong_type}), 8);
+    // Already matching columns require no conversion budget per row.
+    auto valid = arrow::compute::Cast(*data->Slice(0, 3), arrow::int16()).ValueOrDie();
+    auto expected = arrow::RecordBatch::Make(target, 3, {valid});
+    mosaic::write_uint8_as_int16(writer, *expected, target, 1);
+    writer.close();
+    auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
+    ASSERT_EQ(reader.num_row_groups(), 1u);
+    ASSERT_TRUE(read_row_group(reader, 0)->Equals(*expected));
+    printf("  PASS test_uint8_widening_validates_before_append\n");
+}
+
 int main() {
     printf("Running Mosaic C++ tests...\n");
     test_basic_roundtrip();
@@ -1080,6 +1178,8 @@ int main() {
     test_array_with_null_elements();
     test_array_string_elements();
     test_map_type();
-    printf("All %d tests passed.\n", 19);
+    test_bounded_uint8_widening();
+    test_uint8_widening_validates_before_append();
+    printf("All %d tests passed.\n", 21);
     return 0;
 }
