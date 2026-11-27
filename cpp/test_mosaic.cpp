@@ -18,7 +18,7 @@
  */
 
 #include "mosaic.hpp"
-#include "mosaic_arrow.hpp"
+#include "examples/write_unsigned_batch.hpp"
 
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>
@@ -1097,32 +1097,38 @@ static void test_bounded_unsigned_widening() {
 
     // The six widened columns use 2+4+8+4+8+8 = 34 bytes per row.
     // With 68 bytes, flushing each append exposes slice lengths of 2, 2, 1.
-    for (bool flush_each_slice : {false, true}) {
+    struct WriteCase {
+        int64_t budget;
+        bool flush_each_append;
+        std::vector<int64_t> group_rows;
+    };
+    const WriteCase cases[] = {{68, false, {5}}, {68, true, {2, 2, 1}}, {170, true, {5}}};
+    for (const auto& run : cases) {
         MemBuffer buf;
         ArrowSchema file_schema{};
         ASSERT_TRUE(arrow::ExportSchema(*target, &file_schema).ok());
         mosaic::WriterOptions opts;
-        if (flush_each_slice) opts.row_group_max_size = 1;
+        if (run.flush_each_append) opts.row_group_max_size = 1;
         const char* stats_columns[] = {"large"};
         opts.stats_columns = stats_columns;
         opts.num_stats_columns = 1;
         mosaic::Writer writer(make_output(buf), &file_schema, opts);
         ArrowSchemaRelease(&file_schema);
-        mosaic::write_with_unsigned_widening(writer, *input->Slice(0, 0), target, 68);
-        mosaic::write_with_unsigned_widening(writer, *input, target, 68);
+        mosaic::examples::write_with_unsigned_widening(writer, *input->Slice(0, 0), target, run.budget);
+        mosaic::examples::write_with_unsigned_widening(writer, *input, target, run.budget);
         writer.close();
 
         auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
-        ASSERT_EQ(reader.num_row_groups(), flush_each_slice ? 3u : 1u);
+        ASSERT_EQ(reader.num_row_groups(), run.group_rows.size());
         int64_t offset = 0;
         for (uint32_t rg = 0; rg < reader.num_row_groups(); ++rg) {
             auto actual = read_row_group(reader, rg);
-            auto count = flush_each_slice ? std::min<int64_t>(2, 5 - offset) : 5;
+            auto count = run.group_rows[rg];
             ASSERT_TRUE(actual->Equals(*expected->Slice(offset, count)));
             offset += count;
         }
         ASSERT_EQ(offset, 5);
-        if (!flush_each_slice) {
+        if (run.group_rows.size() == 1) {
             const auto stats = reader.get_row_group_statistics(0);
             ASSERT_EQ(stats.size(), 1u);
             ASSERT_EQ(stats[0].null_count, 1u);
@@ -1148,7 +1154,7 @@ static void test_unsigned_widening_validates_before_append() {
                                           4, {data});
     auto expect_error = [&](const arrow::RecordBatch& batch, int64_t budget) {
         try {
-            mosaic::write_with_unsigned_widening(writer, batch, target, budget);
+            mosaic::examples::write_with_unsigned_widening(writer, batch, target, budget);
         } catch (const mosaic::Error&) {
             return;
         }
@@ -1167,7 +1173,7 @@ static void test_unsigned_widening_validates_before_append() {
     // Already matching columns require no conversion budget per row.
     auto valid = arrow::compute::Cast(*data->Slice(0, 3), arrow::int16()).ValueOrDie();
     auto expected = arrow::RecordBatch::Make(target, 3, {valid});
-    mosaic::write_with_unsigned_widening(writer, *expected, target, 1);
+    mosaic::examples::write_with_unsigned_widening(writer, *expected, target, 1);
     writer.close();
     auto reader = mosaic::make_reader(make_input(buf), buf.data.size());
     ASSERT_EQ(reader.num_row_groups(), 1u);
@@ -1191,7 +1197,7 @@ static void test_equal_width_unsigned_input_is_rejected() {
         auto batch = arrow::RecordBatch::Make(arrow::schema({arrow::field("value", from)}), 1, {array});
         bool rejected = false;
         try {
-            mosaic::write_with_unsigned_widening(writer, *batch, target, 64);
+            mosaic::examples::write_with_unsigned_widening(writer, *batch, target, 64);
         } catch (const mosaic::Error& e) {
             rejected = std::string(e.what()).find("unsupported conversion") != std::string::npos;
         }

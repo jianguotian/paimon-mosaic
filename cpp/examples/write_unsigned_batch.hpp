@@ -31,7 +31,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace mosaic {
+namespace mosaic::examples {
 
 namespace detail {
 struct ExportedBatch {
@@ -91,7 +91,7 @@ inline void write_with_unsigned_widening(Writer& writer, const arrow::RecordBatc
 
     for (int64_t offset = 0; offset < input.num_rows();) {
         const int64_t count = std::min(rows_per_slice, input.num_rows() - offset);
-        auto columns = input.Slice(offset, count)->columns();
+        auto columns = count == input.num_rows() ? input.columns() : input.Slice(offset, count)->columns();
         for (const int i : widen) {
             auto converted = arrow::compute::Cast(*columns[i], file_schema->field(i)->type());
             if (!converted.ok()) throw Error(converted.status().ToString());
@@ -106,4 +106,4 @@ inline void write_with_unsigned_widening(Writer& writer, const arrow::RecordBatc
     }
 }
 
-}  // namespace mosaic
+}  // namespace mosaic::examples
